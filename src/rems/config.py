@@ -68,6 +68,16 @@ class REMSConfig(BaseSettings):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
 
+    # ---- Recall: role-aware summary tier selection (白皮书 4.4 Lazy Index) ----
+    # 默认召回摘要起点：0 = 中间级（mid），-N = 向 L1 偏移 N 档（更精细），+N = 向最高级偏移 N 档（更压缩）。
+    recall_default_tier_offset: int = 0
+    # 关注角色（S/A 重要性）：在默认档基础上向 L1 方向再偏移的档数（更精细）。
+    recall_primary_role_detail_shift: int = 1
+    # 次要/无关角色（C/D 重要性或未出现）：在默认档基础上向高压缩方向偏移的档数。
+    recall_minor_role_compress_shift: int = 1
+    # 摘要最低字数门槛：某档摘要字数 ≤ 此值时视为已最大压缩，不再向上推进档位。
+    recall_summary_min_chars: int = 20
+
     # 回忆块中「同主题」基本事件数达到阈值则触发抽象/再巩固（白皮书 3.2、4.4）。
     recall_cluster_threshold: int = 5
     # 物理红线触发时，未闭合事件总长超过 len_msg * 该比例则强制封存（代谢防溢出）。

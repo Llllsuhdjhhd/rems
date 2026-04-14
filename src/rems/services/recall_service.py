@@ -46,8 +46,26 @@ class RecallService:
         self._vector = vector_store
 
     # ------------------------------------------------------------------
-    def build_recall_block(self, query: str, shadow: Shadow | None = None) -> RecallBlock:
-        # 查询词拼接残影，使「未封存上下文」参与语义命中（白皮书 4.4）。
+    def build_recall_block(
+        self,
+        query: str,
+        shadow: Shadow | None = None,
+        focus_role_ids: set[str] | None = None,
+    ) -> RecallBlock:
+        """Build the recall block for *query*.
+
+        Parameters
+        ----------
+        query:
+            Current raw input text used as semantic query.
+        shadow:
+            Unprocessed shadow buffer; prepended to *query* for richer search.
+        focus_role_ids:
+            Role IDs considered "primary" in the current context (e.g. the
+            main user or roles mentioned in the current input).  Events where
+            these roles have S/A importance will receive more detailed summaries;
+            events where they are absent or minor will receive more compressed ones.
+        """
         search_text = query
         if shadow and shadow.content:
             search_text = shadow.content + "\n" + query
@@ -67,16 +85,18 @@ class RecallService:
 
         scored_events.sort(key=lambda x: x[1], reverse=True)
 
-        block = self._assemble_block(scored_events)
-
-        # Append semantic cards for top roles (within ceiling)
+        block = self._assemble_block(scored_events, focus_role_ids=focus_role_ids or set())
         block = self._append_semantic_cards(block, scored_events)
-
         return block
 
     # ------------------------------------------------------------------
-    def build_context_package(self, raw_input: str, shadow: Shadow) -> ContextPackage:
-        recall = self.build_recall_block(raw_input, shadow)
+    def build_context_package(
+        self,
+        raw_input: str,
+        shadow: Shadow,
+        focus_role_ids: set[str] | None = None,
+    ) -> ContextPackage:
+        recall = self.build_recall_block(raw_input, shadow, focus_role_ids=focus_role_ids)
         return ContextPackage(
             recall_block=recall,
             shadow=shadow,
@@ -108,27 +128,54 @@ class RecallService:
         return math.exp(-0.693 * age_days / half_life_days)
 
     # ------------------------------------------------------------------
-    # Assembly with Lazy Index degradation
+    # Assembly with role-aware Lazy Index degradation
     # ------------------------------------------------------------------
 
-    def _assemble_block(self, scored: list[tuple[Event, float]]) -> RecallBlock:
-        ceiling = self._config.physical_redline  # 10/66 ≈ 1/6.6
+    def _assemble_block(
+        self,
+        scored: list[tuple[Event, float]],
+        focus_role_ids: set[str] | None = None,
+    ) -> RecallBlock:
+        """Assemble RecallBlock with role-aware summary tier selection.
+
+        For each recalled event the method determines a target compression tier
+        based on the highest importance that any *focus_role* holds within that
+        event:
+
+        +--------------+-------------------------------------------+
+        | Role status  | Tier offset from mid                      |
+        +==============+===========================================+
+        | S / A        | - ``recall_primary_role_detail_shift``    |
+        |              |   (toward L1, more detail)                |
+        +--------------+-------------------------------------------+
+        | B            | ``recall_default_tier_offset`` (mid)      |
+        +--------------+-------------------------------------------+
+        | C / D /      | + ``recall_minor_role_compress_shift``    |
+        | not present  |   (toward max level, more compressed)     |
+        +--------------+-------------------------------------------+
+
+        The summary picked at that tier is guaranteed to be ≥
+        ``recall_summary_min_chars`` chars; if the candidate falls below that
+        floor the tier is pinned (no further compression applied).
+        """
+        focus_role_ids = focus_role_ids or set()
+        ceiling = self._config.physical_redline
         items: list[RecallItem] = []
         total = 0
 
         for event, score in scored:
-            text, level = self._pick_summary(event, ceiling - total)
+            tier_offset = self._compute_tier_offset(event, focus_role_ids)
+            text, level = self._role_aware_pick_summary(event, ceiling - total, tier_offset)
             if not text:
                 continue
 
-            item = RecallItem(
+            items.append(RecallItem(
                 event_id=event.event_id,
                 content=text,
                 score=score,
                 summary_level=level,
-            )
+            ))
             total += len(text)
-            items.append(item)
 
             if total >= ceiling:
                 break
@@ -176,26 +223,105 @@ class RecallService:
         return block
 
     # ------------------------------------------------------------------
-    def _pick_summary(self, event: Event, budget: int) -> tuple[str, str]:
-        """Choose the best summary level that fits within *budget*.
+    # Role-aware summary tier helpers
+    # ------------------------------------------------------------------
 
-        在无摘要时尝试整段 ``content_raw``（标记 L0）；否则按 L1、L2… 顺序寻找首个长度不超过 *budget* 的级别；
-        若均过长则尝试最短一级；仍超出则返回空串对，交由上层跳过或触发 ultra 回退（懒索引降级，白皮书 4.4）。
+    def _compute_tier_offset(self, event: Event, focus_role_ids: set[str]) -> int:
+        """Return the tier offset for *event* given *focus_role_ids*.
+
+        Scans ``event.role_list`` to find the highest importance of any focus
+        role.  Maps that importance to an offset relative to the mid-level index:
+
+        * S / A  →  mid - ``recall_primary_role_detail_shift``  (more detail)
+        * B      →  mid + ``recall_default_tier_offset``         (default)
+        * C / D  →  mid + ``recall_minor_role_compress_shift``   (more compressed)
+        * absent →  mid + ``recall_minor_role_compress_shift``   (same as C/D)
         """
+        cfg = self._config
+        if not focus_role_ids:
+            return cfg.recall_default_tier_offset
+
+        best = "absent"
+        rank = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4, "absent": 5}
+        for entry in event.role_list:
+            if entry.role_id not in focus_role_ids:
+                continue
+            imp = entry.importance.value if hasattr(entry.importance, "value") else str(entry.importance)
+            if rank.get(imp, 5) < rank.get(best, 5):
+                best = imp
+
+        if best in ("S", "A"):
+            return cfg.recall_default_tier_offset - cfg.recall_primary_role_detail_shift
+        if best == "B":
+            return cfg.recall_default_tier_offset
+        # C, D, absent
+        return cfg.recall_default_tier_offset + cfg.recall_minor_role_compress_shift
+
+    def _role_aware_pick_summary(
+        self,
+        event: Event,
+        budget: int,
+        tier_offset: int,
+    ) -> tuple[str, str]:
+        """Pick a summary level for *event* using role-aware tier selection.
+
+        Algorithm
+        ---------
+        1. Build the ordered list of available summary levels: [L1, L2, …, Ln].
+        2. Compute *target index* = mid_index + tier_offset, clamped to [0, n-1].
+        3. Starting at *target index*, search toward max (higher compression) for
+           a summary that fits *budget*.
+        4. If target summary char-count ≤ ``recall_summary_min_chars``, pin at
+           that level — do NOT compress further regardless of tier_offset.
+        5. If nothing fits, fall back to L0 (content_raw) or return empty.
+
+        字数门槛（recall_summary_min_chars）保证过短摘要不会被进一步压缩；
+        这在摘要条目极短（如只剩几个关键词）时非常重要。
+        """
+        min_chars = self._config.recall_summary_min_chars
+
+        # No summaries — try raw content
         if not event.summaries:
             text = event.content_raw
             return (text, "L0") if len(text) <= budget else ("", "")
 
         levels = sorted(event.summaries.keys(), key=lambda k: int(k[1:]))
+        n = len(levels)
+        mid_idx = n // 2  # index of the middle level (default starting point)
 
-        for level_key in levels:
+        target_idx = max(0, min(n - 1, mid_idx + tier_offset))
+
+        # Starting from target, scan toward max-compression until we find one
+        # that fits budget AND respects the min_chars floor.
+        for idx in range(target_idx, n):
+            level_key = levels[idx]
+            text = event.summaries[level_key]
+            char_count = len(text)
+
+            # Min-chars floor: if this summary is already very short,
+            # treat it as the terminal level — use it if it fits budget.
+            at_floor = char_count <= min_chars
+
+            if char_count <= budget:
+                return text, level_key
+
+            if at_floor:
+                # Can't compress further; if it doesn't fit budget, give up.
+                break
+
+        # If target is above mid (requesting more detail), also scan toward L1.
+        if target_idx < mid_idx:
+            for idx in range(target_idx, -1, -1):
+                level_key = levels[idx]
+                text = event.summaries[level_key]
+                if len(text) <= budget:
+                    return text, level_key
+
+        # Last resort: try every level from most to least compressed
+        for level_key in reversed(levels):
             text = event.summaries[level_key]
             if len(text) <= budget:
                 return text, level_key
-
-        shortest = event.summaries[levels[-1]]
-        if len(shortest) <= budget:
-            return shortest, levels[-1]
 
         return "", ""
 

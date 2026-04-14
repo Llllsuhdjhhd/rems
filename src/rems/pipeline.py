@@ -234,10 +234,15 @@ class REMSPipeline:
         """
         shadow = self.meta_repo.get_shadow()
 
+        # 从当前输入和残影中提取焦点角色（用于回忆时的角色感知摘要档位选择）。
+        focus_role_ids = self._extract_focus_roles(raw_input, shadow.content if shadow else "")
+
         # 对话/NPC：用「残影 + 当前输入」检索并组装 ContextPackage；被动日志跳过（白皮书 5.2）。
         ctx: Optional[ContextPackage] = None
         if mode != ProcessingMode.PASSIVE_LOG:
-            ctx = self.recall_service.build_context_package(raw_input, shadow)
+            ctx = self.recall_service.build_context_package(
+                raw_input, shadow, focus_role_ids=focus_role_ids
+            )
 
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
         sealed = self.metabolism_service.process_input(raw_input, force_save=force_save)
@@ -270,6 +275,33 @@ class REMSPipeline:
             mode=mode,
             npc_directives=npc_directives,
         )
+
+    # ------------------------------------------------------------------
+    # Focus role extraction (for recall tier selection)
+    # ------------------------------------------------------------------
+
+    def _extract_focus_roles(self, raw_input: str, shadow_content: str = "") -> set[str]:
+        """Identify role IDs that should be treated as 'primary' in this cycle.
+
+        Strategy (no LLM call — pure heuristic for low latency):
+        1. Collect all registered role names / aliases.
+        2. Check which names appear (case-insensitive substring) in the combined
+           text of *raw_input* + *shadow_content*.
+        3. Return the matching role IDs.
+
+        This gives the recall assembler enough signal to prefer detailed summaries
+        for roles the user is currently talking about, and compress others.
+        """
+        combined = (shadow_content + " " + raw_input).lower()
+        focus: set[str] = set()
+        try:
+            for role in self.role_repo.list_all():
+                names_to_check = [role.name] + (role.aliases or [])
+                if any(n.lower() in combined for n in names_to_check):
+                    focus.add(role.role_id)
+        except Exception:
+            pass
+        return focus
 
     # ------------------------------------------------------------------
     # Memory Reconsolidation
