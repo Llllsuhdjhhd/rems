@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from typing import Optional
 
 # 动态信念修正：自然演进依赖白描时序+遗忘；技术性错误用墓碑 tombstone 逻辑覆写（白皮书 4.3）。
 
 from ..config import REMSConfig
-from ..models.event import Event, EventStatus
+from ..models.event import EventStatus
 from ..storage.repository import EventRepository, RoleRepository
 
 logger = logging.getLogger(__name__)

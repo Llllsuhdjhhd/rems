@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
-import pytest
 
 from rems.config import REMSConfig
-from rems.pipeline import REMSPipeline, ProcessingResult
+from rems.pipeline import REMSPipeline
 from .conftest import FakeEmbeddingFunction
 
 
