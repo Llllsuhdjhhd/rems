@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 # HTTP API：将白皮书中的 ingest、回忆侧数据、墓碑、角色双轨、后台演化等暴露为 REST。
-# 注意：ingest 返回 ID 列表；完整 ContextPackage由管线内部生成，如需返回需扩展响应模型。
+# 注意：ingest 返回 ID 列表；完整 ContextPackage 由管线内部生成，如需返回需扩展响应模型。
+
+from contextlib import contextmanager
+from typing import Iterator
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from rems.pipeline import ProcessingMode
-
+from ..config import UserMode
+from ..pipeline import ProcessingMode
 from .app import get_pipeline
 
 router = APIRouter(tags=["rems"])
@@ -20,6 +23,11 @@ class IngestRequest(BaseModel):
     force_save: bool = False
     mode: ProcessingMode = ProcessingMode.DIALOGUE
     npc_role_id: str | None = None
+
+    # Per-request overrides for 单人/多人模式（白皮书 2.2）。若留空则沿用全局 REMSConfig。
+    user_mode: UserMode | None = None
+    core_user_role_id: str | None = None
+    active_participants: list[str] | None = None
 
 
 class IngestResponse(BaseModel):
@@ -48,6 +56,36 @@ class EventOut(BaseModel):
     status: str
     insight: str | None = None
     affective_energy: float = 0.0
+    activation_energy: float = 0.0
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+@contextmanager
+def _mode_override(req: IngestRequest) -> Iterator[None]:
+    """Temporarily patch pipeline.config with per-request mode overrides.
+
+    单次调用内覆盖 ``user_mode`` / ``core_user_role_id`` / ``active_participants``；
+    上下文退出后恢复原值（进程安全；非并发-请求安全，若需高并发请求级隔离，
+    应改为在 pipeline/skill 签名中显式传 ctx 参数而不是 mutate config）。
+    """
+    pipeline = get_pipeline()
+    cfg = pipeline.config
+    originals: dict[str, object] = {}
+    try:
+        if req.user_mode is not None:
+            originals["user_mode"] = cfg.user_mode
+            cfg.user_mode = req.user_mode
+        if req.core_user_role_id is not None:
+            originals["core_user_role_id"] = cfg.core_user_role_id
+            cfg.core_user_role_id = req.core_user_role_id
+        if req.active_participants is not None:
+            originals["active_participants"] = list(cfg.active_participants)
+            cfg.active_participants = req.active_participants
+        yield
+    finally:
+        for k, v in originals.items():
+            setattr(cfg, k, v)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────
@@ -55,12 +93,13 @@ class EventOut(BaseModel):
 @router.post("/ingest", response_model=IngestResponse)
 def ingest(req: IngestRequest):
     pipeline = get_pipeline()
-    result = pipeline.ingest(
-        req.text,
-        force_save=req.force_save,
-        mode=req.mode,
-        npc_role_id=req.npc_role_id,
-    )
+    with _mode_override(req):
+        result = pipeline.ingest(
+            req.text,
+            force_save=req.force_save,
+            mode=req.mode,
+            npc_role_id=req.npc_role_id,
+        )
     return IngestResponse(
         sealed_event_ids=[e.event_id for e in result.sealed_events],
         abstract_event_ids=[e.event_id for e in result.abstract_events],
@@ -141,7 +180,7 @@ def health():
     return {"status": "ok"}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────
+# ── Serialisation helpers ────────────────────────────────────────────
 
 def _event_out(e) -> EventOut:
     return EventOut(
@@ -153,4 +192,5 @@ def _event_out(e) -> EventOut:
         status=e.status.value,
         insight=e.insight,
         affective_energy=round(e.affective_energy, 4),
+        activation_energy=round(e.activation_energy, 4),
     )

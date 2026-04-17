@@ -45,6 +45,7 @@ class EventRepository:
                 abstraction_level=event.abstraction_level,
                 source_events=event.source_events,
                 is_tombstoned=event.is_tombstoned,
+                activation_energy=event.activation_energy,
             )
             s.merge(record)
             s.commit()
@@ -115,6 +116,7 @@ class EventRepository:
             abstraction_level=r.abstraction_level,
             source_events=r.source_events,
             is_tombstoned=bool(r.is_tombstoned),
+            activation_energy=float(r.activation_energy or 0.0),
         )
 
 

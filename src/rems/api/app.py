@@ -7,10 +7,8 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 
-from rems.config import REMSConfig
-from rems.pipeline import REMSPipeline
-
-from .routes import router
+from ..config import REMSConfig
+from ..pipeline import REMSPipeline
 
 _pipeline: REMSPipeline | None = None
 
@@ -30,6 +28,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    from .routes import router
+
     app = FastAPI(
         title="REMS API",
         version="0.1.0",

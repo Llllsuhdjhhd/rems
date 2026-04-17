@@ -122,6 +122,12 @@ class Event(BaseModel):
     # 墓碑化：逻辑上被修正覆盖，保留审计但回忆排除（白皮书 4.3）。
     is_tombstoned: bool = False
 
+    # 激活能量（Activation Energy，白皮书 2.5 与记忆初始值硬绑定）：
+    # 由 EMA + 事件级 AE 计算；重大情感事件（极乐/大苦）在封存时写入较高初值，
+    # 作为进入回忆混合打分的独立权重（与 AE 组合但不等同：AE 是事件瞬时最大值，
+    # activation_energy 是与角色长期心境做动态调节后的"落地权重"）。
+    activation_energy: float = 0.0
+
     def model_post_init(self, __context: object) -> None:
         if not self.event_length:
             self.event_length = len(self.content_raw)

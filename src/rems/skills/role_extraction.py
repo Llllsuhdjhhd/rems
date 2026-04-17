@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
-from ..llm.prompts import ROLE_EXTRACTION_SYSTEM, ROLE_EXTRACTION_USER
+from ..llm.prompts import ROLE_EXTRACTION_SYSTEM, ROLE_EXTRACTION_USER, build_user_mode_block
 from ..models.event import (
     EmotionalModel,
     EventRoleEntry,
@@ -59,10 +59,13 @@ class RoleExtractionSkill:
             content_raw=content_raw,
         )
 
+        # 白皮书 2.2：在系统提示词首部注入单人/多人模式块，指导模型做代词消解。
+        system_msg = build_user_mode_block(self._config) + ROLE_EXTRACTION_SYSTEM
+
         data = self._llm.complete_json(
             "role_extraction",
             [
-                {"role": "system", "content": ROLE_EXTRACTION_SYSTEM},
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
         )

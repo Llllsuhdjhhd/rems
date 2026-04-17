@@ -7,7 +7,59 @@ Convention
 
 中文说明：正文 prompt 已与《REMS 记忆系统规范解析》对齐（边界/摘要/角色/演化等条款），
 修改 prompt 时建议同步核对白皮书对应小节，避免与领域语义漂移。
+
+全局模式注入（白皮书 2.2）：``build_user_mode_block(config)`` 会按 ``UserMode`` 渲染一段
+系统提示段，由 ``RoleExtractionSkill`` 与 ``BoundaryDetectionSkill`` 拼接进 system prompt。
 """
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..config import REMSConfig
+
+
+# =====================================================================
+# 0. Global Mode Injection — 单人/多人代词消解（白皮书 2.2）
+# =====================================================================
+
+_SINGLE_MODE_TEMPLATE = """\
+【全局运行模式：单人隔离模式（Single-User）】
+当前系统运行于单人隔离模式。上下文中所有第一人称代词（"我"、"我的"）以及缺乏明确主语的动作，
+均极大可能指向唯一核心用户实体 <{core_user}>。
+- 在抽取角色/切分边界时，应优先将此类模糊主语归并为该核心用户；
+- 除非文本中出现明确的第三方人名/称谓，否则不应新增其他角色。
+"""
+
+_MULTI_MODE_TEMPLATE = """\
+【全局运行模式：多人交互模式（Multi-User）】
+当前为多实体交互场景，已知活跃参与者包含 <{participants}>。
+请务必结合对话历史、时间戳与发言者账号/声纹标签，执行精确的多方代词消解
+（Multiparty Coreference Resolution）。严禁将模糊代词默认归属于单一核心用户；
+若无法确定代词指代，应如实在输出中标注未决并保留原词，不得臆测。
+"""
+
+
+def build_user_mode_block(config: "REMSConfig") -> str:
+    """Render the mode-injection text for system prompts.
+
+    根据 ``config.user_mode`` 返回要注入到 system prompt 的模式描述块（白皮书 2.2）。
+    单人模式会带出 ``core_user_role_id``；多人模式会带出 ``active_participants`` 列表。
+    返回字符串末尾包含一个空行便于与后续 prompt 正文拼接；若未配置则返回空串。
+    """
+    from ..config import UserMode  # local import to avoid circular
+
+    if config.user_mode == UserMode.SINGLE:
+        core = config.core_user_role_id or "核心用户（未显式指定 role_id）"
+        return _SINGLE_MODE_TEMPLATE.format(core=core) + "\n"
+    if config.user_mode == UserMode.MULTI:
+        if config.active_participants:
+            participants = "、".join(config.active_participants)
+        else:
+            participants = "未显式提供花名册——请完全依赖文本线索做共指消解"
+        return _MULTI_MODE_TEMPLATE.format(participants=participants) + "\n"
+    return ""
 
 # =====================================================================
 # 1. Boundary Detection

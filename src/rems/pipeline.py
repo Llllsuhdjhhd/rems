@@ -5,12 +5,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from .config import REMSConfig
+from .config import REMSConfig, UserMode
 from .llm.provider import LLMProvider
 from .models.event import Event
 from .models.metabolism import ContextPackage
 from .services.abstraction_service import AbstractionService
 from .services.belief_revision_service import BeliefRevisionService
+from .services.emotion_service import EMAEvolver
 from .services.event_service import EventService
 from .services.metabolism_service import MetabolismService
 from .services.recall_service import RecallService
@@ -170,7 +171,16 @@ class REMSPipeline:
         boundary_skill = BoundaryDetectionSkill(llm, config)
         evolution_skill = InductiveEvolutionSkill(llm, config)
 
-        event_service = EventService(config, llm, event_repo, vector_store, summary_skill, role_skill)
+        emotion_evolver = EMAEvolver(config, role_repo)
+        event_service = EventService(
+            config,
+            llm,
+            event_repo,
+            vector_store,
+            summary_skill,
+            role_skill,
+            emotion_evolver=emotion_evolver,
+        )
         # Pass llm to role_service so semantic cards can be refreshed in-process
         role_service = RoleService(config, role_repo, role_skill, llm=llm)
         metabolism_service = MetabolismService(config, meta_repo, boundary_skill, event_service)
@@ -284,16 +294,23 @@ class REMSPipeline:
         """Identify role IDs that should be treated as 'primary' in this cycle.
 
         Strategy (no LLM call — pure heuristic for low latency):
-        1. Collect all registered role names / aliases.
-        2. Check which names appear (case-insensitive substring) in the combined
+        1. In single-user mode, always include ``core_user_role_id`` (白皮书 2.2/2.3:
+           单人模式下核心用户恒为主角，配合动态粒度路由强制拉取 L3 详细白描)。
+        2. Collect all registered role names / aliases.
+        3. Check which names appear (case-insensitive substring) in the combined
            text of *raw_input* + *shadow_content*.
-        3. Return the matching role IDs.
+        4. Return the matching role IDs.
 
         This gives the recall assembler enough signal to prefer detailed summaries
         for roles the user is currently talking about, and compress others.
         """
         combined = (shadow_content + " " + raw_input).lower()
         focus: set[str] = set()
+
+        # 单人模式：核心用户恒在 focus（白皮书 2.2）。
+        if self.config.user_mode == UserMode.SINGLE and self.config.core_user_role_id:
+            focus.add(self.config.core_user_role_id)
+
         try:
             for role in self.role_repo.list_all():
                 names_to_check = [role.name] + (role.aliases or [])

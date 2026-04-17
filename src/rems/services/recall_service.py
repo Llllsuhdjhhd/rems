@@ -104,10 +104,17 @@ class RecallService:
         )
 
     # ------------------------------------------------------------------
-    # Scoring (cosine 0.5 + time_decay 0.15 + role_importance 0.2 + AE 0.15)
+    # Scoring (cosine + time_decay 0.15 + role_importance 0.20 + AE + activation_energy)
     # ------------------------------------------------------------------
 
     def _hybrid_score(self, event: Event, cosine_sim: float) -> float:
+        """Hybrid recall score.
+
+        四项贡献：余弦相似度、时间半衰、角色重要性 max boost、事件级情感能量（AE）与
+        ``activation_energy``（白皮书 2.5：重大情感事件的硬绑定抗遗忘初值）。权重分配上，
+        ``time_decay`` 与 ``role_boost`` 固定为 0.15 / 0.20；``ae_w``、``act_w`` 从 config 读取，
+        余量自动回填到余弦项，保证总权重恒为 1。
+        """
         time_decay = self._time_decay(event.create_time)
 
         role_boost = 0.0
@@ -117,9 +124,17 @@ class RecallService:
             role_boost = max(role_boost, importance_weights.get(key, 0.0))
 
         ae = event.affective_energy
-        ae_w = self._config.ae_score_weight           # default 0.15
-        cosine_w = 1.0 - ae_w - 0.15 - 0.20          # remainder to cosine ≈ 0.50
-        return cosine_w * cosine_sim + 0.15 * time_decay + 0.20 * role_boost + ae_w * ae
+        act = event.activation_energy
+        ae_w = self._config.ae_score_weight                 # 事件级 AE 权重
+        act_w = self._config.activation_energy_weight       # EMA 演化后的激活能量权重
+        cosine_w = max(0.0, 1.0 - ae_w - act_w - 0.15 - 0.20)
+        return (
+            cosine_w * cosine_sim
+            + 0.15 * time_decay
+            + 0.20 * role_boost
+            + ae_w * ae
+            + act_w * act
+        )
 
     @staticmethod
     def _time_decay(create_time: datetime, half_life_days: float = 30.0) -> float:
