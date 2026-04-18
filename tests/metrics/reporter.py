@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from rems.config import REMSConfig
+from rems.llm.metrics import LLMInvocationMetrics
 
 from .probes import ProbeResult
 
@@ -133,6 +134,7 @@ class WPReporter:
         self._run_summary_lines: list[str] = []
         self._repro_lines: list[str] = []
         self._table_rows: list[tuple[str, str, str, str]] = []
+        self._llm_invocation_md: str = ""
 
     def set_config_snapshot(self, cfg: REMSConfig) -> None:
         """Serialize a compact, human-readable config view."""
@@ -162,6 +164,48 @@ class WPReporter:
 
     def set_llm_env_summary(self, lines: list[str]) -> None:
         self._llm_env_lines = lines
+
+    def set_llm_invocation_metrics(self, records: list[LLMInvocationMetrics]) -> None:
+        """Append a Markdown section from :meth:`rems.llm.provider.LLMProvider.invocation_history`."""
+        if not records:
+            self._llm_invocation_md = (
+                "\n## LLM 调用记录\n\n"
+                "_（本段运行无 ``LLMProvider`` 调用记录。）_\n"
+            )
+            return
+
+        def tok(v: int | None) -> str:
+            return str(v) if v is not None else "—"
+
+        lines = [
+            "\n## LLM 调用记录\n\n",
+            (
+                "数据来自 **`LLMProvider.invocation_history()`**（每次 ``complete`` 一行）。\n\n"
+                "**延迟**为客户端测量的往返时间（毫秒）；**token** 取自 API `usage`，"
+                "网关未返回时显示为「—」。\n\n"
+            ),
+            "| # | task_type | model | 延迟(ms) | prompt | completion | total |\n",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: |\n",
+        ]
+        for i, r in enumerate(records, 1):
+            lines.append(
+                f"| {i} | `{_escape_md_cell(r.task_type)}` | `{_escape_md_cell(r.model)}` | "
+                f"{r.latency_ms:.2f} | {tok(r.prompt_tokens)} | {tok(r.completion_tokens)} | "
+                f"{tok(r.total_tokens)} |\n"
+            )
+        pts = [r.prompt_tokens for r in records if r.prompt_tokens is not None]
+        cts = [r.completion_tokens for r in records if r.completion_tokens is not None]
+        tts = [r.total_tokens for r in records if r.total_tokens is not None]
+        sums: list[str] = []
+        if pts:
+            sums.append(f"prompt Σ={sum(pts)}")
+        if cts:
+            sums.append(f"completion Σ={sum(cts)}")
+        if tts:
+            sums.append(f"total Σ={sum(tts)}")
+        if sums:
+            lines.append("\n**Token 合计（仅统计 API 返回了对应字段的调用）**：" + " · ".join(sums) + "\n")
+        self._llm_invocation_md = "".join(lines)
 
     def add_probe(self, clause: str, pr: ProbeResult) -> None:
         self._probes.append((clause, pr))
@@ -226,6 +270,9 @@ class WPReporter:
         if self._run_summary_lines:
             parts.append("\n## 运行摘要\n\n")
             parts.extend(ln if ln.endswith("\n") else ln + "\n" for ln in self._run_summary_lines)
+
+        if self._llm_invocation_md:
+            parts.append(self._llm_invocation_md)
 
         parts.append("\n## 环境 & 复现命令\n\n")
         parts.extend(ln + "\n" for ln in self._repro_lines)

@@ -242,6 +242,7 @@ def test_wp_live_abstraction_and_recall(tmp_path) -> None:
             f"- 墓碑 event_id：`{tomb_id}`",
         ]
     )
+    rep.set_llm_invocation_metrics(pipeline.llm.invocation_history())
     rep.finalize()
     un()
 

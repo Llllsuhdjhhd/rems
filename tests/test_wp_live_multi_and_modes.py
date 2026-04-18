@@ -221,6 +221,7 @@ def test_wp_live_multi_and_modes(tmp_path) -> None:
             f"- NPC 指令条数：**{len(r_npc.npc_directives)}**",
         ]
     )
+    rep.set_llm_invocation_metrics(pipeline.llm.invocation_history())
     rep.finalize()
     un()
 

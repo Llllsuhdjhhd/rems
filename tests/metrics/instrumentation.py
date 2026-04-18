@@ -18,6 +18,11 @@ class LLMCallRecord:
     reply_preview: str
     reply_chars: int
     seconds: float
+    model: str = ""
+    latency_ms: float = 0.0
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
 
 
 @dataclass
@@ -89,6 +94,13 @@ def install_llm_tracer(store: InstrumentationStore, llm: Any) -> Callable[[], No
         finally:
             dt = time.perf_counter() - t0
 
+        inv = None
+        hist = getattr(llm, "invocation_history", None)
+        if callable(hist):
+            h = hist()
+            if h:
+                inv = h[-1]
+
         tail = (out or "").replace("\r", " ").replace("\n", " ").strip()
         if len(tail) > 72:
             tail = tail[:71] + "…"
@@ -99,7 +111,12 @@ def install_llm_tracer(store: InstrumentationStore, llm: Any) -> Callable[[], No
                 prompt_chars=pch,
                 reply_preview=tail,
                 reply_chars=len(out or ""),
-                seconds=dt,
+                seconds=inv.latency_ms / 1000.0 if inv is not None else dt,
+                model=inv.model if inv is not None else "",
+                latency_ms=inv.latency_ms if inv is not None else round(dt * 1000.0, 3),
+                prompt_tokens=inv.prompt_tokens if inv is not None else None,
+                completion_tokens=inv.completion_tokens if inv is not None else None,
+                total_tokens=inv.total_tokens if inv is not None else None,
             ),
         )
         return out

@@ -38,9 +38,9 @@ class TaskModelMapping(BaseModel):
     summary: str = "tongyi-xiaomi-analysis-pro"
     boundary_detection: str = "qwen-turbo"
     role_extraction: str = "qwen-turbo"
-    abstraction: str = "qwen3.5-plus"
+    abstraction: str = "qwen3.6-flash-2026-04-16"
     insight: str = "tongyi-xiaomi-analysis-pro"
-    default: str = "qwen3.5-plus"
+    default: str = "qwen3.6-flash-2026-04-16"
 
 
 class LLMConfig(BaseModel):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
 # OpenAI 兼容 Chat Completions 封装；按 task_type 选择模型名（见 config.llm.task_models）。
@@ -10,6 +11,7 @@ from typing import Any
 from openai import OpenAI
 
 from ..config import REMSConfig
+from .metrics import LLMInvocationMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +33,27 @@ class LLMProvider:
             api_key=config.llm.api_key,
             max_retries=config.llm.max_retries,
         )
+        # 每次 ``complete`` 追加一条，供观测账单、延迟与测试报告（非流式 usage）。
+        self._invocations: list[LLMInvocationMetrics] = []
 
     def _get_model(self, task_type: str) -> str:
         mapping = self.config.llm.task_models
         return getattr(mapping, task_type, None) or mapping.default
+
+    def invocation_history(self) -> list[LLMInvocationMetrics]:
+        """Copy of all completed calls since this provider was constructed."""
+        return list(self._invocations)
+
+    def clear_invocation_history(self) -> None:
+        """Drop recorded metrics (e.g. before a new benchmark window)."""
+        self._invocations.clear()
+
+    @staticmethod
+    def _usage_int(usage: Any, name: str) -> int | None:
+        if usage is None:
+            return None
+        v = getattr(usage, name, None)
+        return int(v) if v is not None else None
 
     # ------------------------------------------------------------------
     def complete(
@@ -47,13 +66,32 @@ class LLMProvider:
         model = self._get_model(task_type)
         temp = temperature if temperature is not None else self.config.llm.temperature
 
+        t0 = time.perf_counter()
         response = self._client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temp,
         )
+        latency_ms = (time.perf_counter() - t0) * 1000.0
         content = response.choices[0].message.content or ""
-        logger.debug("LLM [%s/%s] usage=%s", task_type, model, response.usage)
+        usage = getattr(response, "usage", None)
+        self._invocations.append(
+            LLMInvocationMetrics(
+                task_type=task_type,
+                model=model,
+                latency_ms=round(latency_ms, 3),
+                prompt_tokens=self._usage_int(usage, "prompt_tokens"),
+                completion_tokens=self._usage_int(usage, "completion_tokens"),
+                total_tokens=self._usage_int(usage, "total_tokens"),
+            ),
+        )
+        logger.debug(
+            "LLM [%s/%s] latency_ms=%.2f usage=%s",
+            task_type,
+            model,
+            latency_ms,
+            usage,
+        )
         return content
 
     # ------------------------------------------------------------------

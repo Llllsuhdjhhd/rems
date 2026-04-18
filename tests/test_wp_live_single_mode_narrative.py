@@ -364,6 +364,7 @@ def test_wp_live_single_mode_narrative(tmp_path, monkeypatch) -> None:
             f"- LLM 调用次数：**{len(store.llm_calls)}**",
         ]
     )
+    rep.set_llm_invocation_metrics(pipeline.llm.invocation_history())
     rep.finalize()
 
     assert rep.report_path.is_file()
