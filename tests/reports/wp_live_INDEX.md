@@ -4,4 +4,5 @@
 
 | 报告 | PASS | FAIL | INFO | 总判 |
 | --- | ---: | ---: | ---: | --- |
+| [`wp_live_multi_and_modes.md`](./wp_live_multi_and_modes.md) | 7 | 0 | 0 | **PASS** |
 | [`wp_live_single_mode.md`](./wp_live_single_mode.md) | 9 | 1 | 1 | **FAIL** |

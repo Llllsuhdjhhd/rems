@@ -1,6 +1,12 @@
-"""WP-LIVE §2.2–2.3 / §5.1–5.3 — multi-user mode + output modes."""
+"""WP-LIVE §2.2–2.3 / §5.1–5.3 — multi-user mode + output modes.
+
+运行：``REMS_RUN_LIVE_METABOLISM_TEST=1``；可选 ``REMS_WP_REPORT_DIR``、
+``REMS_WP_LIVE_MULTI_ROUNDS``（正整数时只跑多人剧本前 *N* 条 ingest）。
+"""
 
 from __future__ import annotations
+
+import os
 
 import pytest
 
@@ -22,10 +28,33 @@ from .metrics.live_common import build_pipeline, live_llm_skip_if_disabled
 
 NPC_ID = "ROL-npc-guard"
 
+MULTI_NARRATIVE_INPUTS: list[str] = [
+    "她把杯子递给他，然后我们都笑了。Alice 点了点头，Bob 耸耸肩，Carol 在记笔记。",
+    "Carol 提议周末去爬山，Bob 说可以带相机。",
+    "Alice 和 Bob 争论预算，Carol 建议先写邮件问财务。",
+    "下班路上 Bob 打电话给 Carol，Alice 自己先走了。",
+    "三个人在群里约好周二当面复盘项目风险。",
+]
+
+
+def _multi_inputs_this_run() -> list[str]:
+    raw = os.environ.get("REMS_WP_LIVE_MULTI_ROUNDS", "").strip()
+    if not raw:
+        return list(MULTI_NARRATIVE_INPUTS)
+    try:
+        n = int(raw)
+    except ValueError:
+        return list(MULTI_NARRATIVE_INPUTS)
+    if n <= 0:
+        return list(MULTI_NARRATIVE_INPUTS)
+    return MULTI_NARRATIVE_INPUTS[:n]
+
 
 @pytest.mark.live_llm
 def test_wp_live_multi_and_modes(tmp_path) -> None:
     live_llm_skip_if_disabled()
+
+    multi_inputs = _multi_inputs_this_run()
 
     pipeline, cfg, emb_notes = build_pipeline(
         tmp_path,
@@ -39,14 +68,25 @@ def test_wp_live_multi_and_modes(tmp_path) -> None:
 
     rep = WPReporter(default_report_path("wp_live_multi_and_modes.md"), "多人与多场景输出")
     rep.set_config_snapshot(cfg)
-    rep.set_llm_env_summary(emb_notes)
+    rounds_note = os.environ.get("REMS_WP_LIVE_MULTI_ROUNDS", "").strip()
+    rep.set_llm_env_summary(
+        emb_notes
+        + (
+            [f"**多人剧本截断**: `REMS_WP_LIVE_MULTI_ROUNDS={rounds_note}` → 本轮 **{len(multi_inputs)}** 条"]
+            if rounds_note
+            else [f"**多人剧本**: 本轮 **{len(multi_inputs)}** 条（全量 {len(MULTI_NARRATIVE_INPUTS)}）"]
+        ),
+    )
     rep.set_repro_footer(
-        pytest_cmd="python -m pytest tests/test_wp_live_multi_and_modes.py -v -s",
+        pytest_cmd=(
+            "python -m pytest tests/test_wp_live_multi_and_modes.py -v -s"
+            + (f"  # REMS_WP_LIVE_MULTI_ROUNDS={rounds_note}" if rounds_note else "")
+        ),
     )
 
-    pipeline.ingest(
-        "她把杯子递给他，然后我们都笑了。Alice 点了点头，Bob 耸耸肩，Carol 在记笔记。",
-    )
+    r_dialogue: object | None = None
+    for raw in multi_inputs:
+        r_dialogue = pipeline.ingest(raw, mode=ProcessingMode.DIALOGUE)
     sp = store.first_role_extraction_system or ""
 
     with rep.section("§2.2", "多人模式提示词注入") as s:
@@ -97,10 +137,7 @@ def test_wp_live_multi_and_modes(tmp_path) -> None:
         if not found:
             s.note("_未找到合适的非 S/A 白描样本。_")
 
-    r_dialogue = pipeline.ingest(
-        "Carol 提议周末去爬山，Bob 说可以带相机。",
-        mode=ProcessingMode.DIALOGUE,
-    )
+    assert r_dialogue is not None
     with rep.section("§5.1", "DIALOGUE 上下文包") as s:
         s.quote("标准交互模式应组装 Context Package 供上游生成回复。")
         s.method(["`context_package is not None`，且 `recall_block.total_length ≤ physical_redline`。"])
@@ -178,7 +215,9 @@ def test_wp_live_multi_and_modes(tmp_path) -> None:
 
     rep.add_run_summary(
         [
-            f"- 多人模式封存事件数：**{len(sealed_multi)}**",
+            f"- 多人 DIALOGUE 剧本：**{len(multi_inputs)}** 轮",
+            f"- 剧本结束后基本事件数：**{len(sealed_multi)}**",
+            f"- 全程 LLM 调用：**{len(store.llm_calls)}**",
             f"- NPC 指令条数：**{len(r_npc.npc_directives)}**",
         ]
     )
