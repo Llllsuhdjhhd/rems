@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
-import tempfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -14,7 +12,6 @@ import pytest
 from rems.config import REMSConfig
 from rems.llm.provider import LLMProvider
 from rems.storage.database import Database
-from rems.storage.vector_store import VectorStore
 
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -84,6 +81,10 @@ class FakeEmbeddingFunction:
 
     def __call__(self, input):  # noqa: A002
         return [[0.0] * 4 for _ in input]
+
+    def embed_query(self, input):  # noqa: A002
+        """Chroma query path calls ``embed_query``; ingest uses ``__call__``."""
+        return self(input)
 
     def name(self) -> str:
         return "default"

@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
-from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER
+from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER, build_user_mode_block
 from ..models.metabolism import UnclosedEvent
 
 logger = logging.getLogger(__name__)
@@ -61,10 +61,13 @@ class BoundaryDetectionSkill:
             current_input=current_input,
         )
 
+        # 白皮书 2.2：system prompt 首部注入模式块，让边界检测也感知代词归属约束。
+        system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM
+
         data = self._llm.complete_json(
             "boundary_detection",
             [
-                {"role": "system", "content": BOUNDARY_SYSTEM},
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
         )

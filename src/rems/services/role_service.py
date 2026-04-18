@@ -7,9 +7,9 @@ from typing import Any, Optional
 
 # 角色服务：注册、白描追加、语义卡片 LLM 刷新、基于 AE 的白描摘要权重（白皮书第 2 章）。
 
-from ..config import REMSConfig
+from ..config import REMSConfig, UserMode
 from ..llm.provider import LLMProvider
-from ..models.event import Event
+from ..models.event import Event, EventRoleEntry, Importance
 from ..models.role import Role, SemanticCard, WhitePaintingEntry, generate_role_id
 from ..skills.role_extraction import ExtractedRole, RoleExtractionSkill
 from ..storage.repository import RoleRepository
@@ -102,7 +102,7 @@ class RoleService:
             if role is None:
                 role = self.register_role(entry.role_id, entity_type="person")
 
-            summary_text = entry.role_snapshot.l2_interaction or entry.role_snapshot.l1_mention or ""
+            summary_text = self._pick_wp_summary(entry)
 
             # Role-level AE: per-role emotion intensity
             v = entry.emotional_model.vedana
@@ -126,6 +126,58 @@ class RoleService:
 
             # Async-style: update semantic card in same call (background in prod)
             self._refresh_semantic_card(role.role_id)
+
+    # ------------------------------------------------------------------
+    # Dynamic granularity routing — 收集端（白皮书 2.3）
+    # ------------------------------------------------------------------
+
+    def _pick_wp_summary(self, entry: EventRoleEntry) -> str:
+        """Select the snapshot level to persist into the white-painting timeline.
+
+        选择写入白描时间线的快照粒度：
+        - 主要角色（``S``/``A`` 重要性）或单人模式下的核心用户 → 使用 ``wp_primary_field``（默认 L3 决策白描）；
+        - 其他角色 → 使用 ``wp_default_field``（默认 L2 互动白描）；
+        - 若目标字段为空则按 L3→L2→L1 顺序回退。与《REMS 记忆系统规范解析》2.3 对齐，
+          让白描收集端实现"主角详细 / 配角标准"的动态粒度路由，防止长周期性格漂移。
+        """
+        cfg = self._config
+        is_primary = self._is_primary_role(entry)
+        target_field = cfg.wp_primary_field if is_primary else cfg.wp_default_field
+
+        snap = entry.role_snapshot
+        candidates_primary = [
+            target_field,
+            "l3_decision",
+            "l2_interaction",
+            "l1_mention",
+        ]
+        candidates_default = [
+            target_field,
+            "l2_interaction",
+            "l1_mention",
+            "l3_decision",
+        ]
+        ordered = candidates_primary if is_primary else candidates_default
+
+        seen: set[str] = set()
+        for field_name in ordered:
+            if field_name in seen:
+                continue
+            seen.add(field_name)
+            text = getattr(snap, field_name, None)
+            if text:
+                return text
+        return ""
+
+    def _is_primary_role(self, entry: EventRoleEntry) -> bool:
+        # S/A 重要性 → 主角；单人模式下核心用户恒为主角（白皮书 2.2 / 2.3）。
+        imp = entry.importance if isinstance(entry.importance, Importance) else Importance(str(entry.importance))
+        if imp in (Importance.S, Importance.A):
+            return True
+        cfg = self._config
+        if cfg.user_mode == UserMode.SINGLE and cfg.core_user_role_id == entry.role_id:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Semantic card maintenance

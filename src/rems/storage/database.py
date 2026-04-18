@@ -49,6 +49,7 @@ class EventRecord(Base):
     abstraction_level = Column(Integer, nullable=True)
     source_events = Column(JSON, nullable=True)
     is_tombstoned = Column(Boolean, default=False)
+    activation_energy = Column(Float, default=0.0)  # 白皮书 2.5 记忆初始值硬绑定
 
 
 class RoleRecord(Base):

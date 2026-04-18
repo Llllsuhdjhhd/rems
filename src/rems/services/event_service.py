@@ -14,6 +14,7 @@ from ..skills.role_extraction import RoleExtractionSkill
 from ..skills.summary_generation import SummaryGenerationSkill
 from ..storage.repository import EventRepository
 from ..storage.vector_store import VectorStore
+from .emotion_service import EMAEvolver
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class EventService:
         vector_store: VectorStore,
         summary_skill: SummaryGenerationSkill,
         role_skill: RoleExtractionSkill,
+        emotion_evolver: EMAEvolver | None = None,
     ):
         self._config = config
         self._llm = llm
@@ -42,6 +44,8 @@ class EventService:
         self._vector = vector_store
         self._summary_skill = summary_skill
         self._role_skill = role_skill
+        # 可选：若传入 EMAEvolver，则在封存前做情感动态演化并计算 activation_energy（白皮书 2.5）。
+        self._emotion_evolver = emotion_evolver
 
     # ------------------------------------------------------------------
     def seal_event(
@@ -86,6 +90,14 @@ class EventService:
             status=EventStatus.ACTIVE,
             decoration=decoration,
         )
+
+        # EMA 动态演化 + activation_energy 计算（白皮书 2.5）。
+        # 必须在 save 之前，让 ORM 落盘时带上"历史心境调和后的情感"和激活能量。
+        if self._emotion_evolver is not None:
+            try:
+                self._emotion_evolver.evolve_event(event)
+            except Exception:
+                logger.debug("EMA evolution skipped due to error", exc_info=True)
 
         self._event_repo.save(event)
         self._index_event(event)

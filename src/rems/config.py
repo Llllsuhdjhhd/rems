@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enum import Enum
+
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -8,8 +10,20 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # - recall_cluster_threshold：3.2、4.4 召回聚集与记忆重组触发阈值；
 # - ae_*、wp_*：1.1.4、2.2 情感能量（AE）与白描动态遗忘；
 # - hallucination_anchor_prob：3.3 递归抽象时锚定子事件摘要的概率；
-# - tombstone_prefix：4.3 墓碑化时在 insight 中的审计标记前缀。
+# - tombstone_prefix：4.3 墓碑化时在 insight 中的审计标记前缀；
+# - user_mode / core_user_role_id / active_participants：2.2 单人/多人模式与提示词注入引擎。
 # 加载：环境变量前缀 REMS_，嵌套键用 __ 分隔；可选 .env。
+
+
+class UserMode(str, Enum):
+    """Global pronoun-resolution mode (白皮书 2.2).
+
+    SINGLE：单人模式——第一人称与无主语动作默认归属 ``core_user_role_id``，降低代词消解幻觉。
+    MULTI：多人模式——提供 ``active_participants`` 花名册，模型需做多方共指消解，禁止默认归一。
+    """
+
+    SINGLE = "single"
+    MULTI = "multi"
 
 
 class TaskModelMapping(BaseModel):
@@ -21,12 +35,12 @@ class TaskModelMapping(BaseModel):
 
     # 以下为各技能默认模型名；可按任务强度分流成本（摘要/边界/抽取/抽象等）。
 
-    summary: str = "qwen-turbo"
-    boundary_detection: str = "qwen-plus"
-    role_extraction: str = "qwen-plus"
-    abstraction: str = "qwen-max"
-    insight: str = "qwen-max"
-    default: str = "qwen-turbo"
+    summary: str = "tongyi-xiaomi-analysis-pro"
+    boundary_detection: str = "qwen-turbo"
+    role_extraction: str = "qwen-turbo"
+    abstraction: str = "qwen3.5-plus"
+    insight: str = "tongyi-xiaomi-analysis-pro"
+    default: str = "qwen3.5-plus"
 
 
 class LLMConfig(BaseModel):
@@ -68,6 +82,16 @@ class REMSConfig(BaseSettings):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
 
+    # ---- Recall: role-aware summary tier selection (白皮书 4.4 Lazy Index) ----
+    # 默认召回摘要起点：0 = 中间级（mid），-N = 向 L1 偏移 N 档（更精细），+N = 向最高级偏移 N 档（更压缩）。
+    recall_default_tier_offset: int = 0
+    # 关注角色（S/A 重要性）：在默认档基础上向 L1 方向再偏移的档数（更精细）。
+    recall_primary_role_detail_shift: int = 1
+    # 次要/无关角色（C/D 重要性或未出现）：在默认档基础上向高压缩方向偏移的档数。
+    recall_minor_role_compress_shift: int = 1
+    # 摘要最低字数门槛：某档摘要字数 ≤ 此值时视为已最大压缩，不再向上推进档位。
+    recall_summary_min_chars: int = 20
+
     # 回忆块中「同主题」基本事件数达到阈值则触发抽象/再巩固（白皮书 3.2、4.4）。
     recall_cluster_threshold: int = 5
     # 物理红线触发时，未闭合事件总长超过 len_msg * 该比例则强制封存（代谢防溢出）。
@@ -92,6 +116,30 @@ class REMSConfig(BaseSettings):
 
     # 墓碑化时写入 insight 的审计前缀（白皮书 4.3）。
     tombstone_prefix: str = "[TOMBSTONE]"
+
+    # ---- Global pronoun-resolution mode (白皮书 2.2) ----
+    # 默认单人模式；生产环境按场景切换为多人。
+    user_mode: UserMode = UserMode.SINGLE
+    # 单人模式下第一人称与无主语动作默认归属的核心用户 role_id；留空则仍由模型自推。
+    core_user_role_id: str | None = None
+    # 多人模式下的已知活跃参与者花名册（role_id 或角色名），会被注入 system prompt 做共指消解。
+    active_participants: list[str] = Field(default_factory=list)
+
+    # ---- Emotion: EMA (Emotion & Adaptation) dynamic evolution (白皮书 2.5) ----
+    # EMA 指数平滑系数；越大越偏向"新事件"，越小越延续"历史心境"。
+    ema_smoothing_alpha: float = 0.4
+    # EMA 回溯读取白描尾部的条数（用于生成历史心境基线）。
+    ema_history_window: int = 10
+    # 将事件 AE 映射为 ``activation_energy`` 的增益；超过 ae_high_threshold 触发重大事件硬绑定。
+    activation_energy_gain: float = 1.0
+    # 回忆混合打分中 ``activation_energy`` 的权重（从余弦相似度份额中扣除）。
+    activation_energy_weight: float = 0.10
+
+    # ---- White-painting collection tier (白皮书 2.3 动态粒度路由·收集端) ----
+    # 白描收集时对主要角色（S/A 或单人核心用户）落盘的默认档位字段：l3_decision / l2_interaction / l1_mention。
+    wp_primary_field: str = "l3_decision"
+    wp_default_field: str = "l2_interaction"
+    wp_minor_field: str = "l2_interaction"
 
     @property
     def context_chars(self) -> int:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from rems.config import REMSConfig
-from rems.models.event import Event, EventRoleEntry, Importance
+from rems.models.event import Event
 from rems.models.metabolism import Shadow
 from rems.services.recall_service import RecallService
 from rems.storage.database import Database
