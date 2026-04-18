@@ -24,6 +24,19 @@ from ..models.event import (
 logger = logging.getLogger(__name__)
 
 
+def _emotion_subfields(raw: dict, field_names: set[str]) -> dict[str, float]:
+    """Keep only known keys and coerce to float; skip values the LLM returned as labels."""
+    out: dict[str, float] = {}
+    for k, v in raw.items():
+        if k not in field_names:
+            continue
+        try:
+            out[k] = float(v)
+        except (TypeError, ValueError):
+            logger.warning("inductive_evolution: skip non-numeric emotion field %s=%r", k, v)
+    return out
+
+
 class InductiveEvolutionSkill:
     """Synthesises an abstract event from a cluster of basic/lower-order events.
 
@@ -67,16 +80,16 @@ class InductiveEvolutionSkill:
 
         role_entries: list[EventRoleEntry] = []
         for rd in data.get("roles", []):
-            trend = rd.get("emotion_trend", {})
-            vedana_d = trend.get("vedana", {})
-            klesha_d = trend.get("klesha", {})
+            trend = rd.get("emotion_trend", {}) or {}
+            vedana_d = _emotion_subfields(trend.get("vedana") or {}, set(Vedana.model_fields))
+            klesha_d = _emotion_subfields(trend.get("klesha") or {}, set(Klesha.model_fields))
             role_entries.append(EventRoleEntry(
                 role_id=rd.get("role_id", ""),
                 importance=Importance(rd["importance"]) if rd.get("importance") in Importance.__members__ else Importance.C,
                 role_snapshot=RoleSnapshot(l3_decision=rd.get("l3_decision")),
                 emotional_model=EmotionalModel(
-                    vedana=Vedana(**{k: float(v) for k, v in vedana_d.items() if k in Vedana.model_fields}),
-                    klesha=Klesha(**{k: float(v) for k, v in klesha_d.items() if k in Klesha.model_fields}),
+                    vedana=Vedana(**vedana_d),
+                    klesha=Klesha(**klesha_d),
                 ),
             ))
 

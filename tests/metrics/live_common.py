@@ -45,9 +45,11 @@ def probe_torch() -> tuple[bool, str]:
 
 
 def isolated_config(tmp_path: Path, **updates) -> REMSConfig:
+    root = Path(tmp_path)
+    root.mkdir(parents=True, exist_ok=True)
     base = REMSConfig()
-    db_path = tmp_path / "wp_live.sqlite3"
-    chroma_path = tmp_path / "chroma_wp_live"
+    db_path = root / "wp_live.sqlite3"
+    chroma_path = root / "chroma_wp_live"
     storage = StorageConfig(
         database_url=f"sqlite:///{db_path.as_posix()}",
         chromadb_path=str(chroma_path),
@@ -73,7 +75,7 @@ def build_pipeline(
             mock_ef.return_value = FakeEmbeddingFunction()
             pipeline = REMSPipeline.from_config(cfg)
         notes.append(
-            "- **Chroma 嵌入**: 假向量（`REMS_LIVE_ALLOW_FAKE_EMBEDDING=1`），语义检索质量不保证。"
+            "**Chroma 嵌入**: 假向量（`REMS_LIVE_ALLOW_FAKE_EMBEDDING=1`），语义检索质量不保证。"
         )
     else:
         torch_ok, torch_msg = probe_torch()
@@ -84,7 +86,7 @@ def build_pipeline(
                 "请改用可用 torch 的环境，或设置 `REMS_LIVE_ALLOW_FAKE_EMBEDDING=1`。"
             )
         pipeline = REMSPipeline.from_config(cfg)
-        notes.append(f"- **Chroma 嵌入**: `{cfg.embedding.model_name}`（{torch_msg}）")
+        notes.append(f"**Chroma 嵌入**: `{cfg.embedding.model_name}`（{torch_msg}）")
     return pipeline, cfg, notes
 
 

@@ -82,5 +82,9 @@ class FakeEmbeddingFunction:
     def __call__(self, input):  # noqa: A002
         return [[0.0] * 4 for _ in input]
 
+    def embed_query(self, input):  # noqa: A002
+        """Chroma query path calls ``embed_query``; ingest uses ``__call__``."""
+        return self(input)
+
     def name(self) -> str:
         return "default"

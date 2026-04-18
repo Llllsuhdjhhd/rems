@@ -1,10 +1,12 @@
 """WP-LIVE §1 / §2 / §4.4 — single-user narrative through full ``ingest``.
 
-运行：``REMS_RUN_LIVE_METABOLISM_TEST=1``；可选 ``REMS_WP_REPORT_DIR``、``REMS_LIVE_ALLOW_FAKE_EMBEDDING=1``。
+运行：``REMS_RUN_LIVE_METABOLISM_TEST=1``；可选 ``REMS_WP_REPORT_DIR``、``REMS_LIVE_ALLOW_FAKE_EMBEDDING=1``、
+``REMS_WP_LIVE_NARRATIVE_ROUNDS``（正整数时只跑剧本前 *N* 条，便于短程真模型试跑）。
 """
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 
 import pytest
@@ -52,9 +54,24 @@ NARRATIVE_INPUTS: list[str] = [
 ]
 
 
+def _narrative_inputs_this_run() -> list[str]:
+    raw = os.environ.get("REMS_WP_LIVE_NARRATIVE_ROUNDS", "").strip()
+    if not raw:
+        return list(NARRATIVE_INPUTS)
+    try:
+        n = int(raw)
+    except ValueError:
+        return list(NARRATIVE_INPUTS)
+    if n <= 0:
+        return list(NARRATIVE_INPUTS)
+    return NARRATIVE_INPUTS[:n]
+
+
 @pytest.mark.live_llm
 def test_wp_live_single_mode_narrative(tmp_path, monkeypatch) -> None:
     live_llm_skip_if_disabled()
+
+    narrative_inputs = _narrative_inputs_this_run()
 
     pipeline, cfg, emb_notes = build_pipeline(
         tmp_path,
@@ -99,9 +116,20 @@ def test_wp_live_single_mode_narrative(tmp_path, monkeypatch) -> None:
 
     rep = WPReporter(default_report_path("wp_live_single_mode.md"), "单人模式全景叙述")
     rep.set_config_snapshot(cfg)
-    rep.set_llm_env_summary(emb_notes)
+    rounds_note = os.environ.get("REMS_WP_LIVE_NARRATIVE_ROUNDS", "").strip()
+    rep.set_llm_env_summary(
+        emb_notes
+        + (
+            [f"**剧本截断**: `REMS_WP_LIVE_NARRATIVE_ROUNDS={rounds_note}` → 本轮 **{len(narrative_inputs)}** 条"]
+            if rounds_note
+            else []
+        ),
+    )
     rep.set_repro_footer(
-        pytest_cmd="python -m pytest tests/test_wp_live_single_mode_narrative.py -v -s",
+        pytest_cmd=(
+            "python -m pytest tests/test_wp_live_single_mode_narrative.py -v -s"
+            + (f"  # REMS_WP_LIVE_NARRATIVE_ROUNDS={rounds_note}" if rounds_note else "")
+        ),
     )
 
     all_sealed: list = []
@@ -110,7 +138,7 @@ def test_wp_live_single_mode_narrative(tmp_path, monkeypatch) -> None:
     last_recall_block = None
     frag_event = None
 
-    for i, raw in enumerate(NARRATIVE_INPUTS, start=1):
+    for i, raw in enumerate(narrative_inputs, start=1):
         result = pipeline.ingest(raw, mode=ProcessingMode.DIALOGUE)
         all_sealed.extend(result.sealed_events)
         for ev in result.sealed_events:
@@ -331,7 +359,7 @@ def test_wp_live_single_mode_narrative(tmp_path, monkeypatch) -> None:
 
     rep.add_run_summary(
         [
-            f"- 剧本轮次：**{len(NARRATIVE_INPUTS)}**",
+            f"- 剧本轮次：**{len(narrative_inputs)}**（全量剧本共 {len(NARRATIVE_INPUTS)} 条）",
             f"- 新封存事件数：**{len(all_sealed)}**",
             f"- LLM 调用次数：**{len(store.llm_calls)}**",
         ]
