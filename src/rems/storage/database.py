@@ -60,6 +60,8 @@ class RoleRecord(Base):
     entity_type = Column(String, default="person")
     aliases = Column(JSON, default=list)
     created_at = Column(DateTime, nullable=False)
+    # 角色在系统中是否属于强制生成的“可疑记录”（身份不确切等）
+    is_suspicious = Column(Boolean, default=False)
 
 
 class WhitePaintingRecord(Base):
@@ -72,7 +74,10 @@ class WhitePaintingRecord(Base):
     emotional_model = Column(JSON, default=dict)
     importance = Column(String, default="C")
     create_time = Column(DateTime, nullable=False)
+    # 由 AE 映射的记忆权重 [0,1]，越高越抗遗忘
     memory_weight = Column(Float, default=0.0)
+    # 该条目是否包含可疑标记
+    is_suspicious = Column(Boolean, default=False)
 
 
 class ShadowRecord(Base):

@@ -52,34 +52,41 @@ class RecallService:
         shadow: Shadow | None = None,
         focus_role_ids: set[str] | None = None,
     ) -> RecallBlock:
-        """Build the recall block for *query*.
-
-        Parameters
-        ----------
-        query:
-            Current raw input text used as semantic query.
-        shadow:
-            Unprocessed shadow buffer; prepended to *query* for richer search.
-        focus_role_ids:
-            Role IDs considered "primary" in the current context (e.g. the
-            main user or roles mentioned in the current input).  Events where
-            these roles have S/A importance will receive more detailed summaries;
-            events where they are absent or minor will receive more compressed ones.
-        """
+        """Build the recall block for *query*. Two-stage retrieval implementation."""
         search_text = query
         if shadow and shadow.content:
             search_text = shadow.content + "\n" + query
 
-        hits = self._vector.search(search_text, n_results=20)
+        # ========================================================
+        # Phase 1: 海选匹配与数值遗忘过滤 (Vector + Time Decay)
+        # ========================================================
+        # 此阶段主要利用底层检索粗拉取，将"时间惩罚（遗忘因子）"尽压至第一级计算
+        hits = self._vector.search(search_text, n_results=40)
         if not hits:
             return RecallBlock()
 
-        scored_events: list[tuple[Event, float]] = []
+        phase1_candidates = []
         for hit in hits:
             event = self._event_repo.get(hit["event_id"])
             if event is None or event.is_tombstoned:
                 continue
             raw_sim = 1.0 - hit.get("distance", 1.0)
+            
+            # 第一阶段分数仅考虑：纯距离相似度 + 时间衰减因子（纯数值计算），滤除冗余
+            time_decay = self._time_decay(event.create_time)
+            p1_score = 0.8 * raw_sim + 0.2 * time_decay
+            phase1_candidates.append((event, p1_score, raw_sim))
+
+        # 按照包含遗忘因子的前置打分进行排序与强制截断，保留头部若干项进入精排
+        phase1_candidates.sort(key=lambda x: x[1], reverse=True)
+        top_candidates = phase1_candidates[:15]
+
+        # ========================================================
+        # Phase 2: 情感精排与深度再校准 (Emotion & Entity Routing)
+        # ========================================================
+        scored_events: list[tuple[Event, float]] = []
+        for event, p1_score, raw_sim in top_candidates:
+            # 这里调用提取 AE、实体图谱的重负荷计算，得出二次重排的综合分
             score = self._hybrid_score(event, raw_sim)
             scored_events.append((event, score))
 

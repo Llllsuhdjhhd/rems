@@ -13,10 +13,10 @@ from .event import EmotionalModel, Importance
 # 见《REMS 记忆系统规范解析》第 2 章（2.2 白描与遗忘、2.3 双轨制状态机）。
 
 
+import uuid
+
 def generate_role_id() -> str:
-    ts = int(time.time() * 1000)
-    rand = secrets.token_hex(4)
-    return f"ROL-{ts:013x}-{rand}"
+    return f"ROL-{uuid.uuid4().hex}"
 
 
 class WhitePaintingEntry(BaseModel):
@@ -33,6 +33,8 @@ class WhitePaintingEntry(BaseModel):
     create_time: datetime = Field(default_factory=datetime.now)
     # 由 AE 映射的记忆权重 [0,1]，越高越抗遗忘（白皮书 2.2 动态遗忘）。
     memory_weight: float = 0.0
+    # 该条目是否包含可疑标记（事件边界/仲裁不确定的产物）
+    is_suspicious: bool = False
 
 
 class SemanticCard(BaseModel):
@@ -81,3 +83,5 @@ class Role(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     white_painting: list[WhitePaintingEntry] = Field(default_factory=list)  # 时间序事实流（2.2）。
     semantic_card: SemanticCard | None = None  # 并行轨道的压缩状态（2.3）。
+    # 角色在系统中是否属于强制生成的“可疑记录”（身份不确切等）
+    is_suspicious: bool = False

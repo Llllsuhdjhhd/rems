@@ -34,7 +34,6 @@ class ExtractedRole(BaseModel):
 
 class RoleExtractionResult(BaseModel):
     roles: list[ExtractedRole] = Field(default_factory=list)
-    depronom_text: str = ""
 
 
 class RoleExtractionSkill:
@@ -95,7 +94,6 @@ class RoleExtractionSkill:
 
         return RoleExtractionResult(
             roles=extracted,
-            depronom_text=data.get("depronom_text", content_raw),
         )
 
     @staticmethod

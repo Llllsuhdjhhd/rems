@@ -56,7 +56,7 @@ class RoleService:
     # Registration
     # ------------------------------------------------------------------
 
-    def register_role(self, name: str, entity_type: str = "person", aliases: list[str] | None = None) -> Role:
+    def register_role(self, name: str, entity_type: str = "person", aliases: list[str] | None = None, is_suspicious: bool = False) -> Role:
         existing = self._repo.find_by_name(name)
         if existing:
             logger.info("Role '%s' already exists as %s", name, existing.role_id)
@@ -67,6 +67,7 @@ class RoleService:
             name=name,
             entity_type=entity_type,
             aliases=aliases or [],
+            is_suspicious=is_suspicious,
         )
         self._repo.save(role)
         logger.info("Registered new role %s (%s)", role.role_id, name)
@@ -120,6 +121,7 @@ class RoleService:
                 importance=entry.importance,
                 create_time=event.create_time,
                 memory_weight=memory_weight,
+                is_suspicious=role.is_suspicious,
             )
             self._repo.add_white_painting_entry(role.role_id, wp)
             logger.debug("WP appended for %s from event %s (AE=%.2f)", role.role_id, event.event_id, memory_weight)
@@ -259,11 +261,12 @@ class RoleService:
     # Role-aware resolution helpers
     # ------------------------------------------------------------------
 
-    def resolve_and_register(self, extracted: list[ExtractedRole]) -> dict[str, str]:
+    def resolve_and_register(self, extracted: list[ExtractedRole], is_suspicious: bool = False) -> dict[str, str]:
         """Ensure every extracted role has a persistent role_id.
 
         为抽取结果中每个角色解析或创建持久 ``role_id``：若已带 ID 且库中存在则复用；
         否则按名称查找；再否则 ``register_role`` 新建。返回从抽取键到最终 ``role_id`` 的映射。
+        如果本次生成涉及疑难边界仲裁或强制兜底（is_suspicious=True），则新注册角色附带可疑属性。
         """
         mapping: dict[str, str] = {}
         for er in extracted:
@@ -289,7 +292,8 @@ class RoleService:
                 )
                 if is_invalid:
                     clean_name = f"未知人物_{secrets.token_hex(2)}"
+                    is_suspicious = True  # 仲裁边界不定产生垃圾名称，强制标记为可疑
                 
-                new_role = self.register_role(clean_name, er.entity_type)
+                new_role = self.register_role(clean_name, er.entity_type, is_suspicious=is_suspicious)
                 mapping[key] = new_role.role_id
         return mapping

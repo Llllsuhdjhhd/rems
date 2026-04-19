@@ -72,14 +72,51 @@ class BoundaryDetectionSkill:
             ],
         )
 
-        completed = [
-            CompletedFragment(
-                content=item.get("content", ""),
-                continuation_of=item.get("continuation_of"),
-            )
-            for item in data.get("completed_events", [])
-            if item.get("content")
-        ]
+        # 直接使用原文截断以替代 LLM 输出全量事件内容
+        combined_text = shadow_content
+        if combined_text and current_input:
+            combined_text += "\n" + current_input
+        elif current_input:
+            combined_text = current_input
+            
+        completed = []
+        last_idx = 0
+        
+        import re
+
+        for item in data.get("completed_events", []):
+            end_snip = item.get("end_snippet", "").strip()
+            if not end_snip:
+                continue
+                
+            # 改进正则：处理转义字符，并允许字符间存在任意空白/换行
+            # 先对 snippet 做预处理，压缩连续空白
+            clean_snip = re.sub(r"\s+", "", end_snip)
+            if not clean_snip:
+                continue
+                
+            # 为每个字符建立容错模式
+            pattern_parts = []
+            for c in clean_snip:
+                pattern_parts.append(re.escape(c))
+            pattern_str = r"\s*".join(pattern_parts)
+            
+            match = re.search(pattern_str, combined_text[last_idx:], re.DOTALL)
+            
+            if match:
+                cut_idx = last_idx + match.end()
+                content_chunk = combined_text[last_idx:cut_idx].strip()
+                # 检查截取内容是否过短（通常不应发生）
+                if len(content_chunk) > 5:
+                    completed.append(CompletedFragment(
+                        content=content_chunk,
+                        continuation_of=item.get("continuation_of"),
+                    ))
+                    last_idx = cut_idx
+            else:
+                logger.warning("Failed to locate end_snippet in text: %s", end_snip)
+                # 匹配失败时不应吞掉全文，而是尝试跳过
+                continue
 
         new_unc = [
             NewUnclosed(

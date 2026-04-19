@@ -54,6 +54,7 @@ class MetabolismService:
         raw_input: str,
         *,
         force_save: bool = False,
+        input_id: str | None = None,
     ) -> list[Event]:
         """Ingest *raw_input*, return list of newly sealed events (may be empty).
 
@@ -66,11 +67,20 @@ class MetabolismService:
         shadow = self._repo.get_shadow()
         unclosed = self._repo.get_unclosed_events()
 
-        if force_save:
-            return self._force_save_all(shadow, raw_input, unclosed)
+        total_len = (shadow.length if shadow else 0) + len(raw_input)
+        force_fallback = False
+        
+        # 兜底截断测试：如果超过 1.2 倍 msg_len，不再等待模型判断，强制闭环
+        fallback_threshold = int(self._config.len_msg * 1.2)
+        if total_len > fallback_threshold:
+            logger.warning("Input + shadow length %d exceeds fallback threshold %d, forcing fallback", total_len, fallback_threshold)
+            force_fallback = True
+
+        if force_save or force_fallback:
+            return self._force_save_all(shadow, raw_input, unclosed, is_suspicious=force_fallback, input_id=input_id)
 
         result = self._boundary.detect(shadow.content, raw_input, unclosed)
-        return self._apply_boundary_result(result, unclosed)
+        return self._apply_boundary_result(result, unclosed, input_id=input_id)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -80,6 +90,7 @@ class MetabolismService:
         self,
         result: BoundaryResult,
         unclosed: list[UnclosedEvent],
+        input_id: str | None = None,
     ) -> list[Event]:
         sealed: list[Event] = []
 
@@ -94,7 +105,7 @@ class MetabolismService:
             else:
                 content = frag.content
 
-            event = self._event_svc.seal_event(content)
+            event = self._event_svc.seal_event(content, input_id=input_id)
             sealed.append(event)
 
         self._repo.update_shadow(Shadow(content=result.remaining_shadow, updated_at=datetime.now()))
@@ -117,22 +128,25 @@ class MetabolismService:
         shadow: Shadow,
         raw_input: str,
         unclosed: list[UnclosedEvent],
+        *,
+        is_suspicious: bool = False,
+        input_id: str | None = None,
     ) -> list[Event]:
-        """Manual trigger (/save, /mem): seal everything immediately.
+        """Manual trigger (/save, /mem) or length-based fallback: seal everything immediately.
 
-        手动触发：将残影与当前输入合并后尽可能封存；遍历未完成库中已有内容的条目逐一封存并删除；
-        最后清空残影。用于用户显式「保存记忆」或调试绕过边界模型。
+        手动触发或长度被迫兜底：将残影与当前输入合并后尽可能封存；遍历未完成库中已有内容的条目逐一封存并删除；
+        最后清空残影。用于用户显式「保存记忆」或文本溢出边界强制回收。
         """
         sealed: list[Event] = []
 
         combined = (shadow.content + "\n" + raw_input).strip()
         if combined:
-            event = self._event_svc.seal_event(combined)
+            event = self._event_svc.seal_event(combined, is_suspicious=is_suspicious, input_id=input_id)
             sealed.append(event)
 
         for ue in unclosed:
             if ue.total_length > 0:
-                event = self._event_svc.seal_event(ue.merged_content)
+                event = self._event_svc.seal_event(ue.merged_content, is_suspicious=is_suspicious, input_id=input_id)
                 sealed.append(event)
             self._repo.delete_unclosed_event(ue.id)
 

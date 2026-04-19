@@ -136,6 +136,7 @@ class RoleRepository:
                 entity_type=role.entity_type,
                 aliases=role.aliases,
                 created_at=role.created_at,
+                is_suspicious=role.is_suspicious,
             )
             s.merge(record)
             s.commit()
@@ -190,6 +191,7 @@ class RoleRepository:
                 importance=importance_val,
                 create_time=entry.create_time,
                 memory_weight=entry.memory_weight,
+                is_suspicious=entry.is_suspicious,
             )
             s.add(record)
             s.commit()
@@ -248,6 +250,7 @@ class RoleRepository:
             created_at=rec.created_at,
             white_painting=[RoleRepository._to_wp_entry(e) for e in entries],
             semantic_card=card,
+            is_suspicious=bool(rec.is_suspicious),
         )
 
     @staticmethod
@@ -260,6 +263,7 @@ class RoleRepository:
             importance=e.importance,
             create_time=e.create_time,
             memory_weight=float(e.memory_weight or 0.0),
+            is_suspicious=bool(e.is_suspicious),
         )
 
 

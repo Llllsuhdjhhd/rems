@@ -57,6 +57,8 @@ class EventService:
         role_entries: list[EventRoleEntry] | None = None,
         skip_roles: bool = False,
         known_roles: list | None = None,
+        is_suspicious: bool = False,
+        input_id: str | None = None,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
@@ -77,10 +79,21 @@ class EventService:
         if role_entries is None and not skip_roles:
             extraction = self._role_skill.extract(content_raw, known_roles=known_roles)
             
+            if not extraction.roles and is_suspicious:
+                import secrets
+                from ..models.event import Importance
+                
+                mock_er = ExtractedRole(
+                    name=f"临时记录角色_{secrets.token_hex(2)}",
+                    entity_type="unknown",
+                    importance=Importance.D
+                )
+                extraction.roles.append(mock_er)
+            
             # Resolve extracted names to real persistent IDs
             id_mapping = {}
             if self._role_service:
-                id_mapping = self._role_service.resolve_and_register(extraction.roles)
+                id_mapping = self._role_service.resolve_and_register(extraction.roles, is_suspicious=is_suspicious)
             
             role_entries = []
             for er in extraction.roles:
@@ -98,6 +111,7 @@ class EventService:
             role_list=role_entries or [],
             status=EventStatus.ACTIVE,
             decoration=decoration,
+            input_id=input_id,
         )
 
         # EMA 动态演化 + activation_energy 计算（白皮书 2.5）。

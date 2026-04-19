@@ -12,15 +12,15 @@ from pydantic import BaseModel, Field
 # Vedana/Klesha、抽象字段、墓碑）及 AE 工程化抗遗忘逻辑。
 
 
-def generate_event_id() -> str:
-    """Lexicographically-ordered unique event identifier.
+import uuid
 
-    生成字典序大致随时间递增、全局唯一的 ``event_id``：毫秒时间戳（13 位十六进制）加短随机后缀，
-    前缀 ``EVT-``，满足可追溯与可排序的工程需求（白皮书 1.1.1）。
+def generate_event_id() -> str:
+    """Stateless unique event identifier.
+
+    废除字典序，改用无状态分布式的唯一标识（目前使用 uuid4 模拟），
+    前缀 ``EVT-``，满足海量并发和高可用等无状态工程需求（白皮书 1.1.1）。
     """
-    ts = int(time.time() * 1000)
-    rand = secrets.token_hex(4)
-    return f"EVT-{ts:013x}-{rand}"
+    return f"EVT-{uuid.uuid4().hex}"
 
 
 class Importance(str, Enum):
@@ -51,11 +51,11 @@ class Vedana(BaseModel):
 
     佛学五受（乐、苦、喜、忧、舍）在工程上映射为上述英文字段，便于 LLM JSON 键稳定输出（白皮书 1.1.4）。
     """
-    joy: float = 0.0
-    suffering: float = 0.0
-    happiness: float = 0.0
-    worry: float = 0.0
-    equanimity: float = 0.0
+    joy: float = 1.0
+    suffering: float = 1.0
+    happiness: float = 1.0
+    worry: float = 1.0
+    equanimity: float = 1.0
 
 
 class Klesha(BaseModel):
@@ -63,12 +63,12 @@ class Klesha(BaseModel):
 
     贪、嗔、痴、慢、疑、恶见映射为上述英文键；与 Vedana 一起构成事件内情感量化，驱动 AE 与 NPC 增量等（1.1.4）。
     """
-    greed: float = 0.0
-    anger: float = 0.0
-    ignorance: float = 0.0
-    pride: float = 0.0
-    doubt: float = 0.0
-    wrong_view: float = 0.0
+    greed: float = 1.0
+    anger: float = 1.0
+    ignorance: float = 1.0
+    pride: float = 1.0
+    doubt: float = 1.0
+    wrong_view: float = 1.0
 
 
 class EmotionalModel(BaseModel):
@@ -99,6 +99,7 @@ class EventRoleEntry(BaseModel):
 class Event(BaseModel):
     event_id: str = Field(default_factory=generate_event_id)
     create_time: datetime = Field(default_factory=datetime.now)
+    input_id: Optional[str] = None  # 记录产生此事件的原始输入/对话轮次唯一标识
     content_raw: str  # L0：基本事件为已闭环事实原文；抽象事件为自子事件归纳的合成描述（白皮书 1.1.2、3.1）。
 
     summaries: dict[str, str] = Field(default_factory=dict)  # L1~Ln 递归摘要（白皮书 1.1.3）。
@@ -138,25 +139,27 @@ class Event(BaseModel):
 
     @property
     def affective_energy(self) -> float:
-        """Event-level AE: max emotional intensity across all role entries.
+        """Event-level AE based on deviation from baseline (1.0).
 
-        AE = max over roles of (max(vedana values) + max(klesha values)) / 2,
-        clamped to [0, 1].
-
-        事件级情感能量 AE：对每个角色条目先取五受分量与六烦恼分量的各自最大值，再求平均，
-        然后在所有角色上取最大，并限制在 [0,1]。该标量进入回忆混合打分，并影响白描 ``memory_weight``，
-        体现「强情感事件更难遗忘」（白皮书 1.1.4 工程附加逻辑、4.4）。
+        [接口占位] 当前仅提供临时算法：计算全要素偏离基础值 1.0 的最大波动（绝对差值）平均作为初步实现。
+        ※ TODO: 这里的算法留出接口，后续需由业务或数据科学重新评估及重新实写。
         """
         if not self.role_list:
             return 0.0
+            
         max_ae = 0.0
         for entry in self.role_list:
             v = entry.emotional_model.vedana
             k = entry.emotional_model.klesha
-            vedana_peak = max(v.joy, v.suffering, v.happiness, v.worry, v.equanimity)
-            klesha_peak = max(k.greed, k.anger, k.ignorance, k.pride, k.doubt, k.wrong_view)
-            ae = (vedana_peak + klesha_peak) / 2.0
+            
+            # 使用与 1.0 基础值的偏离程度（绝对值）作为波动能量的粗略估计
+            vedana_peak_diff = max(abs(v.joy-1.0), abs(v.suffering-1.0), abs(v.happiness-1.0), abs(v.worry-1.0), abs(v.equanimity-1.0))
+            klesha_peak_diff = max(abs(k.greed-1.0), abs(k.anger-1.0), abs(k.ignorance-1.0), abs(k.pride-1.0), abs(k.doubt-1.0), abs(k.wrong_view-1.0))
+            
+            ae = (vedana_peak_diff + klesha_peak_diff) / 2.0
             max_ae = max(max_ae, ae)
+            
+        # 限制在某一合理上限或继续返回 0~1 的百分比
         return min(max_ae, 1.0)
 
     @property

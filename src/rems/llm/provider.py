@@ -162,23 +162,37 @@ class LLMProvider:
                         if match:
                             recovered[key] = match.group(1).replace('\\"', '"') # Basic unescape
                     
-                    # Pattern for list values (like completed_events or new_unclosed)
-                    # We look for the array start and end
+                    # Pattern for list of objects (like completed_events or new_unclosed)
                     for key in ["completed_events", "new_unclosed", "roles", "sealed_events"]:
+                        # Extract the array content between [...]
                         match = re.search(f'"{key}"\\s*:\\s*\\[(.*?)\\]\\s*(?:,|}})', inner, re.DOTALL)
                         if match:
-                            # If it's a list of objects, this is still hard, but we can try to 
-                            # parse individual objects if they are simple, or just return empty for safety
-                            # In most cases, these lists contain objects that are also broken.
-                            # For now, we try to parse the inner list if possible
-                            try:
-                                recovered[key] = json.loads(f"[{match.group(1)}]")
-                            except:
-                                # If nested parsing fails, skip or use a simpler recovery
-                                pass
+                            array_str = match.group(1).strip()
+                            if not array_str:
+                                recovered[key] = []
+                                continue
+                            
+                            # Heuristic: split objects by "}," or "}\s*," pattern
+                            items = []
+                            obj_matches = re.finditer(r"\{(.*?)\}", array_str, re.DOTALL)
+                            for m in obj_matches:
+                                obj_inner = m.group(1)
+                                obj_recovered = {}
+                                # Recover simple keys inside the object
+                                for subkey in ["content", "end_snippet", "continuation_of", "name", "role_id", "entity_type", "importance", "logical_gaps"]:
+                                    # Very loose match for "key": "value"
+                                    # This handles even garbage around the quotes
+                                    sub_match = re.search(f'"{subkey}"\\s*:\\s*"(.*?)"', obj_inner, re.DOTALL)
+                                    if sub_match:
+                                        # Fix: replace internal unescaped quotes if they exist 
+                                        # (though here we just captured everything between the first and last ")
+                                        obj_recovered[subkey] = sub_match.group(1).replace('\\"', '"')
+                                if obj_recovered:
+                                    items.append(obj_recovered)
+                            recovered[key] = items
                     
                     if recovered:
-                        logger.warning("JSON recovered via structural scraper. Partial data may be lost.")
+                        logger.warning("JSON recovered via structural scraper. HEURISTIC mode used for objects.")
                         return recovered
 
                     with open("failed_llm_json.txt", "w", encoding="utf-8") as f:

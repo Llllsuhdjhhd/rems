@@ -93,19 +93,19 @@ BOUNDARY_USER = """\
 ## 当前输入
 {current_input}
 
-请分析以上文本，返回如下 JSON：
+请分析以上文本，返回如下 JSON（注意不要返回原文本的正文，以节约 token）：
 ```json
 {{
   "completed_events": [
     {{
-      "content": "提取出的完整事件原文",
+      "end_snippet": "该事件在此处结束的精确原文片段（请严格从原文复制最后的10-15个及以上字符），用于系统截断定位，严禁发挥。",
       "continuation_of": null 或 "未完成事件ID"
     }}
   ],
-  "remaining_shadow": "剩余的未消化文本",
+  "remaining_shadow": "剩余的尚未闭合、无头无尾的残影文本（必须是提取自原文的精确后缀）",
   "new_unclosed": [
     {{
-      "content": "新识别到但未闭环的事实片段",
+      "content": "新识别到但未闭环的事实片段句子（精简）",
       "logical_gaps": "缺什么信息才能闭环"
     }}
   ]
@@ -151,8 +151,8 @@ ROLE_EXTRACTION_SYSTEM = """\
 1. 【绝对指令】"name" 字段必须填写原文中角色的姓名、称谓或具体的身份标识（如：“甄士隐”、“贾雨村”、“英莲”）。
 2. 【严禁行为】禁止在 "name" 中填写数字（如 "1", "2"）、"null"、"未知人物"、"核心用户" 等任何非真实名字的占位符。
 3. 替换所有模糊代词（他/她/它/他们等）为上述明确角色名。
-4. 对每个角色评定重要性：S/A/B/C/D。
-5. 生成三级快照：L1（提及）、L2（互动）、L3（决策）。
+4. 对每个角色评定重要性：S（核心）/A（主要）/B（次要）/C（边缘）/D（背景）。
+5. 生成快照：对 S/A/B 级的重要角色生成完整三级快照（L1提及、L2互动、L3决策）；对 C/D 级的不重要角色仅生成 L1（提及）即可，禁止对其虚构 L2/L3。
 6. 量化当次事件中该角色的情感状态（Vedana/Klesha 数值在 0-1 之间）。
 
 输出严格 JSON。"""
@@ -175,16 +175,15 @@ ROLE_EXTRACTION_USER = """\
       "importance": "S|A|B|C|D",
       "snapshot": {{
         "l1_mention": "...",
-        "l2_interaction": "...",
-        "l3_decision": "..."
+        "l2_interaction": "...(仅重要角色S/A/B填写，C/D级直接省略该字段或留空)",
+        "l3_decision": "...(同上，仅重要角色填写)"
       }},
       "emotion": {{
         "vedana": {{"joy":0,"suffering":0,"happiness":0,"worry":0,"equanimity":0}},
         "klesha": {{"greed":0,"anger":0,"ignorance":0,"pride":0,"doubt":0,"wrong_view":0}}
       }}
     }}
-  ],
-  "depronom_text": "替换代词后的完整文本"
+  ]
 }}
 ```"""
 

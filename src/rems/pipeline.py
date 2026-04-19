@@ -218,6 +218,7 @@ class REMSPipeline:
         force_save: bool = False,
         mode: ProcessingMode = ProcessingMode.DIALOGUE,
         npc_role_id: str | None = None,
+        input_id: str | None = None,
     ) -> ProcessingResult:
         """Full processing cycle with multi-scenario output.
 
@@ -258,7 +259,7 @@ class REMSPipeline:
             )
 
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
-        sealed = self.metabolism_service.process_input(raw_input, force_save=force_save)
+        sealed = self.metabolism_service.process_input(raw_input, force_save=force_save, input_id=input_id)
 
         # 角色：每个新事件更新白描时间线并刷新语义卡片（第 2.2–2.3）。
         for event in sealed:
