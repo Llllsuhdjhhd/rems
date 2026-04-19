@@ -172,6 +172,9 @@ class REMSPipeline:
         evolution_skill = InductiveEvolutionSkill(llm, config)
 
         emotion_evolver = EMAEvolver(config, role_repo)
+        # Pass llm to role_service so semantic cards can be refreshed in-process
+        role_service = RoleService(config, role_repo, role_skill, llm=llm)
+        
         event_service = EventService(
             config,
             llm,
@@ -179,10 +182,10 @@ class REMSPipeline:
             vector_store,
             summary_skill,
             role_skill,
+            role_service=role_service,
             emotion_evolver=emotion_evolver,
         )
-        # Pass llm to role_service so semantic cards can be refreshed in-process
-        role_service = RoleService(config, role_repo, role_skill, llm=llm)
+        
         metabolism_service = MetabolismService(config, meta_repo, boundary_skill, event_service)
         recall_service = RecallService(config, event_repo, role_repo, vector_store)
         abstraction_service = AbstractionService(config, event_repo, vector_store, evolution_skill, summary_skill)

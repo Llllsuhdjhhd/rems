@@ -36,6 +36,7 @@ class EventService:
         vector_store: VectorStore,
         summary_skill: SummaryGenerationSkill,
         role_skill: RoleExtractionSkill,
+        role_service: RoleService | None = None,
         emotion_evolver: EMAEvolver | None = None,
     ):
         self._config = config
@@ -44,6 +45,7 @@ class EventService:
         self._vector = vector_store
         self._summary_skill = summary_skill
         self._role_skill = role_skill
+        self._role_service = role_service
         # 可选：若传入 EMAEvolver，则在封存前做情感动态演化并计算 activation_energy（白皮书 2.5）。
         self._emotion_evolver = emotion_evolver
 
@@ -74,10 +76,17 @@ class EventService:
 
         if role_entries is None and not skip_roles:
             extraction = self._role_skill.extract(content_raw, known_roles=known_roles)
+            
+            # Resolve extracted names to real persistent IDs
+            id_mapping = {}
+            if self._role_service:
+                id_mapping = self._role_service.resolve_and_register(extraction.roles)
+            
             role_entries = []
             for er in extraction.roles:
-                rid = er.role_id or er.name
-                role_entries.append(RoleExtractionSkill.to_event_role_entry(er, rid))
+                lookup_key = er.role_id or er.name
+                assigned_id = id_mapping.get(lookup_key, lookup_key)
+                role_entries.append(RoleExtractionSkill.to_event_role_entry(er, assigned_id))
 
         decoration = self._generate_decoration(content_raw)
 

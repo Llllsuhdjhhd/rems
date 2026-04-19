@@ -24,8 +24,12 @@ from ..models.event import (
 logger = logging.getLogger(__name__)
 
 
-def _emotion_subfields(raw: dict, field_names: set[str]) -> dict[str, float]:
+def _emotion_subfields(raw: Any, field_names: set[str]) -> dict[str, float]:
     """Keep only known keys and coerce to float; skip values the LLM returned as labels."""
+    if not isinstance(raw, dict):
+        if raw:
+            logger.warning("inductive_evolution: skip non-dict emotion field %r", raw)
+        return {}
     out: dict[str, float] = {}
     for k, v in raw.items():
         if k not in field_names:

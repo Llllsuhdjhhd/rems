@@ -36,8 +36,8 @@ class TaskModelMapping(BaseModel):
     # 以下为各技能默认模型名；可按任务强度分流成本（摘要/边界/抽取/抽象等）。
 
     summary: str = "tongyi-xiaomi-analysis-pro"
-    boundary_detection: str = "qwen-turbo"
-    role_extraction: str = "qwen-turbo"
+    boundary_detection: str = "qwen3.6-flash-2026-04-16"
+    role_extraction: str = "qwen3.6-flash-2026-04-16"
     abstraction: str = "MiniMax-M2.5"
     insight: str = "tongyi-xiaomi-analysis-pro"
     default: str = "qwen3.6-flash-2026-04-16"
@@ -75,7 +75,8 @@ class REMSConfig(BaseSettings):
     )
 
     # 由 token 窗口折算字符预算（白皮书 1.1.7：单条与缓冲区与上下文比例关系）。
-    context_window: int = 32768
+    # 调整为 128k (131072) 以支持 len_msg ≈ 3000。
+    context_window: int = 131072
     chars_per_token: float = 1.5
 
     llm: LLMConfig = Field(default_factory=LLMConfig)

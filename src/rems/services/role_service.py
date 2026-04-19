@@ -268,15 +268,28 @@ class RoleService:
         mapping: dict[str, str] = {}
         for er in extracted:
             key = er.role_id or er.name
-            if er.role_id:
+            # If the model returned "null" or some placeholder ROL, treat it as new
+            if er.role_id and er.role_id not in ("null", "None", ""):
                 role = self._repo.get(er.role_id)
                 if role:
                     mapping[key] = role.role_id
                     continue
+            
+            # Use name-based lookup
             role = self._repo.find_by_name(er.name)
             if role:
                 mapping[key] = role.role_id
             else:
-                new_role = self.register_role(er.name, er.entity_type)
+                # Sanitize name: if numeric or garbage, don't use it as the definitive name
+                clean_name = er.name
+                is_invalid = (
+                    er.name.isdigit() or 
+                    not er.name.strip() or 
+                    er.name.lower() in ("null", "none", "unknown", "核心用户", "未知角色")
+                )
+                if is_invalid:
+                    clean_name = f"未知人物_{secrets.token_hex(2)}"
+                
+                new_role = self.register_role(clean_name, er.entity_type)
                 mapping[key] = new_role.role_id
         return mapping

@@ -13,3 +13,4 @@ chroma_data/
 *.so
 .venv/
 venv/
+tests/

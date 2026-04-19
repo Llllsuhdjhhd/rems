@@ -107,9 +107,21 @@ class SemanticCardRecord(Base):
 # Database facade
 # ------------------------------------------------------------------
 
+import json
+from functools import partial
+
+# ------------------------------------------------------------------
+# Database facade
+# ------------------------------------------------------------------
+
 class Database:
     def __init__(self, url: str):
-        self.engine = create_engine(url, echo=False)
+        # 强制 json_serializer 使用 ensure_ascii=False，确保中文在 SQLite 数据库中以明文存储
+        self.engine = create_engine(
+            url, 
+            echo=False, 
+            json_serializer=partial(json.dumps, ensure_ascii=False)
+        )
         self._session_factory = sessionmaker(bind=self.engine)
 
     def create_tables(self) -> None:

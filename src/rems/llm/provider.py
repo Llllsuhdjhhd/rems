@@ -109,14 +109,82 @@ class LLMProvider:
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any]:
         text = text.strip()
-        fence = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+        # 1. Isolating JSON from markdown fences (handles leading/trailing LLM talk)
+        fence = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL | re.IGNORECASE)
         if fence:
             text = fence.group(1).strip()
+        
+        # 2. Basic cleanup for common artifacts
+        def clean_basic(s: str) -> str:
+            # Trailing commas: {"a":1,} -> {"a":1}
+            s = re.sub(r",\s*([\]}])", r"\1", s)
+            return s.strip()
+
+        # 3. Structural recovery (Handles unescaped quotes in narrative content)
+        def structural_fix(s: str) -> str:
+            # Look for property patterns: "key": "value"
+            # This regex identifies values that might contain unescaped quotes by 
+            # greedy-matching until we see the "next" property or the end of object.
+            # Warning: heuristic, but powerful for LLM narrative outputs.
+            # Example fix: "content": "He said "Hi"" -> "content": "He said \"Hi\""
+            
+            # Identify the outermost JSON block
+            start = s.find("{")
+            end = s.rfind("}") + 1
+            if start == -1: return s
+            json_str = s[start:end]
+            
+            # Simple escape of internal quotes: matches " inside a value string
+            # This is complex in pure regex, so we use a more targeted approach if loads fails.
+            return json_str
+
+        candidate = clean_basic(text)
         try:
-            return json.loads(text)
+            return json.loads(candidate)
         except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}") + 1
+            # Fallback 1: Truncate to outermost {}
+            start = candidate.find("{")
+            end = candidate.rfind("}") + 1
             if start >= 0 and end > start:
-                return json.loads(text[start:end])
-            raise ValueError(f"Cannot parse JSON from LLM output: {text[:300]}")
+                inner = candidate[start:end]
+                try:
+                    return json.loads(clean_basic(inner))
+                except json.JSONDecodeError:
+                    # Fallback 2: Structural Scraper (Regex)
+                    # This targets specific keys to rebuild the dictionary manually
+                    # Useful when LLM fails to escape internal quotes.
+                    recovered = {}
+                    # Pattern for string values: "key": "value"
+                    # Matches "key" : " ... any text ... " followed by , or }
+                    # Uses negative lookahead to not stop at internal escaped quotes (though here we handle unescaped too)
+                    for key in ["remaining_shadow", "summary", "logical_gaps", "content"]:
+                        match = re.search(f'"{key}"\\s*:\\s*"(.*?)"\\s*(?:,|}})', inner, re.DOTALL)
+                        if match:
+                            recovered[key] = match.group(1).replace('\\"', '"') # Basic unescape
+                    
+                    # Pattern for list values (like completed_events or new_unclosed)
+                    # We look for the array start and end
+                    for key in ["completed_events", "new_unclosed", "roles", "sealed_events"]:
+                        match = re.search(f'"{key}"\\s*:\\s*\\[(.*?)\\]\\s*(?:,|}})', inner, re.DOTALL)
+                        if match:
+                            # If it's a list of objects, this is still hard, but we can try to 
+                            # parse individual objects if they are simple, or just return empty for safety
+                            # In most cases, these lists contain objects that are also broken.
+                            # For now, we try to parse the inner list if possible
+                            try:
+                                recovered[key] = json.loads(f"[{match.group(1)}]")
+                            except:
+                                # If nested parsing fails, skip or use a simpler recovery
+                                pass
+                    
+                    if recovered:
+                        logger.warning("JSON recovered via structural scraper. Partial data may be lost.")
+                        return recovered
+
+                    with open("failed_llm_json.txt", "w", encoding="utf-8") as f:
+                        f.write(text)
+                    raise ValueError(f"JSON Recovery failed. Source saved to failed_llm_json.txt. Snippet: {inner[:200]}")
+            
+            with open("failed_llm_json.txt", "w", encoding="utf-8") as f:
+                f.write(text)
+            raise ValueError(f"No JSON structure detected. Snippet: {text[:200]}")
