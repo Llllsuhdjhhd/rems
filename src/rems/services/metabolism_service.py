@@ -98,14 +98,18 @@ class MetabolismService:
             if frag.continuation_of:
                 ue = self._find_unclosed(unclosed, frag.continuation_of)
                 if ue:
-                    content = ue.merged_content + "\n" + frag.content
+                    content = ue.merged_content + "\n" + frag.content_raw
                     self._repo.delete_unclosed_event(ue.id)
                 else:
-                    content = frag.content
+                    content = frag.content_raw
             else:
-                content = frag.content
+                content = frag.content_raw
 
-            event = self._event_svc.seal_event(content, input_id=input_id)
+            event = self._event_svc.seal_event(
+                content,
+                input_id=input_id,
+                pre_summaries=frag.summaries,
+            )
             sealed.append(event)
 
         self._repo.update_shadow(Shadow(content=result.remaining_shadow, updated_at=datetime.now()))

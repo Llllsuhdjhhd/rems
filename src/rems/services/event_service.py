@@ -59,6 +59,7 @@ class EventService:
         known_roles: list | None = None,
         is_suspicious: bool = False,
         input_id: str | None = None,
+        pre_summaries: dict[str, str] | None = None,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
@@ -82,7 +83,17 @@ class EventService:
             budget.snapshot_budget_per_role, budget.wp_budget_per_role, budget.decoration_budget,
         )
 
-        summary_result = self._summary_skill.generate(content_raw, char_budget=budget.summary_budget)
+        if pre_summaries:
+            from ..skills.summary_generation import SummaryResult
+            # 合并摘要架构：直接使用上游传入的 summaries
+            summary_result = SummaryResult(
+                summaries=pre_summaries,
+                summary_lengths={k: len(v) for k, v in pre_summaries.items()},
+                actual_max_level=len(pre_summaries),
+            )
+        else:
+            # 兼容旧逻辑/应急后置降级：使用独立摘要技能
+            summary_result = self._summary_skill.generate(content_raw, char_budget=budget.summary_budget)
 
         if role_entries is None and not skip_roles:
             extraction = self._role_skill.extract(

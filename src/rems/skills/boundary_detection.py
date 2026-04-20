@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 
 class CompletedFragment(BaseModel):
-    content: str
+    content_raw: str
+    summaries: dict[str, str] = Field(default_factory=dict)
     continuation_of: Optional[str] = None
 
 
@@ -49,16 +50,20 @@ class BoundaryDetectionSkill:
         shadow_content: str,
         current_input: str,
         unclosed_events: list[UnclosedEvent] | None = None,
+        char_budget: int | None = None,
     ) -> BoundaryResult:
         unclosed_summary = "无" if not unclosed_events else "\n".join(
             f"- ID={ue.id}, 片段={ue.merged_content[:80]}…, 缺={ue.logical_gaps or '未知'}"
             for ue in (unclosed_events or [])
         )
 
+        budget_hint = f"\n【字数预算】请尽量将每个事件的 L1 摘要控制在 {char_budget} 字以内。\n" if char_budget else ""
+
         user_msg = BOUNDARY_USER.format(
             shadow=shadow_content or "（空）",
             unclosed_summary=unclosed_summary,
             current_input=current_input,
+            budget_hint=budget_hint,
         )
 
         # 白皮书 2.2：system prompt 首部注入模式块，让边界检测也感知代词归属约束。
@@ -72,51 +77,17 @@ class BoundaryDetectionSkill:
             ],
         )
 
-        # 直接使用原文截断以替代 LLM 输出全量事件内容
-        combined_text = shadow_content
-        if combined_text and current_input:
-            combined_text += "\n" + current_input
-        elif current_input:
-            combined_text = current_input
-            
         completed = []
-        last_idx = 0
-        
-        import re
-
         for item in data.get("completed_events", []):
-            end_snip = item.get("end_snippet", "").strip()
-            if not end_snip:
+            extracted_raw = item.get("content_raw", "").strip()
+            if not extracted_raw:
                 continue
-                
-            # 改进正则：处理转义字符，并允许字符间存在任意空白/换行
-            # 先对 snippet 做预处理，压缩连续空白
-            clean_snip = re.sub(r"\s+", "", end_snip)
-            if not clean_snip:
-                continue
-                
-            # 为每个字符建立容错模式
-            pattern_parts = []
-            for c in clean_snip:
-                pattern_parts.append(re.escape(c))
-            pattern_str = r"\s*".join(pattern_parts)
             
-            match = re.search(pattern_str, combined_text[last_idx:], re.DOTALL)
-            
-            if match:
-                cut_idx = last_idx + match.end()
-                content_chunk = combined_text[last_idx:cut_idx].strip()
-                # 检查截取内容是否过短（通常不应发生）
-                if len(content_chunk) > 5:
-                    completed.append(CompletedFragment(
-                        content=content_chunk,
-                        continuation_of=item.get("continuation_of"),
-                    ))
-                    last_idx = cut_idx
-            else:
-                logger.warning("Failed to locate end_snippet in text: %s", end_snip)
-                # 匹配失败时不应吞掉全文，而是尝试跳过
-                continue
+            completed.append(CompletedFragment(
+                content_raw=extracted_raw,
+                summaries=item.get("summaries", {}),
+                continuation_of=item.get("continuation_of"),
+            ))
 
         new_unc = [
             NewUnclosed(
