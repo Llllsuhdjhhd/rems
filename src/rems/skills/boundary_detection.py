@@ -89,14 +89,22 @@ class BoundaryDetectionSkill:
                 continuation_of=item.get("continuation_of"),
             ))
 
-        new_unc = [
-            NewUnclosed(
-                content=item.get("content", ""),
-                logical_gaps=item.get("logical_gaps"),
-            )
-            for item in data.get("new_unclosed", [])
-            if item.get("content")
-        ]
+        new_unc = []
+        for item in data.get("new_unclosed", []):
+            if isinstance(item, dict):
+                content = item.get("content", "").strip()
+                if content:
+                    new_unc.append(NewUnclosed(
+                        content=content,
+                        logical_gaps=item.get("logical_gaps"),
+                    ))
+            elif isinstance(item, (str, bytes)):
+                content = str(item).strip()
+                if content:
+                    new_unc.append(NewUnclosed(
+                        content=content,
+                        logical_gaps=None,
+                    ))
 
         return BoundaryResult(
             completed_events=completed,

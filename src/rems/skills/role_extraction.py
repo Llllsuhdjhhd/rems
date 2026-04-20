@@ -61,7 +61,8 @@ class RoleExtractionSkill:
         user_msg = ROLE_EXTRACTION_USER.format(
             known_roles=known_desc,
             content_raw=content_raw,
-        ) + budget_hint
+            budget_hint=budget_hint,
+        )
 
         # 白皮书 2.2：在系统提示词首部注入单人/多人模式块，指导模型做代词消解。
         system_msg = build_user_mode_block(self._config) + ROLE_EXTRACTION_SYSTEM

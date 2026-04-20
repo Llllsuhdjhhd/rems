@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional
 
 # 基本事件封存：L0 → 递归摘要 → 角色抽取 → decoration → 持久化与向量索引。
@@ -86,10 +87,14 @@ class EventService:
         if pre_summaries:
             from ..skills.summary_generation import SummaryResult
             # 合并摘要架构：直接使用上游传入的 summaries
+            # 计算最高数字层级以反映实际缩减深度
+            levels = [int(k[1:]) for k in pre_summaries.keys() if k.startswith("L") and k[1:].isdigit()]
+            max_lvl = max(levels) if levels else 0
+
             summary_result = SummaryResult(
                 summaries=pre_summaries,
                 summary_lengths={k: len(v) for k, v in pre_summaries.items()},
-                actual_max_level=len(pre_summaries),
+                actual_max_level=max_lvl,
             )
         else:
             # 兼容旧逻辑/应急后置降级：使用独立摘要技能
@@ -124,7 +129,12 @@ class EventService:
                 assigned_id = id_mapping.get(lookup_key, lookup_key)
                 role_entries.append(RoleExtractionSkill.to_event_role_entry(er, assigned_id))
 
-        decoration = self._generate_decoration(content_raw, char_budget=budget.decoration_budget)
+        # 3. 生成主观装饰 (Decoration) - 受开关管控
+        decoration = ""
+        if self._config.enable_decoration:
+            decoration = self._generate_decoration(content_raw, char_budget=budget.decoration_budget)
+        else:
+            logging.debug("Decoration skipped per config.")
 
         # 白皮书 1.2：计算实际压缩率 sum_len / raw_len
         compression_ratio = self._compute_compression_ratio(
@@ -207,12 +217,19 @@ class EventService:
     def _compute_budget(self, raw_len: int, role_count_estimate: int = 2) -> CompressionBudget:
         """Pre-compute character budgets for all derived data components.
 
-        根据已知的 ``raw_len`` 和配置的目标压缩率、缩放因子、分项比例，确定性地计算出
-        各衍生数据项的字符预算，用于注入 LLM 提示词（白皮书 1.2.2）。
+        根据已知的 ``raw_len`` 和配置的目标压缩率，计算出各衍生数据项的字符预算。
+        针对短文本引入宽恕机制（平滑补偿）：文字越短，允许保留的比例越高。
         """
         cfg = self._config
-        total = int(raw_len * cfg.compression_target_ratio * cfg.compression_budget_multiplier)
-        total = max(total, 20)  # 最低保底
+        
+        # 白皮书 1.2.2：短文本宽恕机制 (平滑补偿公式)
+        # 当 raw_len -> 0 时，effective_ratio -> 1.0 (不压缩)
+        # 当 raw_len -> inf 时，effective_ratio -> target_ratio (1/6.6)
+        relaxation_threshold = 500.0  # 缓释阈值，决定多短的文本开始放宽
+        effective_ratio = cfg.compression_target_ratio + (1.0 - cfg.compression_target_ratio) * math.exp(-raw_len / relaxation_threshold)
+        
+        total = int(raw_len * effective_ratio * cfg.compression_budget_multiplier)
+        total = max(total, 60)  # 物理保底上调，确保 L10 语义种子至少能分到 20+ 字
 
         role_n = max(role_count_estimate, 1)
         summary_b = int(total * cfg.budget_ratio_summary)
@@ -239,23 +256,30 @@ class EventService:
     ) -> float:
         """Calculate actual sum_len / raw_len after all derived data is generated.
 
-        封存后审计用：实际的衍生数据总量与原始数据的比值，记录在 Event 上供追踪（白皮书 1.2.1）。
+        封存后审计用：实际的衍生数据总量与原始数据的比值。
+        配合 L1-L10 体系，审计平衡点取 L5（中阶压缩层级）。
         """
         raw_len = len(content_raw)
         if raw_len == 0:
             return 0.0
 
-        # 默认级摘要（取中位级别）
-        mid_key = None
-        if summary_result.summaries:
-            levels = sorted(summary_result.summaries.keys(), key=lambda k: int(k[1:]))
-            mid_key = levels[len(levels) // 2]
-        summary_len = len(summary_result.summaries.get(mid_key, "")) if mid_key else 0
+        # 取 L5 作为中位层级审计点（若最高级不足 L5，则取最高级）
+        audit_level = "L5"
+        if audit_level not in summary_result.summaries:
+            if summary_result.summaries:
+                # 找现有的最高层级
+                levels = sorted(summary_result.summaries.keys(), key=lambda k: int(k[1:]))
+                audit_level = levels[-1]
+            else:
+                audit_level = None
 
-        # 角色快照（默认级 l2_interaction）+ 白描条目（同一文本）
+        summary_len = len(summary_result.summaries.get(audit_level, "")) if audit_level else 0
+
+        # 角色快照（主角取 L2 标准级，配角只有 L1）
         snapshot_len = 0
         for re in role_entries:
-            snap_text = re.role_snapshot.l2_interaction or re.role_snapshot.l1_mention or ""
+            snap = re.role_snapshot
+            snap_text = snap.l2_interaction or snap.l1_mention or ""
             snapshot_len += len(snap_text)
 
         # 装饰

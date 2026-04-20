@@ -131,6 +131,9 @@ class REMSConfig(BaseSettings):
     budget_ratio_snapshot: float = 0.25    # 角色快照（各角色均分）
     budget_ratio_wp: float = 0.25          # 角色白描条目（各角色均分）
     budget_ratio_decoration: float = 0.10  # 装饰
+    
+    # 是否启用情节装饰（Decoration）：开启后会额外调用一次 LLM 为事件生成感性描述。
+    enable_decoration: bool = False
 
     # 墓碑化时写入 insight 的审计前缀（白皮书 4.3）。
     tombstone_prefix: str = "[TOMBSTONE]"
