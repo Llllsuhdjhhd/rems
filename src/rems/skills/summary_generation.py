@@ -31,14 +31,14 @@ class SummaryGenerationSkill:
         self._llm = llm
         self._config = config
 
-    def generate(self, content_raw: str, *, max_levels: int = 5) -> SummaryResult:
+    def generate(self, content_raw: str, *, max_levels: int = 5, char_budget: int | None = None) -> SummaryResult:
         """Recursively generate L1 … Ln summaries from ``content_raw``.
 
         Stops when the new summary is shorter than ``summary_fuse_min_chars``
         or ``max_levels`` is reached.
 
         从 ``content_raw`` 递归生成 L1…Ln：当新摘要长度小于 ``summary_fuse_min_chars`` 或达到 ``max_levels`` 时停止；
-        返回各级文本与字数及实际层数。
+        返回各级文本与字数及实际层数。``char_budget`` 为白皮书 1.2 前置预算约束，注入 L1 提示词。
         """
         summaries: dict[str, str] = {}
         lengths: dict[str, int] = {}
@@ -47,11 +47,19 @@ class SummaryGenerationSkill:
 
         for level in range(1, max_levels + 1):
             target = f"L{level}"
+
+            # 白皮书 1.2：仅 L1 使用前置预算约束；后续级别自然递归压缩
+            if level == 1 and char_budget is not None:
+                budget_hint = f"【字数预算】请将本级摘要控制在 {char_budget} 字以内。\n"
+            else:
+                budget_hint = ""
+
             sys_msg = SUMMARY_SYSTEM.format(fuse_min_chars=self._config.summary_fuse_min_chars)
             user_msg = SUMMARY_USER.format(
                 source_level=source_label,
                 target_level=target,
                 text=current_text,
+                budget_hint=budget_hint,
             )
 
             data = self._llm.complete_json(

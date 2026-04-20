@@ -228,28 +228,60 @@ class RoleService:
     # ------------------------------------------------------------------
 
     def get_white_painting_summary(self, role_id: str, *, limit: int = 20) -> str:
-        """Return a compact textual summary weighted by AE memory score.
+        """Return a compact textual summary with capacity-aware soft forgetting.
 
-        取该角色白描条目（扩大抓取再筛选），按 ``memory_weight`` 与时间半衰（高 AE 乘半衰倍数）
-        计算有效留存分，在保持大致时序的前提下选取头部若干条拼成可读摘要，用于 API/调试展示（白皮书 2.2）。
+        容量感知的白描检索（白皮书 2.3 FIFO 软遗忘）：
+        1. 取全量白描条目（按 create_time 升序）。
+        2. 计算总字符长度。若 ≤ ``wp_role_capacity`` → 全量保真，不施加遗忘惩罚。
+        3. 若超出容量 → 从最老条目（FIFO）开始逐条标记为"受惩罚"，直到剩余未惩罚条目
+           总长回落至容量上限以内。
+        4. 受惩罚条目以时间半衰 + AE 遗忘因子降权；未惩罚条目保持完整权重。
+        5. 按综合得分取 top *limit* 条拼成可读摘要。
         """
-        entries = self._repo.get_white_painting(role_id, limit=limit * 3)
-        if not entries:
+        # 获取全量白描（按时间升序）
+        all_entries = self._repo.get_white_painting(role_id)
+        if not all_entries:
             return ""
 
-        # Sort by effective retention score (memory_weight * time_retention)
+        capacity = self._config.wp_role_capacity
+
+        # 计算总长并确定 FIFO 惩罚边界
+        total_len = sum(len(e.role_summary) for e in all_entries)
+
+        # 找到惩罚边界：从最老开始累计，直到剩余未惩罚条目总长 ≤ capacity
+        penalized_count = 0
+        if total_len > capacity:
+            cumulative = 0
+            for i, e in enumerate(all_entries):
+                if total_len - cumulative <= capacity:
+                    break
+                cumulative += len(e.role_summary)
+                penalized_count = i + 1
+
+        # 打分
         now = datetime.now()
         scored: list[tuple[WhitePaintingEntry, float]] = []
-        for e in entries:
-            age_days = max((now - e.create_time).total_seconds() / 86400, 0.0)
-            half_life = self._config.wp_half_life_days * (
-                self._config.ae_forgetting_multiplier if e.memory_weight >= self._config.ae_high_threshold else 1.0
-            )
-            retention = math.exp(-0.693 * age_days / half_life)
-            scored.append((e, e.memory_weight * 0.4 + retention * 0.6))
+        for i, e in enumerate(all_entries):
+            is_penalized = i < penalized_count
 
-        scored.sort(key=lambda x: x[0].create_time)  # keep chronological order for top items
-        top = [e for e, _ in scored[-limit:]]
+            if is_penalized:
+                # 受惩罚条目：施加时间半衰 + AE 遗忘因子
+                age_days = max((now - e.create_time).total_seconds() / 86400, 0.0)
+                half_life = self._config.wp_half_life_days * (
+                    self._config.ae_forgetting_multiplier if e.memory_weight >= self._config.ae_high_threshold else 1.0
+                )
+                retention = math.exp(-0.693 * age_days / half_life)
+                score = e.memory_weight * 0.4 + retention * 0.6
+            else:
+                # 未惩罚条目：全量保真，完整权重
+                score = 1.0
+
+            scored.append((e, score))
+
+        # 按得分降序取 top，再按时间排序输出
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = [e for e, _ in scored[:limit]]
+        top.sort(key=lambda x: x.create_time)
 
         lines = [
             f"[{e.create_time.strftime('%Y-%m-%d %H:%M')}] ({e.importance.value if hasattr(e.importance, 'value') else e.importance}) {e.role_summary}"

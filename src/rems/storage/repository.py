@@ -46,6 +46,7 @@ class EventRepository:
                 source_events=event.source_events,
                 is_tombstoned=event.is_tombstoned,
                 activation_energy=event.activation_energy,
+                compression_ratio=event.compression_ratio,
             )
             s.merge(record)
             s.commit()
@@ -117,6 +118,7 @@ class EventRepository:
             source_events=r.source_events,
             is_tombstoned=bool(r.is_tombstoned),
             activation_energy=float(r.activation_energy or 0.0),
+            compression_ratio=float(r.compression_ratio or 0.0),
         )
 
 
@@ -214,6 +216,18 @@ class RoleRepository:
             if limit:
                 q = q.limit(limit)
             return [self._to_wp_entry(e) for e in q.all()]
+
+    def get_wp_total_length(self, role_id: str) -> int:
+        """Return the total character length of all white-painting entries for a role.
+
+        用于角色容量判定（白皮书 2.3）：当总长超过 ``wp_role_capacity`` 时触发软遗忘。
+        """
+        with self._db.session() as s:
+            from sqlalchemy import func
+            result = s.query(func.sum(func.length(WhitePaintingRecord.role_summary))).filter(
+                WhitePaintingRecord.role_id == role_id
+            ).scalar()
+            return int(result or 0)
 
     def save_semantic_card(self, card: SemanticCard) -> None:
         with self._db.session() as s:

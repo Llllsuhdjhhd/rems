@@ -50,6 +50,7 @@ class EventRecord(Base):
     source_events = Column(JSON, nullable=True)
     is_tombstoned = Column(Boolean, default=False)
     activation_energy = Column(Float, default=0.0)  # 白皮书 2.5 记忆初始值硬绑定
+    compression_ratio = Column(Float, default=0.0)  # 白皮书 1.2 封存后实际 sum_len/raw_len
 
 
 class RoleRecord(Base):

@@ -47,16 +47,21 @@ class RoleExtractionSkill:
         self._llm = llm
         self._config = config
 
-    def extract(self, content_raw: str, known_roles: list[Role] | None = None) -> RoleExtractionResult:
+    def extract(self, content_raw: str, known_roles: list[Role] | None = None, snapshot_budget: int | None = None) -> RoleExtractionResult:
         known_desc = "无已知角色" if not known_roles else "\n".join(
             f"- {r.role_id}: {r.name} ({r.entity_type}), 别名={r.aliases}"
             for r in (known_roles or [])
         )
 
+        # 白皮书 1.2：前置预算约束注入
+        budget_hint = ""
+        if snapshot_budget is not None:
+            budget_hint = f"\n【字数预算】每个角色的 L2 互动白描请控制在 {snapshot_budget} 字以内。\n"
+
         user_msg = ROLE_EXTRACTION_USER.format(
             known_roles=known_desc,
             content_raw=content_raw,
-        )
+        ) + budget_hint
 
         # 白皮书 2.2：在系统提示词首部注入单人/多人模式块，指导模型做代词消解。
         system_msg = build_user_mode_block(self._config) + ROLE_EXTRACTION_SYSTEM

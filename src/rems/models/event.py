@@ -85,6 +85,23 @@ class RoleSnapshot(BaseModel):
     l3_decision: Optional[str] = None
 
 
+# ---------- Compression budget (白皮书 1.2) ----------
+
+class CompressionBudget(BaseModel):
+    """Pre-computed character budgets for each derived-data component.
+
+    在事件封存流程最前端，根据已知的 ``raw_len`` 确定性地计算出各衍生数据项的字符预算，
+    并注入后续 LLM 提示词中作为硬约束（白皮书 1.2.2）。
+    """
+    raw_len: int                   # L0 原文字符长度
+    total_budget: int              # raw_len * target_ratio * multiplier
+    summary_budget: int            # 默认级摘要的字数上限
+    snapshot_budget_per_role: int   # 每个角色快照（默认级）的字数上限
+    wp_budget_per_role: int        # 每个角色白描条目的字数上限
+    decoration_budget: int         # 装饰的字数上限
+    role_count_estimate: int = 1   # 预估角色数（用于分摍计算）
+
+
 class EventRoleEntry(BaseModel):
     # 单个角色在一次事件中的瞬时记录（之后会被写入角色白描时间线）。
     role_id: str
@@ -128,6 +145,9 @@ class Event(BaseModel):
     # 作为进入回忆混合打分的独立权重（与 AE 组合但不等同：AE 是事件瞬时最大值，
     # activation_energy 是与角色长期心境做动态调节后的"落地权重"）。
     activation_energy: float = 0.0
+
+    # 动态压缩率（白皮书 1.2）：封存后实际的 sum_len / raw_len，用于审计与追踪。
+    compression_ratio: float = 0.0
 
     def model_post_init(self, __context: object) -> None:
         if not self.event_length:

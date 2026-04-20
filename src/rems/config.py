@@ -115,6 +115,23 @@ class REMSConfig(BaseSettings):
     # 角色语义卡片最多保留的键数量（白皮书 2.3）。
     semantic_card_max_keys: int = 20
 
+    # ---- Role capacity & soft-forgetting (白皮书 2.3 容量分配与软遗忘) ----
+    # 角色白描容量上限倍率：实际容量 = context_chars / wp_role_capacity_divisor（默认 6.6，即与 len_msg 同阶）。
+    # 容量内白描不施加遗忘惩罚；超出后旧条目在 Recall 打分中被遗忘因子惩罚。数据永不物理删除。
+    wp_role_capacity_divisor: float = 6.6
+
+    # ---- Dynamic compression ratio control (白皮书 1.2 前置预算计算) ----
+    # 事件封存时 sum_len / raw_len 的目标比值，默认 1/6.6。
+    compression_target_ratio: float = 0.1515
+    # 缩放因子：在目标压缩率基础上的全局缩放（> 1.0 放松字数，< 1.0 收紧字数）。
+    # 既有递归摘要熔断等逻辑保持不变，预算约束通过该因子叠加于其上。
+    compression_budget_multiplier: float = 1.0
+    # 分项预算占总预算的比例（合计应为 1.0）。
+    budget_ratio_summary: float = 0.40     # 默认级摘要
+    budget_ratio_snapshot: float = 0.25    # 角色快照（各角色均分）
+    budget_ratio_wp: float = 0.25          # 角色白描条目（各角色均分）
+    budget_ratio_decoration: float = 0.10  # 装饰
+
     # 墓碑化时写入 insight 的审计前缀（白皮书 4.3）。
     tombstone_prefix: str = "[TOMBSTONE]"
 
@@ -157,6 +174,16 @@ class REMSConfig(BaseSettings):
         单条消息或单事件 L0 的推荐/硬上限比例：约为 ``context_chars`` 的 1/66（白皮书 1.1.7 物理防御与4.2 触发语义）。
         """
         return int(self.context_chars / 66)
+
+    @property
+    def wp_role_capacity(self) -> int:
+        """Per-role white-painting capacity in characters (白皮书 2.3).
+
+        角色白描时间线在「全保真无遗忘」模式下可承载的最大字符总量。
+        默认等于 ``context_chars / 6.6``（与 ``len_msg`` 同阶）。
+        容量内不施加遗忘惩罚；超出后旧条目仅在 Recall 打分中被遗忘因子惩罚，数据永不删除。
+        """
+        return int(self.context_chars / self.wp_role_capacity_divisor)
 
     @property
     def physical_redline(self) -> int:
