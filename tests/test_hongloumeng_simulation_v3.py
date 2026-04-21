@@ -150,4 +150,4 @@ def run_simulation(max_chunks=5):
     print(f"Total LLM Calls Logged: {call_counter}")
 
 if __name__ == "__main__":
-    run_simulation(3)
+    run_simulation(9)
