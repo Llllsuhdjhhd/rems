@@ -333,59 +333,27 @@ class REMSPipeline:
         ctx: ContextPackage,
         newly_sealed: list[Event],
     ) -> list[Event]:
-        """If recall block contains >= threshold unique basic events,
-        trigger abstract event synthesis (Memory Reconsolidation; white paper section 4.4).
-
-        当本次组装的回忆块中，去重后的基本事件（非抽象、非墓碑）数量达到
-        ``config.recall_cluster_threshold`` 时，触发抽象事件合成：将被再激活的一批记忆
-        视为进入「重组」状态，由归纳技能合成 ``is_abstract=True`` 的新事件并落库，
-        同时将参与簇的基本事件标记为 ``is_abstracted``。语义卡片伪条目（event_id 前缀
-        ``CARD:``）不计入基本事件计数。
+        """Trigger abstract event synthesis based on space pressure (Whitepaper 4.4).
+        
+        Uses the ``abstraction_candidate_ids`` pre-calculated by RecallService 
+        (which targets the top 1/6.6 context pressure zone).
         """
-        # 语义卡片条目 event_id 形如 CARD:...，不计入「基本事件」簇规模。
-        recall_event_ids = [
-            it.event_id
-            for it in ctx.recall_block.items
-            if not it.event_id.startswith("CARD:")
-        ]
-        if len(recall_event_ids) < self.config.recall_cluster_threshold:
-            return []
-
-        recalled_events: list[Event] = []
-        for eid in recall_event_ids:
+        candidates = []
+        for eid in ctx.recall_block.abstraction_candidate_ids:
             e = self.event_repo.get(eid)
-            if e and not e.is_abstract and not e.is_tombstoned:
-                recalled_events.append(e)
+            if e and not e.is_abstract and not e.is_tombstoned and not e.is_abstracted:
+                candidates.append(e)
 
-        if len(recalled_events) < self.config.recall_cluster_threshold:
+        if not candidates:
             return []
 
         logger.info(
-            "Memory Reconsolidation triggered: %d recalled events → abstract synthesis",
-            len(recalled_events),
+            "Memory Reconsolidation triggered: %d candidates from recall pressure zone",
+            len(candidates),
         )
 
-        from .skills.inductive_evolution import InductiveEvolutionSkill
-        evolution_skill = InductiveEvolutionSkill(self.llm, self.config)
-        abstract_evt = evolution_skill.synthesize(recalled_events, abstraction_level=1)
-
-        from .skills.summary_generation import SummaryGenerationSkill
-        summary_skill = SummaryGenerationSkill(self.llm, self.config)
-        sr = summary_skill.generate(abstract_evt.content_raw)
-        abstract_evt.summaries = sr.summaries
-        abstract_evt.summary_lengths = sr.summary_lengths
-        abstract_evt.actual_max_level = sr.actual_max_level
-
-        self.event_repo.save(abstract_evt)
-        self.vector_store.add_event(
-            abstract_evt.event_id,
-            abstract_evt.summaries.get("L1", abstract_evt.content_raw),
-            {"is_abstract": True, "status": abstract_evt.status.value},
-        )
-        for e in recalled_events:
-            self.event_repo.update_status(e.event_id, is_abstracted=True)
-
-        return [abstract_evt]
+        abstract_evt = self.abstraction_service.abstract_event_cluster(candidates)
+        return [abstract_evt] if abstract_evt else []
 
     # ------------------------------------------------------------------
     # NPC / Generative-Agent directives

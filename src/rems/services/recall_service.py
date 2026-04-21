@@ -52,16 +52,18 @@ class RecallService:
         shadow: Shadow | None = None,
         focus_role_ids: set[str] | None = None,
     ) -> RecallBlock:
-        """Build the recall block for *query*. Two-stage retrieval implementation."""
+        """Build the recall block for *query*. Multi-stage retrieval implementation (白皮书 4.4)."""
         search_text = query
         if shadow and shadow.content:
             search_text = shadow.content + "\n" + query
 
         # ========================================================
-        # Phase 1: 海选匹配与数值遗忘过滤 (Vector + Time Decay)
+        # Phase 1: Expansion & Numerically Scored Search (Vector + Time)
         # ========================================================
-        # 此阶段主要利用底层检索粗拉取，将"时间惩罚（遗忘因子）"尽压至第一级计算
-        hits = self._vector.search(search_text, n_results=40)
+        # Increased hits via recall_expansion_factor (approx 2x redline) 
+        # to ensure enough variety for dynamic compression.
+        expansion_hits = 60  # Heuristic for ~2x redline; could be dynamic if needed.
+        hits = self._vector.search(search_text, n_results=expansion_hits)
         if not hits:
             return RecallBlock()
 
@@ -72,28 +74,63 @@ class RecallService:
                 continue
             raw_sim = 1.0 - hit.get("distance", 1.0)
             
-            # 第一阶段分数仅考虑：纯距离相似度 + 时间衰减因子（纯数值计算），滤除冗余
             time_decay = self._time_decay(event.create_time)
             p1_score = 0.8 * raw_sim + 0.2 * time_decay
             phase1_candidates.append((event, p1_score, raw_sim))
 
-        # 按照包含遗忘因子的前置打分进行排序与强制截断，保留头部若干项进入精排
+        # Sort by P1 score and keep a generous set for fine-ranking
         phase1_candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = phase1_candidates[:15]
+        top_candidates = phase1_candidates[:30] # Double the previous set for scaling
 
         # ========================================================
-        # Phase 2: 情感精排与深度再校准 (Emotion & Entity Routing)
+        # Phase 2: Hybrid Scoring & Emotional Filter (1.2x Redline)
         # ========================================================
         scored_events: list[tuple[Event, float]] = []
         for event, p1_score, raw_sim in top_candidates:
-            # 这里调用提取 AE、实体图谱的重负荷计算，得出二次重排的综合分
             score = self._hybrid_score(event, raw_sim)
             scored_events.append((event, score))
 
         scored_events.sort(key=lambda x: x[1], reverse=True)
 
-        block = self._assemble_block(scored_events, focus_role_ids=focus_role_ids or set())
-        block = self._append_semantic_cards(block, scored_events)
+        # Apply intermediate filter target (1.2/6.6)
+        redline = self._config.physical_redline
+        intermediate_ceiling = int(redline * self._config.recall_intermediate_filter_factor)
+        
+        filtered_events: list[tuple[Event, float]] = []
+        current_len = 0
+        for event, score in scored_events:
+            tier_offset = self._compute_tier_offset(event, focus_role_ids or set())
+            text, _ = self._role_aware_pick_summary(event, 9999, tier_offset)
+            if not text:
+                continue
+            
+            # Integrity: Stop BEFORE the item that would exceed the intermediate ceiling
+            if current_len + len(text) > intermediate_ceiling and filtered_events:
+                break
+                
+            filtered_events.append((event, score))
+            current_len += len(text)
+
+        block = self._assemble_block(filtered_events, focus_role_ids=focus_role_ids or set())
+        
+        # ========================================================
+        # Phase 3: Abstraction Candidate Identification (1/6.6)
+        # ========================================================
+        # Identify subset for abstraction based on abstraction_recall_trigger_factor
+        abstraction_limit = int(redline * self._config.abstraction_recall_trigger_factor)
+        abs_candidates = []
+        abs_len = 0
+        for event, _ in filtered_events:
+            # Use L1 summary length for abstraction pressure estimate
+            text = event.summaries.get("L1", event.content_raw)
+            if abs_len + len(text) > abstraction_limit and abs_candidates:
+                break
+            abs_candidates.append(event.event_id)
+            abs_len += len(text)
+        
+        block.abstraction_candidate_ids = abs_candidates
+
+        block = self._append_semantic_cards(block, filtered_events)
         return block
 
     # ------------------------------------------------------------------
@@ -158,54 +195,96 @@ class RecallService:
         scored: list[tuple[Event, float]],
         focus_role_ids: set[str] | None = None,
     ) -> RecallBlock:
-        """Assemble RecallBlock with role-aware summary tier selection.
-
-        For each recalled event the method determines a target compression tier
-        based on the highest importance that any *focus_role* holds within that
-        event:
-
-        +--------------+-------------------------------------------+
-        | Role status  | Tier offset from mid                      |
-        +==============+===========================================+
-        | S / A        | - ``recall_primary_role_detail_shift``    |
-        |              |   (toward L1, more detail)                |
-        +--------------+-------------------------------------------+
-        | B            | ``recall_default_tier_offset`` (mid)      |
-        +--------------+-------------------------------------------+
-        | C / D /      | + ``recall_minor_role_compress_shift``    |
-        | not present  |   (toward max level, more compressed)     |
-        +--------------+-------------------------------------------+
-
-        The summary picked at that tier is guaranteed to be ≥
-        ``recall_summary_min_chars`` chars; if the candidate falls below that
-        floor the tier is pinned (no further compression applied).
+        """Assemble RecallBlock with Sliding Window Dynamic Compression (白皮书 4.4 演化).
+        
+        Logic:
+        1. Split scored events into Head (Top 2/3) and Tail (Bottom 1/3).
+        2. Iteratively compress the Tail group by increasing summary tier offsets.
+        3. If Tail is fully compressed, shift items from Head into Tail and repeat.
         """
         focus_role_ids = focus_role_ids or set()
         ceiling = self._config.physical_redline
-        items: list[RecallItem] = []
-        total = 0
+        head_ratio = self._config.recall_head_ratio
+        
+        # Initial categorization
+        n = len(scored)
+        head_count = int(n * head_ratio)
+        
+        # We store the base tier offset and current 'extra' compression for each item
+        items_data = []
+        for i, (event, score) in enumerate(scored):
+            base_offset = self._compute_tier_offset(event, focus_role_ids)
+            items_data.append({
+                "event": event,
+                "score": score,
+                "base_offset": base_offset,
+                "extra_compression": 0,
+                "is_head": i < head_count
+            })
 
-        for event, score in scored:
-            tier_offset = self._compute_tier_offset(event, focus_role_ids)
-            text, level = self._role_aware_pick_summary(event, ceiling - total, tier_offset)
-            if not text:
-                continue
+        max_iterations = 20 # Safety break
+        iteration = 0
+        while iteration < max_iterations:
+            iteration += 1
+            # 1. Trial assembly
+            current_items = []
+            total_len = 0
+            for data in items_data:
+                offset = data["base_offset"] + data["extra_compression"]
+                text, level = self._role_aware_pick_summary(data["event"], 9999, offset)
+                if not text: continue
+                
+                # Integrity check for final assemble: stop before crossing redline
+                if total_len + len(text) > ceiling and current_items:
+                    # Mark total_len as over so loop continues/finishes
+                    total_len += len(text)
+                    break
 
-            items.append(RecallItem(
-                event_id=event.event_id,
-                content=text,
-                score=score,
-                summary_level=level,
-            ))
-            total += len(text)
-
-            if total >= ceiling:
+                current_items.append(RecallItem(
+                    event_id=data["event"].event_id,
+                    content=text,
+                    score=data["score"],
+                    summary_level=level
+                ))
+                total_len += len(text)
+            
+            # 2. Check if we fit
+            if total_len <= ceiling or not items_data:
                 break
+                
+            # 3. Progressive Compression
+            # Target the Tail group (including those shifted from Head)
+            tail_indices = [i for i, d in enumerate(items_data) if not d["is_head"]]
+            
+            can_compress_tail = False
+            if tail_indices:
+                # Check if any tail item can still be compressed
+                for idx in tail_indices:
+                    event = items_data[idx]["event"]
+                    current_level = items_data[idx]["base_offset"] + items_data[idx]["extra_compression"]
+                    # If not at floor yet, we can try to compress
+                    text, _ = self._role_aware_pick_summary(event, 9999, current_level)
+                    if len(text) > self._config.recall_summary_min_chars:
+                        items_data[idx]["extra_compression"] += 1
+                        can_compress_tail = True
+            
+            # 4. Shifting Logic
+            if not can_compress_tail:
+                # If tail is maxed out, shift one item from Head to Tail
+                head_indices = [i for i, d in enumerate(items_data) if d["is_head"]]
+                if head_indices:
+                    last_head_idx = head_indices[-1]
+                    logger.info("Shifting item %s from Head to Tail for compression", items_data[last_head_idx]["event"].event_id)
+                    items_data[last_head_idx]["is_head"] = False
+                    # On shift, we might want to immediately apply one level of compression
+                    items_data[last_head_idx]["extra_compression"] += 1
+                else:
+                    # Everything is already in Tail and maxed out. 
+                    # Use ultra-concise fallback and exit.
+                    current_items = self._ultra_concise_fallback(current_items, ceiling)
+                    break
 
-        if total > ceiling:
-            items = self._ultra_concise_fallback(items, ceiling)
-
-        block = RecallBlock(items=items)
+        block = RecallBlock(items=current_items)
         block.recompute_length()
         return block
 

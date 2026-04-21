@@ -35,12 +35,12 @@ class TaskModelMapping(BaseModel):
 
     # 以下为各技能默认模型名；可按任务强度分流成本（摘要/边界/抽取/抽象等）。
 
-    summary: str = "tongyi-xiaomi-analysis-pro"
-    boundary_detection: str = "qwen3.6-flash-2026-04-16"
-    role_extraction: str = "qwen3.6-flash-2026-04-16"
-    abstraction: str = "MiniMax-M2.5"
-    insight: str = "tongyi-xiaomi-analysis-pro"
-    default: str = "qwen3.6-flash-2026-04-16"
+    summary: str = "qwen3.5-flash"
+    boundary_detection: str = "qwen3.5-flash"
+    role_extraction: str = "qwen3.5-flash"
+    abstraction: str = "qwen3.5-flash"
+    insight: str = "qwen3.5-flash"
+    default: str = "qwen3.5-flash"
 
 
 class LLMConfig(BaseModel):
@@ -108,6 +108,16 @@ class REMSConfig(BaseSettings):
     # 白描时间线遗忘：低 AE 条目半衰期（天）；高 AE 条目半衰期乘以 ae_forgetting_multiplier。
     wp_half_life_days: float = 60.0
     ae_forgetting_multiplier: float = 5.0
+
+    # ---- Dynamic Recall Compression (白皮书 4.4 扩展与分级压缩) ----
+    # 初始向量检索的目标长度倍率（相对于 physical_redline）。
+    recall_expansion_factor: float = 2.0
+    # 情感精排后的中间过滤目标长度倍率（相对于 physical_redline）。
+    recall_intermediate_filter_factor: float = 1.2
+    # 初始保持高保真摘要的头部条目比例（由条目数决定）。
+    recall_head_ratio: float = 0.66
+    # 触发再巩固抽象的空间门槛比例（相对于 physical_redline，对应 1/6.6）。
+    abstraction_recall_trigger_factor: float = 1.0
 
     # 抽象演化时以该概率强制用子事件 L1/原文锚定，抑制「推理当事实」闭环（白皮书 3.3）。
     hallucination_anchor_prob: float = 0.3

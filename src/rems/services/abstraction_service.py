@@ -40,11 +40,9 @@ class AbstractionService:
     # ------------------------------------------------------------------
     def check_and_abstract(self, anchor_event: Event) -> Event | None:
         """If the anchor event's recall cluster >= threshold, generate an abstract event.
-
-        以 *anchor_event* 的 L1（无则原文）为查询向量，检索近邻事件 ID；在排除自身、过滤抽象/缺失后，
-        若相关基本事件数量仍不低于 ``recall_cluster_threshold``，则将锚点与它们组成簇，
-        计算 ``abstraction_level = max(簇内已有 abstraction_level)+1``，调用演化技能合成抽象事件，
-        再跑摘要链、落库、写入向量索引，并把簇内基本事件标为 ``is_abstracted``。否则返回 ``None``。
+        
+        Note: This is the 'background scan' or 'per-event' trigger. In most dialogue 
+        scenarios, ``abstract_event_cluster`` (triggered by space pressure) is preferred.
         """
         index_text = anchor_event.summaries.get("L1", anchor_event.content_raw)
         hits = self._vector.search(index_text, n_results=self._config.recall_cluster_threshold + 5)
@@ -68,11 +66,22 @@ class AbstractionService:
             return None
 
         cluster = [anchor_event] + related_events
+        return self.abstract_event_cluster(cluster)
+
+    def abstract_event_cluster(self, cluster: list[Event]) -> Event | None:
+        """Synthesize an abstract event from an explicit list of events.
+        
+        It calculates abstraction level, synthesizes content, generates summaries,
+        saves to repo, and marks sources as abstracted. (白皮书 3.1 & 4.4).
+        """
+        if not cluster:
+            return None
+            
         max_level = max((e.abstraction_level or 0) for e in cluster) + 1
 
         logger.info(
-            "Abstracting cluster of %d events (anchor=%s, level=%d)",
-            len(cluster), anchor_event.event_id, max_level,
+            "Abstracting explicit cluster of %d events (level=%d)",
+            len(cluster), max_level,
         )
 
         abstract_event = self._evolution.synthesize(cluster, abstraction_level=max_level)

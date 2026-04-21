@@ -77,10 +77,10 @@ class RoleExtractionSkill:
 
         extracted: list[ExtractedRole] = []
         for rd in data.get("roles", []):
-            snap = rd.get("snapshot", {})
-            emo = rd.get("emotion", {})
-            vedana_d = emo.get("vedana", {})
-            klesha_d = emo.get("klesha", {})
+            snap = rd.get("snapshot") or {}
+            emo = rd.get("emotion") or {}
+            vedana_d = emo.get("vedana") or {}
+            klesha_d = emo.get("klesha") or {}
 
             extracted.append(ExtractedRole(
                 role_id=rd.get("role_id"),
