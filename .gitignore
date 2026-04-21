@@ -13,8 +13,8 @@ chroma_data/
 *.so
 .venv/
 venv/
-# # Enable tests management but ignore heavy simulation outputs
-!tests/
-tests/hongloumeng_sim_*/
-tests/*.db
-tests/chroma_sim/
+
+# --- Simulation Data ---
+tests/hongloumeng_sim_*
+tests/hongloumeng_sim_data/
+
