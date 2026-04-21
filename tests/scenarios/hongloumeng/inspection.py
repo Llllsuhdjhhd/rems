@@ -4,8 +4,15 @@ import os
 from pathlib import Path
 
 def inspect_latest_sim():
-    # 1. 找到最新的模拟目录
-    sim_dirs = sorted(Path("tests").glob("hongloumeng_sim_*"), key=os.path.getmtime, reverse=True)
+    # 1. 找到最新的模拟目录 (在新的 outputs/sim_runs 架构下)
+    base_dir = Path(__file__).parent / "outputs" / "sim_runs"
+    sim_dirs = sorted(base_dir.glob("sim_5ch_*"), key=os.path.getmtime, reverse=True)
+    
+    if not sim_dirs:
+        # 兼容性回退：检查旧的 tests 根目录（如果还没清理）
+        old_base = Path(__file__).parents[2]
+        sim_dirs = sorted(old_base.glob("hongloumeng_sim_*"), key=os.path.getmtime, reverse=True)
+        
     if not sim_dirs:
         print("未找到任何模拟运行目录。")
         return

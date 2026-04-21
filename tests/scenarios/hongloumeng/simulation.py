@@ -3,10 +3,22 @@ import json
 import shutil
 import time
 import sqlite3
+import sys
 from pathlib import Path
+
+# Ensure all prints are flushed immediately for Windows debugging
+_orig_print = print
+def print(*args, **kwargs):
+    kwargs.setdefault('flush', True)
+    _orig_print(*args, **kwargs)
+
+print("DEBUG: Simulation script started.")
+
 from rems.config import REMSConfig, StorageConfig, UserMode
 from rems.pipeline import REMSPipeline, ProcessingMode
 from rems.llm.provider import LLMProvider
+
+print("DEBUG: Imports completed.")
 
 def run_simulation(max_chunks=5):
     """
@@ -15,7 +27,7 @@ def run_simulation(max_chunks=5):
     2. Detailed LLM request/response logging (literal Chinese).
     """
     timestamp = int(time.time())
-    test_dir = Path(f"tests/hongloumeng_sim_5ch_{timestamp}")
+    test_dir = Path(__file__).parent / "outputs" / "sim_runs" / f"sim_5ch_{timestamp}"
     test_dir.mkdir(parents=True, exist_ok=True)
     
     # Create directory for LLM logs
@@ -73,7 +85,7 @@ def run_simulation(max_chunks=5):
         except Exception as e:
             print(f" FAILED: {str(e)[:50]}")
             raise
-
+    
     LLMProvider.complete = complete_with_logging
 
     # 2. Initialization
@@ -86,7 +98,8 @@ def run_simulation(max_chunks=5):
     )
     pipeline = REMSPipeline.from_config(config)
     
-    dataset_path = Path("data/hongloumeng_dataset.json")
+    # 修正数据路径，从 scenarios/hongloumeng/ 回溯到根目录的 data/
+    dataset_path = Path(__file__).parents[3] / "data" / "hongloumeng_dataset.json"
     with open(dataset_path, "r", encoding="utf-8") as f:
         chunks = json.load(f)
     
@@ -138,4 +151,4 @@ def run_simulation(max_chunks=5):
     print(f"Total LLM Calls Logged: {call_counter}")
 
 if __name__ == "__main__":
-    run_simulation(5)
+    run_simulation(9)

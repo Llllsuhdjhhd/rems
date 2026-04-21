@@ -15,6 +15,6 @@ chroma_data/
 venv/
 
 # --- Simulation Data ---
-tests/hongloumeng_sim_*
-tests/hongloumeng_sim_data/
+tests/scenarios/*/outputs/
+tests/integration/outputs/
 
