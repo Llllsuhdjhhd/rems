@@ -11,7 +11,7 @@ from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import DECORATION_SYSTEM, DECORATION_USER
 from ..models.event import CompressionBudget, Event, EventRoleEntry, EventStatus
-from ..skills.role_extraction import RoleExtractionSkill
+from ..skills.role_extraction import ExtractedRole, RoleExtractionSkill
 from ..skills.summary_generation import SummaryGenerationSkill
 from ..storage.repository import EventRepository
 from ..storage.vector_store import VectorStore

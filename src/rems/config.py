@@ -37,9 +37,9 @@ class TaskModelMapping(BaseModel):
 
     summary: str = "qwen3.5-flash"
     boundary_detection: str = "qwen3.5-flash"
-    role_extraction: str = "qwen3.5-flash"
+    role_extraction: str = "qwen-flash-character"
     abstraction: str = "qwen3.5-flash"
-    insight: str = "qwen3.5-flash"
+    insight: str = "qwen-flash-character"
     default: str = "qwen3.5-flash"
 
 

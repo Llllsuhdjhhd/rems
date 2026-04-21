@@ -94,6 +94,7 @@ def run_simulation(max_chunks=5):
             database_url=f"sqlite:///{db_path}",
             chromadb_path=str(chroma_path)
         ),
+        embedding={"provider": "hash"},
         user_mode=UserMode.MULTI
     )
     pipeline = REMSPipeline.from_config(config)

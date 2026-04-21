@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import secrets
 from datetime import datetime
 from typing import Any, Optional
 
@@ -317,6 +318,7 @@ class RoleService:
             else:
                 # Sanitize name: if numeric or garbage, don't use it as the definitive name
                 clean_name = er.name
+                mark_suspicious = is_suspicious
                 is_invalid = (
                     er.name.isdigit() or 
                     not er.name.strip() or 
@@ -324,8 +326,8 @@ class RoleService:
                 )
                 if is_invalid:
                     clean_name = f"未知人物_{secrets.token_hex(2)}"
-                    is_suspicious = True  # 仲裁边界不定产生垃圾名称，强制标记为可疑
+                    mark_suspicious = True  # 仲裁边界不定产生垃圾名称，强制标记为可疑
                 
-                new_role = self.register_role(clean_name, er.entity_type, is_suspicious=is_suspicious)
+                new_role = self.register_role(clean_name, er.entity_type, is_suspicious=mark_suspicious)
                 mapping[key] = new_role.role_id
         return mapping

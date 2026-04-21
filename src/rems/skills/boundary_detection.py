@@ -99,9 +99,12 @@ class BoundaryDetectionSkill:
                 continuation_of=item.get("continuation_of"),
             ))
 
-        # 解码剩余残影
+        # 解码剩余残影（白皮书 4.2：优先遵循序号编码协议）
         shadow_indices = data.get("remaining_shadow_indices", [])
         remaining_shadow = decode_indices(sentences, shadow_indices)
+        if not remaining_shadow:
+            # 兼容历史输出：若模型仍返回原文字段，则回退使用。
+            remaining_shadow = data.get("remaining_shadow", "")
 
         new_unc = []
         for item in data.get("new_unclosed_indices", []):
@@ -119,6 +122,6 @@ class BoundaryDetectionSkill:
 
         return BoundaryResult(
             completed_events=completed,
-            remaining_shadow=data.get("remaining_shadow", ""),
+            remaining_shadow=remaining_shadow,
             new_unclosed=new_unc,
         )

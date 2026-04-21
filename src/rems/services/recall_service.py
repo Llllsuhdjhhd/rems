@@ -236,8 +236,8 @@ class RecallService:
                 
                 # Integrity check for final assemble: stop before crossing redline
                 if total_len + len(text) > ceiling and current_items:
-                    # Mark total_len as over so loop continues/finishes
-                    total_len += len(text)
+                    # Keep ``total_len`` as the actual assembled length.
+                    # Over-counting here would trigger unnecessary extra compression.
                     break
 
                 current_items.append(RecallItem(

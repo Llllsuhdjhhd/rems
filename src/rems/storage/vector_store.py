@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
 from typing import Any
 
 # Chroma 向量库：事件 L1/摘要文本的语义检索入口（回忆服务使用）。距离度量 cosine。
@@ -13,6 +15,46 @@ from ..config import REMSConfig
 logger = logging.getLogger(__name__)
 
 
+class _DeterministicHashEmbeddingFunction:
+    """Pure-local deterministic embedding with zero external dependencies.
+
+    Generates stable pseudo-vectors from text via SHA-256 expansion.
+    It is not semantically rich like sentence-transformers, but it is
+    network-free and robust for offline smoke tests / constrained envs.
+    """
+
+    is_legacy = False
+
+    def __init__(self, dim: int = 128):
+        self._dim = max(8, dim)
+
+    def name(self) -> str:
+        return "deterministic-hash"
+
+    def __call__(self, input):  # noqa: A002
+        return [self._embed_one(text) for text in input]
+
+    def embed_query(self, input):  # noqa: A002
+        if isinstance(input, list):
+            return [self._embed_one(str(x)) for x in input]
+        return [self._embed_one(str(input))]
+
+    def _embed_one(self, text: str) -> list[float]:
+        seed = hashlib.sha256((text or "").encode("utf-8")).digest()
+        values: list[float] = []
+        counter = 0
+        while len(values) < self._dim:
+            block = hashlib.sha256(seed + counter.to_bytes(4, "little")).digest()
+            for b in block:
+                values.append((b / 255.0) * 2.0 - 1.0)  # [-1, 1]
+                if len(values) >= self._dim:
+                    break
+            counter += 1
+
+        norm = math.sqrt(sum(v * v for v in values)) or 1.0
+        return [v / norm for v in values]
+
+
 class VectorStore:
     """ChromaDB-backed vector index for event semantic retrieval.
 
@@ -21,9 +63,14 @@ class VectorStore:
     """
 
     def __init__(self, config: REMSConfig):
-        self._ef = SentenceTransformerEmbeddingFunction(
-            model_name=config.embedding.model_name,
-        )
+        provider = (config.embedding.provider or "local").lower()
+        if provider == "hash":
+            # Offline-first: never downloads model weights.
+            self._ef = _DeterministicHashEmbeddingFunction(dim=128)
+        else:
+            self._ef = SentenceTransformerEmbeddingFunction(
+                model_name=config.embedding.model_name,
+            )
         self._client = chromadb.PersistentClient(path=config.storage.chromadb_path)
         self._collection = self._client.get_or_create_collection(
             name="rems_events",
