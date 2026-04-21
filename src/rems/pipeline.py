@@ -17,6 +17,7 @@ from .services.metabolism_service import MetabolismService
 from .services.recall_service import RecallService
 from .services.role_service import RoleService
 from .skills.boundary_detection import BoundaryDetectionSkill
+from .skills.event_enrichment import EventEnrichmentSkill
 from .skills.inductive_evolution import InductiveEvolutionSkill
 from .skills.role_extraction import RoleExtractionSkill
 from .skills.summary_generation import SummaryGenerationSkill
@@ -166,22 +167,24 @@ class REMSPipeline:
         role_repo = RoleRepository(db)
         meta_repo = MetabolismRepository(db)
 
+        # SummaryGenerationSkill 仍用于抽象事件（inductive evolution 后的总结）。
+        # 基本事件流已被 EventEnrichmentSkill 接管（一次调用产出摘要 + 角色）。
         summary_skill = SummaryGenerationSkill(llm, config)
         role_skill = RoleExtractionSkill(llm, config)
         boundary_skill = BoundaryDetectionSkill(llm, config)
+        enrichment_skill = EventEnrichmentSkill(llm, config)
         evolution_skill = InductiveEvolutionSkill(llm, config)
 
         emotion_evolver = EMAEvolver(config, role_repo)
         # Pass llm to role_service so semantic cards can be refreshed in-process
         role_service = RoleService(config, role_repo, role_skill, llm=llm)
-        
+
         event_service = EventService(
             config,
             llm,
             event_repo,
             vector_store,
-            summary_skill,
-            role_skill,
+            enrichment_skill,
             role_service=role_service,
             emotion_evolver=emotion_evolver,
         )

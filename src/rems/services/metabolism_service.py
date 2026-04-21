@@ -75,13 +75,11 @@ class MetabolismService:
         shadow = self._repo.get_shadow()
         unclosed = self._repo.get_unclosed_events()
 
-        total_len = (shadow.length if shadow else 0) + len(raw_input)
-        budget = self._event_svc._compute_budget(total_len)  # 预计算各级预算
-
         if force_save:
             return self._force_save_all(shadow, raw_input, unclosed, input_id=input_id)
 
-        result = self._boundary.detect(shadow.content, raw_input, unclosed, budget=budget)
+        # 边界检测仅负责事件切分；摘要/角色等衍生字段由 EventEnrichment 在 seal 时生成。
+        result = self._boundary.detect(shadow.content, raw_input, unclosed)
         return self._apply_boundary_result(result, unclosed, input_id=input_id)
 
     # ------------------------------------------------------------------
@@ -110,7 +108,6 @@ class MetabolismService:
             event = self._event_svc.seal_event(
                 content,
                 input_id=input_id,
-                pre_summaries=frag.summaries,
             )
             sealed.append(event)
 

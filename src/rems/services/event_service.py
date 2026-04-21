@@ -11,8 +11,8 @@ from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import DECORATION_SYSTEM, DECORATION_USER
 from ..models.event import CompressionBudget, Event, EventRoleEntry, EventStatus
+from ..skills.event_enrichment import EnrichmentResult, EventEnrichmentSkill
 from ..skills.role_extraction import ExtractedRole, RoleExtractionSkill
-from ..skills.summary_generation import SummaryGenerationSkill
 from ..storage.repository import EventRepository
 from ..storage.vector_store import VectorStore
 from .emotion_service import EMAEvolver
@@ -35,8 +35,7 @@ class EventService:
         llm: LLMProvider,
         event_repo: EventRepository,
         vector_store: VectorStore,
-        summary_skill: SummaryGenerationSkill,
-        role_skill: RoleExtractionSkill,
+        enrichment_skill: EventEnrichmentSkill,
         role_service: RoleService | None = None,
         emotion_evolver: EMAEvolver | None = None,
     ):
@@ -44,8 +43,8 @@ class EventService:
         self._llm = llm
         self._event_repo = event_repo
         self._vector = vector_store
-        self._summary_skill = summary_skill
-        self._role_skill = role_skill
+        # 一次 LLM 调用同时产出摘要 + 角色（替代原 summary_skill + role_skill 二次调用）。
+        self._enrichment_skill = enrichment_skill
         self._role_service = role_service
         # 可选：若传入 EMAEvolver，则在封存前做情感动态演化并计算 activation_energy（白皮书 2.5）。
         self._emotion_evolver = emotion_evolver
@@ -60,13 +59,15 @@ class EventService:
         known_roles: list | None = None,
         is_suspicious: bool = False,
         input_id: str | None = None,
-        pre_summaries: dict[str, str] | None = None,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
         创建、丰富字段、持久化并索引一条新的基本事件（``is_abstract`` 默认为 False）。
         可选传入已构造好的 ``role_entries`` 或 ``skip_roles`` 跳过角色抽取；
-        ``known_roles`` 供角色技能做去代词化对齐。超长 ``content_raw`` 会在 ``len_msg`` 处截断。
+        ``known_roles`` 供 Enrichment 技能做去代词化对齐。超长 ``content_raw`` 会在 ``len_msg`` 处截断。
+
+        实现上：一次 ``EventEnrichmentSkill.enrich`` 调用同时产出多级摘要与角色列表，
+        取代原来分两次调用摘要与角色技能的做法，减少 LLM 往返与上下文重复。
         """
         length_cap = self._config.len_msg
         if len(content_raw) > length_cap:
@@ -84,47 +85,36 @@ class EventService:
             budget.snapshot_budget_per_role, budget.wp_budget_per_role, budget.decoration_budget,
         )
 
-        if pre_summaries:
-            from ..skills.summary_generation import SummaryResult
-            # 合并摘要架构：直接使用上游传入的 summaries。
-            # 实际层数取「已生成的 L 键数量」，与 SummaryGenerationSkill 内部 ``actual_max_level = len(summaries)``
-            # 语义一致；若上游跳级，此值仍反映真实生成档数而非最高数字标签。
-            valid_keys = [k for k in pre_summaries.keys() if k.startswith("L") and k[1:].isdigit()]
+        # 只有在既没有预置 role_entries、又未显式 skip_roles 时，才需要跑 enrichment 抽角色。
+        # 但摘要永远需要，因此总是调用 enrichment 产出 summaries（角色部分按需使用）。
+        need_roles = role_entries is None and not skip_roles
+        enrichment: EnrichmentResult = self._enrichment_skill.enrich(
+            content_raw,
+            known_roles=known_roles,
+            budget=budget,
+        )
 
-            summary_result = SummaryResult(
-                summaries=pre_summaries,
-                summary_lengths={k: len(v) for k, v in pre_summaries.items()},
-                actual_max_level=len(valid_keys),
-            )
-        else:
-            # 兼容旧逻辑/应急后置降级：使用独立摘要技能
-            summary_result = self._summary_skill.generate(content_raw, budget=budget)
+        if need_roles:
+            roles = list(enrichment.roles)
 
-        if role_entries is None and not skip_roles:
-            extraction = self._role_skill.extract(
-                content_raw,
-                known_roles=known_roles,
-                budget=budget,
-            )
-            
-            if not extraction.roles and is_suspicious:
+            if not roles and is_suspicious:
                 import secrets
                 from ..models.event import Importance
-                
-                mock_er = ExtractedRole(
+
+                roles.append(ExtractedRole(
                     name=f"临时记录角色_{secrets.token_hex(2)}",
                     entity_type="unknown",
-                    importance=Importance.D
-                )
-                extraction.roles.append(mock_er)
-            
-            # Resolve extracted names to real persistent IDs
-            id_mapping = {}
+                    importance=Importance.D.value,
+                ))
+
+            id_mapping: dict[str, str] = {}
             if self._role_service:
-                id_mapping = self._role_service.resolve_and_register(extraction.roles, is_suspicious=is_suspicious)
-            
+                id_mapping = self._role_service.resolve_and_register(
+                    roles, is_suspicious=is_suspicious,
+                )
+
             role_entries = []
-            for er in extraction.roles:
+            for er in roles:
                 lookup_key = er.role_id or er.name
                 assigned_id = id_mapping.get(lookup_key, lookup_key)
                 role_entries.append(RoleExtractionSkill.to_event_role_entry(er, assigned_id))
@@ -138,14 +128,14 @@ class EventService:
 
         # 白皮书 1.2：计算实际压缩率 sum_len / raw_len
         compression_ratio = self._compute_compression_ratio(
-            content_raw, summary_result, role_entries or [], decoration,
+            content_raw, enrichment, role_entries or [], decoration,
         )
 
         event = Event(
             content_raw=content_raw,
-            summaries=summary_result.summaries,
-            summary_lengths=summary_result.summary_lengths,
-            actual_max_level=summary_result.actual_max_level,
+            summaries=enrichment.summaries,
+            summary_lengths=enrichment.summary_lengths,
+            actual_max_level=enrichment.actual_max_level,
             role_list=role_entries or [],
             status=EventStatus.ACTIVE,
             decoration=decoration,
@@ -269,30 +259,31 @@ class EventService:
     @staticmethod
     def _compute_compression_ratio(
         content_raw: str,
-        summary_result: "SummaryResult",
+        enrichment: "EnrichmentResult | SummaryResult",
         role_entries: list[EventRoleEntry],
         decoration: str | None,
     ) -> float:
         """Calculate actual sum_len / raw_len after all derived data is generated.
 
         封存后审计用：实际的衍生数据总量与原始数据的比值。
-        配合 L1-L10 体系，审计平衡点取 L5（中阶压缩层级）。
+        配合 L1-L10 体系，审计平衡点取 L5（中阶压缩层级）；若未到 L5 则退到实际最高级。
+        仅依赖 ``enrichment.summaries``，所以 EventEnrichment 与 SummaryGeneration 的返回
+        结构都可传入（只需具备 ``summaries: dict[str, str]`` 字段）。
         """
         raw_len = len(content_raw)
         if raw_len == 0:
             return 0.0
 
-        # 取 L5 作为中位层级审计点（若最高级不足 L5，则取最高级）
+        summaries = enrichment.summaries
         audit_level = "L5"
-        if audit_level not in summary_result.summaries:
-            if summary_result.summaries:
-                # 找现有的最高层级
-                levels = sorted(summary_result.summaries.keys(), key=lambda k: int(k[1:]))
+        if audit_level not in summaries:
+            if summaries:
+                levels = sorted(summaries.keys(), key=lambda k: int(k[1:]))
                 audit_level = levels[-1]
             else:
                 audit_level = None
 
-        summary_len = len(summary_result.summaries.get(audit_level, "")) if audit_level else 0
+        summary_len = len(summaries.get(audit_level, "")) if audit_level else 0
 
         # 角色快照（主角取 L2 标准级，配角只有 L1）
         snapshot_len = 0

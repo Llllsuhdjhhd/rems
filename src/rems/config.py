@@ -38,6 +38,9 @@ class TaskModelMapping(BaseModel):
     summary: str = "qwen3.6-flash"
     boundary_detection: str = "qwen3.6-flash"
     role_extraction: str = "qwen-flash-character"
+    # 事件充实：一次调用产出摘要 + 角色。需要在单次响应里兼顾递归摘要与结构化角色抽取，
+    # 用与 summary 同档的 qwen3.6-flash（flash-character 在混合任务下容易漏掉 roles）。
+    event_enrichment: str = "qwen3.6-flash"
     abstraction: str = "qwen3.6-flash"
     insight: str = "qwen-flash-character"
     default: str = "qwen3.6-flash"

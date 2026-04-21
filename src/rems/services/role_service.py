@@ -127,8 +127,12 @@ class RoleService:
             self._repo.add_white_painting_entry(role.role_id, wp)
             logger.debug("WP appended for %s from event %s (AE=%.2f)", role.role_id, event.event_id, memory_weight)
 
-            # Async-style: update semantic card in same call (background in prod)
-            self._refresh_semantic_card(role.role_id)
+            # 语义卡片（insight）只对「主要角色」(S/A 或单人模式核心用户) 刷新，
+            # 次要角色跳过以节省 LLM 调用开销；与收集端的动态粒度路由一致（白皮书 2.3）。
+            if self._is_primary_role(entry):
+                self._refresh_semantic_card(role.role_id)
+            else:
+                logger.debug("Skip semantic-card refresh for minor role %s", role.role_id)
 
     # ------------------------------------------------------------------
     # Dynamic granularity routing — 收集端（白皮书 2.3）

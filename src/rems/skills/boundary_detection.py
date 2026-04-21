@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 class CompletedFragment(BaseModel):
     content_raw: str
-    summaries: dict[str, str] = Field(default_factory=dict)
     continuation_of: Optional[str] = None
 
 
@@ -51,7 +50,6 @@ class BoundaryDetectionSkill:
         shadow_content: str,
         current_input: str,
         unclosed_events: list[UnclosedEvent] | None = None,
-        budget: "CompressionBudget" | None = None,
     ) -> BoundaryResult:
         unclosed_summary = "无" if not unclosed_events else "\n".join(
             f"- ID={ue.id}, 片段={ue.merged_content[:80]}…, 缺={ue.logical_gaps or '未知'}"
@@ -63,23 +61,14 @@ class BoundaryDetectionSkill:
         sentences = segment_sentences(full_raw)
         indexed_input = format_indexed_text(sentences)
 
-        # 2. 构造字数预算表
-        budget_table = "无"
-        if budget:
-            budget_table = "\n".join(f"- {lvl}: {b} 字以内" for lvl, b in budget.summary_level_budgets.items())
-
-        fuse_min = self._config.summary_fuse_min_chars
+        # 2. 构造 prompt：纯事件切分，不涉及摘要/角色等衍生字段
         user_msg = BOUNDARY_USER.format(
             shadow=shadow_content or "（空）",
             unclosed_summary=unclosed_summary,
             indexed_input=indexed_input,
-            budget_table=budget_table,
-            fuse_min_chars=fuse_min,
         )
 
-        system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM.format(
-            fuse_min_chars=fuse_min,
-        )
+        system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM
 
         data = self._llm.complete_json(
             "boundary_detection",
@@ -96,10 +85,9 @@ class BoundaryDetectionSkill:
             extracted_raw = decode_indices(sentences, indices)
             if not extracted_raw:
                 continue
-            
+
             completed.append(CompletedFragment(
                 content_raw=extracted_raw,
-                summaries=item.get("summaries", {}),
                 continuation_of=item.get("continuation_of"),
             ))
 
