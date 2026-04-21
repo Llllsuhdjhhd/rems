@@ -12,6 +12,7 @@ from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER, build_user_mode_block
 from ..models.metabolism import UnclosedEvent
+from ..utils.text import segment_sentences, format_indexed_text, decode_indices
 
 logger = logging.getLogger(__name__)
 
@@ -50,23 +51,30 @@ class BoundaryDetectionSkill:
         shadow_content: str,
         current_input: str,
         unclosed_events: list[UnclosedEvent] | None = None,
-        char_budget: int | None = None,
+        budget: "CompressionBudget" | None = None,
     ) -> BoundaryResult:
         unclosed_summary = "无" if not unclosed_events else "\n".join(
             f"- ID={ue.id}, 片段={ue.merged_content[:80]}…, 缺={ue.logical_gaps or '未知'}"
             for ue in (unclosed_events or [])
         )
 
-        budget_hint = f"\n【字数预算】请尽量将每个事件的 L1 摘要控制在 {char_budget} 字以内。\n" if char_budget else ""
+        # 1. 对整体输入（残影 + 当前）进行分句编码
+        full_raw = (shadow_content + "\n" + current_input).strip()
+        sentences = segment_sentences(full_raw)
+        indexed_input = format_indexed_text(sentences)
+
+        # 2. 构造字数预算表
+        budget_table = "无"
+        if budget:
+            budget_table = "\n".join(f"- {lvl}: {b} 字以内" for lvl, b in budget.summary_level_budgets.items())
 
         user_msg = BOUNDARY_USER.format(
             shadow=shadow_content or "（空）",
             unclosed_summary=unclosed_summary,
-            current_input=current_input,
-            budget_hint=budget_hint,
+            indexed_input=indexed_input,
+            budget_table=budget_table,
         )
 
-        # 白皮书 2.2：system prompt 首部注入模式块，让边界检测也感知代词归属约束。
         system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM
 
         data = self._llm.complete_json(
@@ -79,7 +87,9 @@ class BoundaryDetectionSkill:
 
         completed = []
         for item in data.get("completed_events", []):
-            extracted_raw = item.get("content_raw", "").strip()
+            indices = item.get("content_raw_indices", [])
+            # 解码: 根据序号还原 content_raw
+            extracted_raw = decode_indices(sentences, indices)
             if not extracted_raw:
                 continue
             
@@ -89,22 +99,23 @@ class BoundaryDetectionSkill:
                 continuation_of=item.get("continuation_of"),
             ))
 
+        # 解码剩余残影
+        shadow_indices = data.get("remaining_shadow_indices", [])
+        remaining_shadow = decode_indices(sentences, shadow_indices)
+
         new_unc = []
-        for item in data.get("new_unclosed", []):
-            if isinstance(item, dict):
-                content = item.get("content", "").strip()
-                if content:
-                    new_unc.append(NewUnclosed(
-                        content=content,
-                        logical_gaps=item.get("logical_gaps"),
-                    ))
-            elif isinstance(item, (str, bytes)):
-                content = str(item).strip()
-                if content:
-                    new_unc.append(NewUnclosed(
-                        content=content,
-                        logical_gaps=None,
-                    ))
+        for item in data.get("new_unclosed_indices", []):
+            # new_unclosed 现在也是序号列表或单个序号
+            if isinstance(item, list):
+                content = decode_indices(sentences, item)
+            else:
+                content = decode_indices(sentences, [item])
+            
+            if content:
+                new_unc.append(NewUnclosed(
+                    content=content,
+                    logical_gaps=None, # 序号模式暂不强制要求 gap 描述
+                ))
 
         return BoundaryResult(
             completed_events=completed,

@@ -47,21 +47,21 @@ class RoleExtractionSkill:
         self._llm = llm
         self._config = config
 
-    def extract(self, content_raw: str, known_roles: list[Role] | None = None, snapshot_budget: int | None = None) -> RoleExtractionResult:
+    def extract(self, content_raw: str, known_roles: list[Role] | None = None, budget: "CompressionBudget" | None = None) -> RoleExtractionResult:
         known_desc = "无已知角色" if not known_roles else "\n".join(
             f"- {r.role_id}: {r.name} ({r.entity_type}), 别名={r.aliases}"
             for r in (known_roles or [])
         )
 
-        # 白皮书 1.2：前置预算约束注入
-        budget_hint = ""
-        if snapshot_budget is not None:
-            budget_hint = f"\n【字数预算】每个角色的 L2 互动白描请控制在 {snapshot_budget} 字以内。\n"
+        # 指数级衰减预算注入
+        snapshot_budgets_text = "按系统默认要求"
+        if budget:
+            snapshot_budgets_text = "\n".join(f"- {lvl}: {b} 字以内" for lvl, b in budget.snapshot_level_budgets.items())
 
         user_msg = ROLE_EXTRACTION_USER.format(
             known_roles=known_desc,
             content_raw=content_raw,
-            budget_hint=budget_hint,
+            snapshot_budgets=snapshot_budgets_text,
         )
 
         # 白皮书 2.2：在系统提示词首部注入单人/多人模式块，指导模型做代词消解。
@@ -82,6 +82,15 @@ class RoleExtractionSkill:
             vedana_d = emo.get("vedana") or {}
             klesha_d = emo.get("klesha") or {}
 
+            # 情感鲁棒解析：处理模型可能返回单一数值而非字典的情况
+            v_init = {}
+            if isinstance(vedana_d, dict):
+                v_init = {k: float(v) for k, v in vedana_d.items() if k in Vedana.model_fields}
+            
+            k_init = {}
+            if isinstance(klesha_d, dict):
+                k_init = {k: float(v) for k, v in klesha_d.items() if k in Klesha.model_fields}
+
             extracted.append(ExtractedRole(
                 role_id=rd.get("role_id"),
                 name=rd.get("name", ""),
@@ -93,8 +102,8 @@ class RoleExtractionSkill:
                     l3_decision=snap.get("l3_decision"),
                 ),
                 emotional_model=EmotionalModel(
-                    vedana=Vedana(**{k: float(v) for k, v in vedana_d.items() if k in Vedana.model_fields}),
-                    klesha=Klesha(**{k: float(v) for k, v in klesha_d.items() if k in Klesha.model_fields}),
+                    vedana=Vedana(**v_init),
+                    klesha=Klesha(**k_init),
                 ),
             ))
 

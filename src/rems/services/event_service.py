@@ -98,13 +98,13 @@ class EventService:
             )
         else:
             # 兼容旧逻辑/应急后置降级：使用独立摘要技能
-            summary_result = self._summary_skill.generate(content_raw, char_budget=budget.summary_budget)
+            summary_result = self._summary_skill.generate(content_raw, budget=budget)
 
         if role_entries is None and not skip_roles:
             extraction = self._role_skill.extract(
                 content_raw,
                 known_roles=known_roles,
-                snapshot_budget=budget.snapshot_budget_per_role,
+                budget=budget,
             )
             
             if not extraction.roles and is_suspicious:
@@ -219,29 +219,48 @@ class EventService:
 
         根据已知的 ``raw_len`` 和配置的目标压缩率，计算出各衍生数据项的字符预算。
         针对短文本引入宽恕机制（平滑补偿）：文字越短，允许保留的比例越高。
+        支持多层级指数衰减预算。
         """
         cfg = self._config
         
         # 白皮书 1.2.2：短文本宽恕机制 (平滑补偿公式)
-        # 当 raw_len -> 0 时，effective_ratio -> 1.0 (不压缩)
-        # 当 raw_len -> inf 时，effective_ratio -> target_ratio (1/6.6)
-        relaxation_threshold = 500.0  # 缓释阈值，决定多短的文本开始放宽
+        relaxation_threshold = 500.0
         effective_ratio = cfg.compression_target_ratio + (1.0 - cfg.compression_target_ratio) * math.exp(-raw_len / relaxation_threshold)
         
         total = int(raw_len * effective_ratio * cfg.compression_budget_multiplier)
-        total = max(total, 60)  # 物理保底上调，确保 L10 语义种子至少能分到 20+ 字
+        total = max(total, 60)
 
         role_n = max(role_count_estimate, 1)
-        summary_b = int(total * cfg.budget_ratio_summary)
-        snapshot_b = int(total * cfg.budget_ratio_snapshot / role_n)
+        
+        # 1. 摘要层级预算 (L1 -> L10 指数衰减)
+        summary_total_b = int(total * cfg.budget_ratio_summary)
+        summary_l1 = max(summary_total_b, cfg.summary_fuse_min_chars)
+        summary_budgets = {"L1": summary_l1}
+        for i in range(2, 11):
+            prev_b = summary_budgets[f"L{i-1}"]
+            # 按 summary_decay_factor 递减，保底为 summary_fuse_min_chars
+            new_b = max(int(prev_b * cfg.summary_decay_factor), cfg.summary_fuse_min_chars)
+            summary_budgets[f"L{i}"] = new_b
+
+        # 2. 角色快照层级预算 (L3 -> L2 -> L1 指数衰减)
+        # 注意：L3 是最详细的，L1 是最精简的。
+        snapshot_total_per_role = int(total * cfg.budget_ratio_snapshot / role_n)
+        snapshot_l3 = max(snapshot_total_per_role, 30) # 保底 L3 稍长
+        snapshot_budgets = {"L3": snapshot_l3}
+        # 逆向衰减：L2 = L3 * factor, L1 = L2 * factor
+        snapshot_l2 = max(int(snapshot_l3 * cfg.snapshot_decay_factor), 15)
+        snapshot_l1 = max(int(snapshot_l2 * cfg.snapshot_decay_factor), 10)
+        snapshot_budgets["L2"] = snapshot_l2
+        snapshot_budgets["L1"] = snapshot_l1
+
         wp_b = int(total * cfg.budget_ratio_wp / role_n)
         deco_b = int(total * cfg.budget_ratio_decoration)
 
         return CompressionBudget(
             raw_len=raw_len,
             total_budget=total,
-            summary_budget=max(summary_b, cfg.summary_fuse_min_chars),
-            snapshot_budget_per_role=max(snapshot_b, 10),
+            summary_level_budgets=summary_budgets,
+            snapshot_level_budgets=snapshot_budgets,
             wp_budget_per_role=max(wp_b, 10),
             decoration_budget=max(deco_b, 10),
             role_count_estimate=role_n,

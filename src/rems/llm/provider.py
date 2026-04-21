@@ -71,6 +71,7 @@ class LLMProvider:
             model=model,
             messages=messages,
             temperature=temp,
+            timeout=300.0,
         )
         latency_ms = (time.perf_counter() - t0) * 1000.0
         content = response.choices[0].message.content or ""

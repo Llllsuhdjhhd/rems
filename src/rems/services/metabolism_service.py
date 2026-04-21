@@ -68,6 +68,8 @@ class MetabolismService:
         unclosed = self._repo.get_unclosed_events()
 
         total_len = (shadow.length if shadow else 0) + len(raw_input)
+        budget = self._event_svc._compute_budget(total_len) # 预计算各级预算
+
         force_fallback = False
         
         # 兜底截断测试：如果超过 1.2 倍 msg_len，不再等待模型判断，强制闭环
@@ -79,7 +81,7 @@ class MetabolismService:
         if force_save or force_fallback:
             return self._force_save_all(shadow, raw_input, unclosed, is_suspicious=force_fallback, input_id=input_id)
 
-        result = self._boundary.detect(shadow.content, raw_input, unclosed)
+        result = self._boundary.detect(shadow.content, raw_input, unclosed, budget=budget)
         return self._apply_boundary_result(result, unclosed, input_id=input_id)
 
     # ------------------------------------------------------------------

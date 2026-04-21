@@ -133,6 +133,10 @@ class REMSConfig(BaseSettings):
     # ---- Dynamic compression ratio control (白皮书 1.2 前置预算计算) ----
     # 事件封存时 sum_len / raw_len 的目标比值，默认 1/6.6。
     compression_target_ratio: float = 0.1515
+    # 递归摘要指数衰减因子 (L1 -> L10)；每一级相对于上一级的字数限制比例。
+    summary_decay_factor: float = 0.5
+    # 角色快照指数衰减因子 (L3 -> L2 -> L1)；L2 = L3 * factor, L1 = L2 * factor。
+    snapshot_decay_factor: float = 0.6
     # 缩放因子：在目标压缩率基础上的全局缩放（> 1.0 放松字数，< 1.0 收紧字数）。
     # 既有递归摘要熔断等逻辑保持不变，预算约束通过该因子叠加于其上。
     compression_budget_multiplier: float = 1.0

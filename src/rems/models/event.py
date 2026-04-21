@@ -92,14 +92,30 @@ class CompressionBudget(BaseModel):
 
     在事件封存流程最前端，根据已知的 ``raw_len`` 确定性地计算出各衍生数据项的字符预算，
     并注入后续 LLM 提示词中作为硬约束（白皮书 1.2.2）。
+    支持多层级指数级递减预算。
     """
     raw_len: int                   # L0 原文字符长度
     total_budget: int              # raw_len * target_ratio * multiplier
-    summary_budget: int            # 默认级摘要的字数上限
-    snapshot_budget_per_role: int   # 每个角色快照（默认级）的字数上限
+    
+    # [L1..L10] 摘要字数上限字典 (key: "L1"..."L10")
+    summary_level_budgets: dict[str, int] = Field(default_factory=dict)
+    
+    # [L1..L3] 角色快照字数上限字典 (key: "L1"..."L3")
+    snapshot_level_budgets: dict[str, int] = Field(default_factory=dict)
+
     wp_budget_per_role: int        # 每个角色白描条目的字数上限
     decoration_budget: int         # 装饰的字数上限
     role_count_estimate: int = 1   # 预估角色数（用于分摍计算）
+
+    @property
+    def summary_budget(self) -> int:
+        """Backward compatibility: returns L1 budget."""
+        return self.summary_level_budgets.get("L1", 0)
+
+    @property
+    def snapshot_budget_per_role(self) -> int:
+        """Backward compatibility: returns L3 (base) budget."""
+        return self.snapshot_level_budgets.get("L3", 0)
 
 
 class EventRoleEntry(BaseModel):
