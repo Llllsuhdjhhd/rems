@@ -258,13 +258,16 @@ class RecallService:
             
             can_compress_tail = False
             if tail_indices:
-                # Check if any tail item can still be compressed
+                # 判断「还能不能再压一档」：比较当前档与再加一档后选出的摘要。
+                # 若选出的 level_key 发生改变且文本确实更短，才允许 extra_compression++；
+                # 否则说明已经到了该事件的最高压缩档（``_role_aware_pick_summary`` 的 clamp），
+                # 继续递增没有意义，避免空转循环耗尽 ``max_iterations``。
                 for idx in tail_indices:
                     event = items_data[idx]["event"]
                     current_level = items_data[idx]["base_offset"] + items_data[idx]["extra_compression"]
-                    # If not at floor yet, we can try to compress
-                    text, _ = self._role_aware_pick_summary(event, 9999, current_level)
-                    if len(text) > self._config.recall_summary_min_chars:
+                    cur_text, cur_key = self._role_aware_pick_summary(event, 9999, current_level)
+                    next_text, next_key = self._role_aware_pick_summary(event, 9999, current_level + 1)
+                    if next_key and next_key != cur_key and len(next_text) < len(cur_text):
                         items_data[idx]["extra_compression"] += 1
                         can_compress_tail = True
             

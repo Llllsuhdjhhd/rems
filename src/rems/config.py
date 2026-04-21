@@ -35,12 +35,12 @@ class TaskModelMapping(BaseModel):
 
     # 以下为各技能默认模型名；可按任务强度分流成本（摘要/边界/抽取/抽象等）。
 
-    summary: str = "qwen3.5-flash"
-    boundary_detection: str = "qwen3.5-flash"
+    summary: str = "qwen3.6-flash"
+    boundary_detection: str = "qwen3.6-flash"
     role_extraction: str = "qwen-flash-character"
-    abstraction: str = "qwen3.5-flash"
+    abstraction: str = "qwen3.6-flash"
     insight: str = "qwen-flash-character"
-    default: str = "qwen3.5-flash"
+    default: str = "qwen3.6-flash"
 
 
 class LLMConfig(BaseModel):
@@ -53,6 +53,9 @@ class LLMConfig(BaseModel):
 
 
 class EmbeddingConfig(BaseModel):
+    # pydantic v2 的 ``model_`` 命名空间会对 ``model_name`` 产生 UserWarning，这里显式放通。
+    model_config = {"protected_namespaces": ()}
+
     # 向量嵌入：默认本地 SentenceTransformer；可扩展为远程 API。
     provider: str = "local"
     model_name: str = "BAAI/bge-small-zh-v1.5"
@@ -75,8 +78,8 @@ class REMSConfig(BaseSettings):
     )
 
     # 由 token 窗口折算字符预算（白皮书 1.1.7：单条与缓冲区与上下文比例关系）。
-    # 调整为 128k (131072) 以支持 len_msg ≈ 3000。
-    context_window: int = 131072
+    # 默认 88000：以 chars_per_token=1.5 折算，使 len_msg = 88000 * 1.5 / 66 ≈ 2000。
+    context_window: int = 88000
     chars_per_token: float = 1.5
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -95,8 +98,9 @@ class REMSConfig(BaseSettings):
 
     # 回忆块中「同主题」基本事件数达到阈值则触发抽象/再巩固（白皮书 3.2、4.4）。
     recall_cluster_threshold: int = 5
-    # 物理红线触发时，未闭合事件总长超过 len_msg * 该比例则强制封存（代谢防溢出）。
-    unclosed_force_ratio: float = 0.8
+    # 未闭合事件总长超过 len_msg * 该比例则强制封存（白皮书 4.2：兜底 1.2×len_msg）。
+    # 同时作为物理红线触发时的强制封存阈值；是否「可疑」由角色抽取与 RoleService 仲裁判断。
+    unclosed_force_ratio: float = 1.2
     # 递归摘要熔断：低于该字数则不再生成更高级摘要（白皮书 1.1.3 actual_max_level）。
     summary_fuse_min_chars: int = 20
 

@@ -210,7 +210,7 @@ class RoleService:
             )
 
             new_data: dict[str, Any] = self._llm.complete_json(
-                "summary",
+                "insight",
                 [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
                 temperature=0.1,
             )

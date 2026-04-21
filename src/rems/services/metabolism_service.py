@@ -60,26 +60,26 @@ class MetabolismService:
 
         摄入字符串 *raw_input*，返回本轮新封存的基本事件列表（可能为空列表）。
         ``force_save=True`` 时跳过边界模型，立即合并残影与未完成项并封存（手动 /save 类触发）。
+
+        白皮书 4.2 说明：``msg_len × 1.2`` 的兜底阈值作用于**未闭环事件的累积长度**，
+        而非整体输入。边界检测不会因「残影 + 当前输入」过长被跳过；超长输入仅在边界剥离
+        得到的单条未闭环片段越过该红线时，才会按「可疑事件」强制封存（见 ``_apply_boundary_result``）。
         """
         if len(raw_input) > self._config.len_msg:
-            logger.warning("Input length %d exceeds len_msg %d", len(raw_input), self._config.len_msg)
+            logger.warning(
+                "Input length %d exceeds len_msg %d; boundary detection will still run",
+                len(raw_input),
+                self._config.len_msg,
+            )
 
         shadow = self._repo.get_shadow()
         unclosed = self._repo.get_unclosed_events()
 
         total_len = (shadow.length if shadow else 0) + len(raw_input)
-        budget = self._event_svc._compute_budget(total_len) # 预计算各级预算
+        budget = self._event_svc._compute_budget(total_len)  # 预计算各级预算
 
-        force_fallback = False
-        
-        # 兜底截断测试：如果超过 1.2 倍 msg_len，不再等待模型判断，强制闭环
-        fallback_threshold = int(self._config.len_msg * 1.2)
-        if total_len > fallback_threshold:
-            logger.warning("Input + shadow length %d exceeds fallback threshold %d, forcing fallback", total_len, fallback_threshold)
-            force_fallback = True
-
-        if force_save or force_fallback:
-            return self._force_save_all(shadow, raw_input, unclosed, is_suspicious=force_fallback, input_id=input_id)
+        if force_save:
+            return self._force_save_all(shadow, raw_input, unclosed, input_id=input_id)
 
         result = self._boundary.detect(shadow.content, raw_input, unclosed, budget=budget)
         return self._apply_boundary_result(result, unclosed, input_id=input_id)
@@ -116,7 +116,25 @@ class MetabolismService:
 
         self._repo.update_shadow(Shadow(content=result.remaining_shadow, updated_at=datetime.now()))
 
+        # 白皮书 4.2 底线兜底：对单条未闭环片段逐项判定；若长度越过 ``len_msg × 1.2`` 红线，
+        # 立即强制封存为事件，防止内存/计算爆炸。是否「可疑」交由 EventService 内部的
+        # 角色抽取与 RoleService 仲裁判断（角色清晰时不应被盲目标脏）。
+        force_threshold = int(self._config.len_msg * self._config.unclosed_force_ratio)
         for nu in result.new_unclosed:
+            if len(nu.content) > force_threshold:
+                logger.warning(
+                    "Unclosed fragment length %d exceeds %.2f×len_msg (%d), force-sealing",
+                    len(nu.content),
+                    self._config.unclosed_force_ratio,
+                    force_threshold,
+                )
+                event = self._event_svc.seal_event(
+                    nu.content,
+                    input_id=input_id,
+                )
+                sealed.append(event)
+                continue
+
             ue = UnclosedEvent(
                 id=f"UC-{secrets.token_hex(4)}",
                 content_fragments=[nu.content],

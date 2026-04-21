@@ -86,15 +86,15 @@ class EventService:
 
         if pre_summaries:
             from ..skills.summary_generation import SummaryResult
-            # 合并摘要架构：直接使用上游传入的 summaries
-            # 计算最高数字层级以反映实际缩减深度
-            levels = [int(k[1:]) for k in pre_summaries.keys() if k.startswith("L") and k[1:].isdigit()]
-            max_lvl = max(levels) if levels else 0
+            # 合并摘要架构：直接使用上游传入的 summaries。
+            # 实际层数取「已生成的 L 键数量」，与 SummaryGenerationSkill 内部 ``actual_max_level = len(summaries)``
+            # 语义一致；若上游跳级，此值仍反映真实生成档数而非最高数字标签。
+            valid_keys = [k for k in pre_summaries.keys() if k.startswith("L") and k[1:].isdigit()]
 
             summary_result = SummaryResult(
                 summaries=pre_summaries,
                 summary_lengths={k: len(v) for k, v in pre_summaries.items()},
-                actual_max_level=max_lvl,
+                actual_max_level=len(valid_keys),
             )
         else:
             # 兼容旧逻辑/应急后置降级：使用独立摘要技能

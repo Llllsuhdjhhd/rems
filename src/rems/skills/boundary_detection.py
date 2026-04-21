@@ -68,14 +68,18 @@ class BoundaryDetectionSkill:
         if budget:
             budget_table = "\n".join(f"- {lvl}: {b} 字以内" for lvl, b in budget.summary_level_budgets.items())
 
+        fuse_min = self._config.summary_fuse_min_chars
         user_msg = BOUNDARY_USER.format(
             shadow=shadow_content or "（空）",
             unclosed_summary=unclosed_summary,
             indexed_input=indexed_input,
             budget_table=budget_table,
+            fuse_min_chars=fuse_min,
         )
 
-        system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM
+        system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM.format(
+            fuse_min_chars=fuse_min,
+        )
 
         data = self._llm.complete_json(
             "boundary_detection",

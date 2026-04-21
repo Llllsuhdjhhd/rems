@@ -31,7 +31,7 @@ class SummaryGenerationSkill:
         self._llm = llm
         self._config = config
 
-    def generate(self, content_raw: str, *, max_levels: int = 5, budget: "CompressionBudget" | None = None) -> SummaryResult:
+    def generate(self, content_raw: str, *, max_levels: int = 10, budget: "CompressionBudget" | None = None) -> SummaryResult:
         """Recursively generate L1 … Ln summaries from ``content_raw``.
 
         Stops when the new summary is shorter than ``summary_fuse_min_chars``
@@ -39,6 +39,7 @@ class SummaryGenerationSkill:
 
         从 ``content_raw`` 递归生成 L1…Ln：当新摘要长度小于 ``summary_fuse_min_chars`` 或达到 ``max_levels`` 时停止；
         返回各级文本与字数及实际层数。使用 ``budget`` 中的指数衰减预算表（白皮书 1.2）。
+        默认 ``max_levels=10`` 对齐白皮书 §1.1.3 的 L1–L10 体系；熔断触发时实际层数会少于 10。
         """
         summaries: dict[str, str] = {}
         lengths: dict[str, int] = {}
