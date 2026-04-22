@@ -431,6 +431,22 @@ class REMSPipeline:
         """
         return self.abstraction_service.mine_and_synthesize()
 
+    def resolve_to_basic_events(self, event_id: str) -> list[Event]:
+        """Resolve an abstract event to the flat list of basic events it ultimately derives from.
+
+        从某条事件出发，沿 ``source_events`` 的嵌套链下钻直到叶子层（基本事件），
+        返回 ``Event`` 模型列表（白皮书 §1.1.8 / §3.2）。
+        输入若是基本事件，直接返回含自身的单元素列表；抽象事件会跨多层抽象逐级展开；
+        墓碑事件不会进入结果。
+        """
+        basic_ids = self.event_repo.resolve_basic_event_ids(event_id)
+        events: list[Event] = []
+        for eid in basic_ids:
+            ev = self.event_repo.get(eid)
+            if ev is not None:
+                events.append(ev)
+        return events
+
     def tombstone(self, event_id: str, reason: str, replacement_id: str | None = None) -> bool:
         return self.belief_revision_service.tombstone_event(
             event_id, reason=reason, replacement_event_id=replacement_id

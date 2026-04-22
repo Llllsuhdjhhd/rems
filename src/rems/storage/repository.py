@@ -80,6 +80,69 @@ class EventRepository:
                 q = q.filter(EventRecord.is_tombstoned == False)  # noqa: E712
             return [self._to_model(r) for r in q.order_by(EventRecord.create_time).all()]
 
+    def resolve_basic_event_ids(self, event_id: str) -> list[str]:
+        """Flatten the abstraction chain rooted at *event_id* down to basic-event leaves.
+
+        抽象事件可被再次抽象（白皮书 §3.2），``source_events`` 允许嵌套其他抽象事件。
+        本方法对证据链做 BFS 展开，返回所有叶子基本事件的 id（按首次到达顺序去重）；
+        若 *event_id* 本身即为基本事件，则返回 ``[event_id]``；缺失 / 墓碑事件被跳过。
+        面向"从抽象事件方便地反查基本事件"的检索与审计场景。
+        """
+        seen: set[str] = set()
+        result: list[str] = []
+        stack: list[str] = [event_id]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            ev = self.get(current)
+            if ev is None or ev.is_tombstoned:
+                continue
+            if ev.is_abstract:
+                for sid in (ev.source_events or []):
+                    if sid not in seen:
+                        stack.append(sid)
+            else:
+                result.append(ev.event_id)
+        return result
+
+    def resolve_basic_event_ids(self, event_id: str) -> list[str]:
+        """Return the flat list of basic-event IDs reachable from *event_id*.
+
+        抽象事件可作为更高阶抽象的 ``source_events`` 成员再次参与合成（白皮书 §3.2），
+        因此 ``source_events`` 可能嵌套抽象事件。本方法按广度优先展开抽象链，
+        收集所有叶子层的基本事件 ID（去重、保持首次发现顺序）：
+            - 起点若是基本事件：返回 ``[event_id]``；
+            - 起点是抽象事件：递归展开其 ``source_events``，逐层下钻直到全部叶子为基本事件；
+            - 遇到已登记为墓碑的事件会被跳过（不进入结果，但仍继续展开其他分支）；
+            - 缺失 / 循环引用自动通过 ``seen`` 集合短路，不会无限递归。
+
+        用途：从一条抽象事件出发做"证据溯源"——回到具体的基本事件层，用于高保真复盘、
+        审计、或在 UI 中提供"展开到原文"入口。
+        """
+        seen: set[str] = set()
+        result: list[str] = []
+        stack: list[str] = [event_id]
+        with self._db.session() as s:
+            while stack:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                r = s.get(EventRecord, cur)
+                if r is None or r.is_tombstoned:
+                    continue
+                if r.is_abstract:
+                    # 抽象事件：推入所有 source_events，继续下钻。
+                    for sid in list(r.source_events or []):
+                        if sid not in seen:
+                            stack.append(sid)
+                else:
+                    # 基本事件：加入结果。
+                    result.append(r.event_id)
+        return result
+
     def update_status(
         self,
         event_id: str,

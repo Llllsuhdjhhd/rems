@@ -131,7 +131,8 @@ class AbstractionService:
 
     # ------------------------------------------------------------------
     def _index_abstract(self, event: Event) -> None:
-        text = event.summaries.get("L1", event.content_raw)
+        # 与基本事件保持一致：向量索引使用默认档（mid）摘要，对齐回忆块展示档位（白皮书 §4.4）。
+        text = event.summaries.get(event.mid_summary_key, event.content_raw)
         self._vector.add_event(
             event.event_id,
             text,

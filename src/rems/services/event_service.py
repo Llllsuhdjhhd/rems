@@ -189,8 +189,9 @@ class EventService:
             return ""
 
     def _index_event(self, event: Event) -> None:
-        # 检索主键优先 L1（保真压缩），无则退回原文（与白皮书 1.1.3 一致）。
-        index_text = event.summaries.get("L1", event.content_raw)
+        # 检索主键采用「默认档」（mid 级摘要），与回忆块展示默认档位对齐，
+        # 避免索引/展示粒度错位（白皮书 §4.4）。若无摘要则退回原文。
+        index_text = event.summaries.get(event.mid_summary_key, event.content_raw)
         metadata: dict = {
             "is_abstract": event.is_abstract,
             "status": event.status.value,
