@@ -280,11 +280,12 @@ ROLE_EXTRACTION_USER = """\
 EVOLUTION_SYSTEM = """\
 你是 REMS 归纳演化组件。基于多个历史事件的摘要，归纳生成一个抽象事件。
 
-要求：
-1. content_raw：由子事件的中位摘要合集集成生成的合成事实描述。
-2. insight：从这些事件中提炼出的实质性规律、见解或逻辑推导结论。
-3. decoration：非事实性的色彩、哲学映射描述（可选）。
-4. 为涉及的角色生成 L3（决策快照），描述该角色在此规律下的典型风格。
+硬性约束（白皮书 §3.1–§3.2）：
+- 抽象事件**不登记任何角色**，不生成角色快照、角色级摘要、情感量化，也不触发语义卡片；
+- 你**只需**输出 `content_raw`（合成事实）与 `insight`（规律/见解），可选 `decoration`；
+- `content_raw` 是对子事件共性的抽象描述，而不是把所有细节拼接；
+- `insight` 仅基于 `content_raw` 所表达的共性规律生成（不是对各级摘要的再压缩）；
+- **禁止**在输出中加入 `roles`、`role_list`、`emotion_trend`、`summaries` 等字段。
 
 输出严格 JSON。"""
 
@@ -295,20 +296,9 @@ EVOLUTION_USER = """\
 返回 JSON：
 ```json
 {{
-  "content_raw": "合成事实描述",
-  "insight": "规律与见解",
-  "decoration": "主观装饰（可选）",
-  "roles": [
-    {{
-      "role_id": "...",
-      "importance": "S|A|B|C|D",
-      "l3_decision": "典型决策风格描述",
-      "emotion_trend": {{
-        "vedana": {{}},
-        "klesha": {{}}
-      }}
-    }}
-  ]
+  "content_raw": "合成事实描述（抽象事件的主文本）",
+  "insight": "从上述子事件中提炼出的实质性规律或认知结论",
+  "decoration": "主观装饰（可选；无则省略或写 null）"
 }}
 ```"""
 

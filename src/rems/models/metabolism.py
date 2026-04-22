@@ -69,8 +69,6 @@ class RecallBlock(BaseModel):
 
     items: list[RecallItem] = Field(default_factory=list)
     total_length: int = 0
-    # 触发空间压力时，识别出的建议进行归纳抽象的一组事件 ID（白皮书 4.4）。
-    abstraction_candidate_ids: list[str] = Field(default_factory=list)
 
     def recompute_length(self) -> int:
         self.total_length = sum(len(it.content) for it in self.items)

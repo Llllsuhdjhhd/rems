@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # REMS 全局配置（对照《REMS 记忆系统规范解析》白皮书）。
 # - len_msg / physical_redline / safe_watermark：1.1.7 事件长度与物理防御、4.2 触发与截断；
-# - recall_cluster_threshold：兼容旧配置名，抽象条数见 abstraction_vector_*；
+# - abstract_subset_min_size / abstract_subset_min_support：3.2 频繁极大子集挖掘触发抽象；
 # - ae_*、wp_*：1.1.4、2.2 情感能量（AE）与白描动态遗忘；
 # - hallucination_anchor_prob：3.3 递归抽象时锚定子事件摘要的概率；
 # - tombstone_prefix：4.3 墓碑化时在 insight 中的审计标记前缀；
@@ -98,15 +98,15 @@ class REMSConfig(BaseSettings):
     # 摘要最低字数门槛：某档摘要字数 ≤ 此值时视为已最大压缩，不再向上推进档位。
     recall_summary_min_chars: int = 20
 
-    # 历史/报告用字段；抽象触发条数现由 ``abstraction_vector_min_total_events`` 等控制（全库代码不再读取本字段）。
-    recall_cluster_threshold: int = 5
+    # ---- Abstraction: Frequent Maximal Subset Mining (白皮书 §3.2 唯一触发) ----
+    # 每次回忆产生的回忆块 event_id 集合被登记到 ``recall_log``；在集合族中找满足：
+    #   - 子集大小 >= abstract_subset_min_size（默认 6；可配置）
+    #   - 支持度（跨多少条回忆块被整体覆盖） >= abstract_subset_min_support（默认 5）
+    # 的 **极大子集**，对其合成抽象事件。合成后把 ``recall_log`` 中该子集替换为抽象事件 id，
+    # 以便后续更高阶抽象继续在同一命名空间演进（"用抽象事件 id 代替原来的子集，逻辑保持统一"）。
+    abstract_subset_min_size: int = 6
+    abstract_subset_min_support: int = 5
 
-    # ---- Abstraction: vector anchor path only (``check_and_abstract``) ----
-    # 以锚点做向量近邻，须同时满足
-    # 1) 聚类内事件数（锚点 + 非抽象/未 is_abstracted 的近邻）≥ 该值，默认 11 即「多于 10 条」
-    # 2) 上述簇内 L1 文本总长度 > len_msg * abstraction_vector_l1_len_msg_min_ratio（默认 1/3）
-    abstraction_vector_min_total_events: int = 11
-    abstraction_vector_l1_len_msg_min_ratio: float = 1.0 / 3.0
     # 未闭合事件总长超过 len_msg * 该比例则强制封存（白皮书 4.2：兜底 1.2×len_msg）。
     # 同时作为物理红线触发时的强制封存阈值；是否「可疑」由角色抽取与 RoleService 仲裁判断。
     unclosed_force_ratio: float = 1.2
@@ -129,8 +129,6 @@ class REMSConfig(BaseSettings):
     recall_intermediate_filter_factor: float = 1.2
     # 初始保持高保真摘要的头部条目比例（由条目数决定）。
     recall_head_ratio: float = 0.66
-    # 触发再巩固抽象的空间门槛比例（相对于 physical_redline，对应 1/6.6）。
-    abstraction_recall_trigger_factor: float = 1.0
 
     # 抽象演化时以该概率强制用子事件 L1/原文锚定，抑制「推理当事实」闭环（白皮书 3.3）。
     hallucination_anchor_prob: float = 0.3

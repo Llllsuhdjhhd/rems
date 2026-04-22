@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -22,7 +23,13 @@ from .skills.inductive_evolution import InductiveEvolutionSkill
 from .skills.role_extraction import RoleExtractionSkill
 from .skills.summary_generation import SummaryGenerationSkill
 from .storage.database import Database
-from .storage.repository import EventRepository, MetabolismRepository, RoleRepository
+from .storage.repository import (
+    AbstractedSubsetRepository,
+    EventRepository,
+    MetabolismRepository,
+    RecallLogRepository,
+    RoleRepository,
+)
 from .storage.vector_store import VectorStore
 
 # 顶层编排：ingest 串联回忆（ContextPackage）、代谢封存、角色白描/语义卡片、
@@ -129,6 +136,7 @@ class REMSPipeline:
         event_repo: EventRepository,
         role_repo: RoleRepository,
         meta_repo: MetabolismRepository,
+        recall_log_repo: RecallLogRepository,
         event_service: EventService,
         role_service: RoleService,
         metabolism_service: MetabolismService,
@@ -143,6 +151,7 @@ class REMSPipeline:
         self.event_repo = event_repo
         self.role_repo = role_repo
         self.meta_repo = meta_repo
+        self.recall_log_repo = recall_log_repo
         self.event_service = event_service
         self.role_service = role_service
         self.metabolism_service = metabolism_service
@@ -166,6 +175,8 @@ class REMSPipeline:
         event_repo = EventRepository(db)
         role_repo = RoleRepository(db)
         meta_repo = MetabolismRepository(db)
+        recall_log_repo = RecallLogRepository(db)
+        abstracted_subset_repo = AbstractedSubsetRepository(db)
 
         # SummaryGenerationSkill 仍用于抽象事件（inductive evolution 后的总结）。
         # 基本事件流已被 EventEnrichmentSkill 接管（一次调用产出摘要 + 角色）。
@@ -191,7 +202,15 @@ class REMSPipeline:
         
         metabolism_service = MetabolismService(config, meta_repo, boundary_skill, event_service)
         recall_service = RecallService(config, event_repo, role_repo, vector_store)
-        abstraction_service = AbstractionService(config, event_repo, vector_store, evolution_skill, summary_skill)
+        abstraction_service = AbstractionService(
+            config,
+            event_repo,
+            vector_store,
+            evolution_skill,
+            summary_skill,
+            recall_log_repo,
+            abstracted_subset_repo,
+        )
         belief_revision_service = BeliefRevisionService(config, event_repo, role_repo)
 
         return cls(
@@ -202,6 +221,7 @@ class REMSPipeline:
             event_repo=event_repo,
             role_repo=role_repo,
             meta_repo=meta_repo,
+            recall_log_repo=recall_log_repo,
             event_service=event_service,
             role_service=role_service,
             metabolism_service=metabolism_service,
@@ -261,6 +281,24 @@ class REMSPipeline:
                 raw_input, shadow, focus_role_ids=focus_role_ids
             )
 
+        # 登记本次回忆块 event_id 到 recall_log（白皮书 §3.2 唯一抽象触发路径的输入流）。
+        # 只记录真实 basic/abstract 事件，过滤 CARD:* 伪条目；抽象事件 id 同样进入命名空间，
+        # 便于后续更高阶抽象在同一空间继续挖掘。
+        if ctx and ctx.recall_block.items and mode != ProcessingMode.PASSIVE_LOG:
+            recall_event_ids: list[str] = []
+            seen_ids: set[str] = set()
+            for it in ctx.recall_block.items:
+                eid = it.event_id
+                if not eid or eid.startswith("CARD:") or eid in seen_ids:
+                    continue
+                seen_ids.add(eid)
+                recall_event_ids.append(eid)
+            if recall_event_ids:
+                self.recall_log_repo.append(
+                    recall_id=f"RCL-{uuid.uuid4().hex}",
+                    event_ids=recall_event_ids,
+                )
+
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
         sealed = self.metabolism_service.process_input(raw_input, force_save=force_save, input_id=input_id)
 
@@ -268,17 +306,10 @@ class REMSPipeline:
         for event in sealed:
             self.role_service.update_from_event(event)
 
-        # 记忆再巩固：回忆块中同一主题基本事件数量达阈值则归纳抽象（第 4.4）。
+        # 抽象事件触发 —— 唯一路径：``recall_log`` 中的极大频繁子集（白皮书 §3.2）。
         abstract_events: list[Event] = []
-
-        if ctx and ctx.recall_block.items and mode != ProcessingMode.PASSIVE_LOG:
-            abstract_events.extend(self._reconsolidate(ctx, sealed))
-
-        # 封存后再以新事件为锚做一次向量聚类抽象（第 3.2 演化驱动触发的一种实现路径）。
-        for event in sealed:
-            abstract = self.abstraction_service.check_and_abstract(event)
-            if abstract:
-                abstract_events.append(abstract)
+        if mode != ProcessingMode.PASSIVE_LOG:
+            abstract_events = self.abstraction_service.mine_and_synthesize()
 
         # NPC：由回忆与威胁启发式生成行为指令（第 5.3）。
         npc_directives: list[dict] = []
@@ -326,37 +357,6 @@ class REMSPipeline:
         except Exception:
             pass
         return focus
-
-    # ------------------------------------------------------------------
-    # Memory Reconsolidation
-    # ------------------------------------------------------------------
-
-    def _reconsolidate(
-        self,
-        ctx: ContextPackage,
-        newly_sealed: list[Event],
-    ) -> list[Event]:
-        """Trigger abstract event synthesis based on space pressure (Whitepaper 4.4).
-        
-        Uses the ``abstraction_candidate_ids`` pre-calculated by RecallService 
-        (which targets the top 1/6.6 context pressure zone).
-        """
-        candidates = []
-        for eid in ctx.recall_block.abstraction_candidate_ids:
-            e = self.event_repo.get(eid)
-            if e and not e.is_abstract and not e.is_tombstoned and not e.is_abstracted:
-                candidates.append(e)
-
-        if not candidates:
-            return []
-
-        logger.info(
-            "Memory Reconsolidation triggered: %d candidates from recall pressure zone",
-            len(candidates),
-        )
-
-        abstract_evt = self.abstraction_service.abstract_event_cluster(candidates)
-        return [abstract_evt] if abstract_evt else []
 
     # ------------------------------------------------------------------
     # NPC / Generative-Agent directives
@@ -425,7 +425,11 @@ class REMSPipeline:
         }
 
     def run_evolution(self) -> list[Event]:
-        return self.abstraction_service.run_background_evolution()
+        """Manually drive the subset-mining pass (白皮书 §3.2).
+
+        Equivalent to what ``ingest`` already runs after each recall; exposed for batch jobs.
+        """
+        return self.abstraction_service.mine_and_synthesize()
 
     def tombstone(self, event_id: str, reason: str, replacement_id: str | None = None) -> bool:
         return self.belief_revision_service.tombstone_event(

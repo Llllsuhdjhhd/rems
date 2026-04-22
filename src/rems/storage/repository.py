@@ -7,9 +7,13 @@ from typing import Optional
 from ..models.event import EmotionalModel, Event, EventRoleEntry, EventStatus
 from ..models.metabolism import Shadow, UnclosedEvent
 from ..models.role import Role, SemanticCard, WhitePaintingEntry
+from datetime import datetime
+
 from .database import (
+    AbstractedSubsetRecord,
     Database,
     EventRecord,
+    RecallLogRecord,
     RoleRecord,
     SemanticCardRecord,
     ShadowRecord,
@@ -345,3 +349,85 @@ class MetabolismRepository:
             updated_at=r.updated_at,
             last_hit_time=r.last_hit_time,
         )
+
+
+# =====================================================================
+# Recall log & abstracted-subset bookkeeping (白皮书 §3.2)
+# =====================================================================
+
+
+def _subset_fingerprint(event_ids: "list[str] | set[str]") -> str:
+    """Deterministic subset id: sort then join with '|' for DB dedupe."""
+    return "|".join(sorted(set(event_ids)))
+
+
+class RecallLogRepository:
+    """Persistence for per-recall event_id sets used by the frequent-subset miner."""
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    def append(self, recall_id: str, event_ids: list[str]) -> None:
+        if not event_ids:
+            return
+        with self._db.session() as s:
+            s.merge(RecallLogRecord(
+                recall_id=recall_id,
+                created_at=datetime.now(),
+                event_ids=list(event_ids),
+            ))
+            s.commit()
+
+    def list_all(self) -> list[tuple[str, list[str]]]:
+        """Return ``[(recall_id, event_ids), ...]`` in insertion (time) order."""
+        with self._db.session() as s:
+            rows = s.query(RecallLogRecord).order_by(RecallLogRecord.created_at).all()
+            return [(r.recall_id, list(r.event_ids or [])) for r in rows]
+
+    def replace_subset(self, subset: set[str], abstract_event_id: str) -> int:
+        """For every recall log row whose id set ⊇ *subset*, remove *subset* and add *abstract_event_id*.
+
+        Returns the number of rows rewritten. Called right after an abstract event is synthesised
+        so the miner keeps working in the new namespace ("用抽象事件 id 代替原来的子集").
+        """
+        if not subset:
+            return 0
+        rewritten = 0
+        with self._db.session() as s:
+            rows = s.query(RecallLogRecord).all()
+            for r in rows:
+                ids = set(r.event_ids or [])
+                if not subset.issubset(ids):
+                    continue
+                new_ids = (ids - subset) | {abstract_event_id}
+                # Preserve deterministic ordering for stable mining.
+                r.event_ids = sorted(new_ids)
+                rewritten += 1
+            s.commit()
+        return rewritten
+
+
+class AbstractedSubsetRepository:
+    """Persisted fingerprints of subsets that already fired an abstract event.
+
+    Provides an idempotency guarantee against duplicate synthesis even in the
+    rare case where the miner revisits a subset after restart.
+    """
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    def is_fired(self, event_ids: "list[str] | set[str]") -> bool:
+        fp = _subset_fingerprint(event_ids)
+        with self._db.session() as s:
+            return s.get(AbstractedSubsetRecord, fp) is not None
+
+    def mark_fired(self, event_ids: "list[str] | set[str]", abstract_event_id: str) -> None:
+        fp = _subset_fingerprint(event_ids)
+        with self._db.session() as s:
+            s.merge(AbstractedSubsetRecord(
+                fingerprint=fp,
+                abstract_event_id=abstract_event_id,
+                created_at=datetime.now(),
+            ))
+            s.commit()

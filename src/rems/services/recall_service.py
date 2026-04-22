@@ -112,24 +112,6 @@ class RecallService:
             current_len += len(text)
 
         block = self._assemble_block(filtered_events, focus_role_ids=focus_role_ids or set())
-        
-        # ========================================================
-        # Phase 3: Abstraction Candidate Identification (1/6.6)
-        # ========================================================
-        # Identify subset for abstraction based on abstraction_recall_trigger_factor
-        abstraction_limit = int(redline * self._config.abstraction_recall_trigger_factor)
-        abs_candidates = []
-        abs_len = 0
-        for event, _ in filtered_events:
-            # Use L1 summary length for abstraction pressure estimate
-            text = event.summaries.get("L1", event.content_raw)
-            if abs_len + len(text) > abstraction_limit and abs_candidates:
-                break
-            abs_candidates.append(event.event_id)
-            abs_len += len(text)
-        
-        block.abstraction_candidate_ids = abs_candidates
-
         block = self._append_semantic_cards(block, filtered_events)
         return block
 

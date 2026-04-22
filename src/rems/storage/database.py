@@ -110,6 +110,37 @@ class SemanticCardRecord(Base):
 
 
 # ------------------------------------------------------------------
+# Recall log & abstraction bookkeeping (白皮书 §3.2 频繁极大子集挖掘)
+# ------------------------------------------------------------------
+
+class RecallLogRecord(Base):
+    """每一次成功组装的回忆块登记为一条记录，``event_ids`` 为当次回忆块中 **basic 事件** 的有序去重 id 列表。
+
+    抽象事件合成时会把已吸收子集 S 替换为新抽象事件 id（"用抽象事件 id 代替原来的子集"），
+    使后续更高阶抽象在同一命名空间继续演进（白皮书 §3.2）。
+    """
+
+    __tablename__ = "recall_log"
+
+    recall_id = Column(String, primary_key=True)
+    created_at = Column(DateTime, nullable=False)
+    event_ids = Column(JSON, default=list)
+
+
+class AbstractedSubsetRecord(Base):
+    """已经触发过抽象事件的子集指纹，避免同一极大子集被重复合成。
+
+    ``fingerprint`` 为事件 id 升序后的 ``"|"`` 拼接；``abstract_event_id`` 指向合成出的抽象事件。
+    """
+
+    __tablename__ = "abstracted_subsets"
+
+    fingerprint = Column(String, primary_key=True)
+    abstract_event_id = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+
+
+# ------------------------------------------------------------------
 # Database facade
 # ------------------------------------------------------------------
 
