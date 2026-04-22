@@ -76,7 +76,7 @@ BOUNDARY_SYSTEM = """\
    - **不要生成摘要、角色、情感等衍生字段**，这些由下游组件处理。
 2. **防碎片化（白皮书 1.1.7）**：同一段落内若干琐碎动作若构成同一逻辑闭环，合并为单个事件；不要把每个短句各拆成独立事件。
 3. **续写判定**：若当前片段是未完成事件库中某条的续写，填写 `continuation_of` 为对应未完成 ID；否则为 null。
-4. **未完成事件**：若段落未形成闭环，请将其序号填入 `new_unclosed_indices`。
+4. **未完成事件**：未闭环的**一段**连续句子请用**一个**正整数列表写出全部序号，例如 `"new_unclosed_indices": [12, 13, 14]` 表示**一条**未完成（勿把每个句子的序号拆成「数组里多个内层表」的歧义；只有存在**多路并行**的未完成时，才用嵌套，如 `[[1,2],[8,9]]`）。
 5. **残影**：把与当前事件无关但仍有保留价值的短句序号填入 `remaining_shadow_indices`。
 
 输出严格 JSON。"""
@@ -101,9 +101,10 @@ BOUNDARY_USER = """\
     }}
   ],
   "remaining_shadow_indices": [10, 11],
-  "new_unclosed_indices": [12]
+  "new_unclosed_indices": [12, 13]
 }}
-```"""
+```
+单条未完成也可写 `"new_unclosed_indices": [12]`（同一条内多句请写进**同一**扁平列表，勿每句一条记录）。"""
 
 # =====================================================================
 # 2. Event Enrichment — 统一的「事件摘要 + 角色抽取」技能
@@ -111,56 +112,52 @@ BOUNDARY_USER = """\
 # 以 boundary 剥离出的 content_raw 为输入，一次 LLM 调用同时产出：
 # 1) L1…Ln 递归摘要（带熔断）
 # 2) 角色列表（快照层级 + Vedana/Klesha）
-# 角色级语义卡片（insight）的刷新由下游按「主要角色」过滤后另起一次调用，见 _CARD_*。
+# 设计要点：先强调「角色」、JSON 中 roles 在 summaries 之前，避免模型因长摘要说明漏填 roles（见
+#   ENRICHMENT_PRIORITY_ADDENDUM）。角色级语义卡片的 LLM 刷新由下游 S/A 过滤后另起调用。
+
+ENRICHMENT_PRIORITY_ADDENDUM = """\
+【角色输出优先（硬约束，优先于后文摘要长说明）】
+- 若原文为叙事/史传/章回/神话/寓言/对话等，**凡出现可区分之专名、道号、神怪/仙真称谓、以及明确叙述对象，均须各对应一条 `roles` 项**；不得合并为无名单一「旁白」后把 `roles` 留空。
+- 在「摘要写满」与「`roles` 非空且覆盖主要专名」二选一相冲突时，**先保证 `roles` 与专名覆盖**；摘要可略短，但 `roles` 不可整段留空或 `[]`（除非原文全无可列实体，且须自行判定确无专名/人物）。
+- 去代词化：见下方已知角色表；`role_id` 可复用或 null 由下游注册。
+
+"""
 
 ENRICHMENT_SYSTEM = """\
-你是 REMS 事件充实（Event Enrichment）组件。给定一个**已闭环**的基本事件原文，你需要**在一次输出中同时完成**两件事：
+你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，在**同一条 JSON** 中同时交付：
 
-1. **生成多级摘要（L1 … Ln）**
-   - 严格遵守下方【摘要字数预算表】（硬约束）。
-   - L1：最高保真压缩，只剥离修饰语，保留核心事实与因果主干。
-   - L2~Ln：逐级指数级压缩，每一级字数显著少于上一级。
-   - **动态熔断**：一旦某级摘要低于 {fuse_min_chars} 字，立即停止后续更高级别的生成（summaries 字典只保留已生成的键值对）。
+A. **roles（与摘要同等优先；JSON 中键名顺序建议 roles 在 summaries 前）**
+   - 重要性 S/A/B/C/D；S 级给满 L1/L2/L3 快照，其余至少 L1，遵守【角色快照预算表】。
+   - Vedana/Klesha 各子项 ∈ [0,1]；无依据可省略子键。
 
-2. **识别角色并生成分级快照与情感量化**
-   - **角色重要性**：S（核心主角）/ A / B / C / D。
-   - **角色快照层级与预算（指数级递减）**：严格遵守下方【角色快照预算表】。
-     * L3：详细意图快照；微观动作、因果、内心意图。
-     * L2：互动逻辑快照；角色间实时互动与反馈。
-     * L1：骨架白描快照；极简事实点。
-   - **层级分配策略**：
-     * S 级：必须同时给出 L1、L2、L3；三级之间要有明显语义密度差异。
-     * A/B/C/D：**仅给出 L1**，L2 / L3 字段留空（null 或缺省）。
-   - **情感量化**：Vedana / Klesha 各子字段数值 ∈ [0, 1]；未提及则留空。
-   - **去代词化**：若「已知角色列表」中已有对应实体，填写对应 role_id 以复用；否则 role_id 置 null，交由下游注册。
+B. **summaries：L1…Ln 递归压缩**
+   - 遵守【摘要字数预算表】；L1 保真主干，L2+ 逐层约减半。
+   - **熔断**：当某级摘要字符数 **≤ {fuse_min_chars}** 时，**不得再生成**下一级更压缩摘要（`summaries` 只含已产出的各级）。
 
-输出严格 JSON，不附加任何解释文本。"""
+只输出一个 JSON 对象，勿附加说明。"""
 
 ENRICHMENT_USER = """\
-## 已知角色列表（可用于去代词化复用）
+## 已知角色（去代词化复用）
 {known_roles}
 
-## 事件原文（已闭环）
+## 任务一：角色（先满足再写任务二）
+从原文中列出**所有**应记录的实体（人名/神怪/可区分主语等），填 `roles`；有专名时禁止 `[]`。
+
+## 任务二：摘要（L1 起，遵守熔断 {fuse_min_chars}）
+生成 `summaries` 各级，直至熔断或达预算上限。
+
+## 事件原文
 {content_raw}
 
-## 【摘要字数预算表】（硬约束）
+## 摘要字预算
 {summary_budget_table}
 
-## 【角色快照字数预算表】（硬约束）
+## 角色快照字预算
 {snapshot_budget_table}
 
-## 摘要字数控制要点
-1. 递减生成：L1 → L2 → … 每一级字数较前一级约减少 50%。
-2. 动态熔断：一旦某级摘要缩减到 **{fuse_min_chars} 字以内**，立即停止后续层级。
-
-请在一次响应中同时返回摘要与角色列表，格式如下：
+## 输出 JSON（**roles 在前，summaries 在后**）
 ```json
 {{
-  "summaries": {{
-    "L1": "摘要文本...",
-    "L2": "摘要文本...",
-    "L3": "摘要文本..."
-  }},
   "roles": [
     {{
       "role_id": "已有ID 或 null",
@@ -168,18 +165,28 @@ ENRICHMENT_USER = """\
       "entity_type": "person",
       "importance": "S|A|B|C|D",
       "snapshot": {{
-        "l1_mention": "L1 文本（S/A/B/C/D 必填）",
-        "l2_interaction": "L2 文本（仅 S 级填写）",
-        "l3_decision": "L3 文本（仅 S 级填写）"
+        "l1_mention": "L1 骨架（S/A/B/C/D 均必填）",
+        "l2_interaction": "L2 互动（仅 S 级有内容）",
+        "l3_decision": "L3 意图（仅 S 级有内容）"
       }},
-      "emotion": {{
-        "vedana": {{}},
-        "klesha": {{}}
-      }}
+      "emotion": {{ "vedana": {{}}, "klesha": {{}} }}
     }}
-  ]
+  ],
+  "summaries": {{
+    "L1": "…",
+    "L2": "…"
+  }}
 }}
 ```"""
+
+
+def build_enrichment_system_message(config: "REMSConfig", *, fuse_min_chars: int) -> str:
+    """System prompt for event enrichment: mode injection + 角色优先 + 主规则。"""
+    return (
+        build_user_mode_block(config)
+        + ENRICHMENT_PRIORITY_ADDENDUM
+        + ENRICHMENT_SYSTEM.format(fuse_min_chars=fuse_min_chars)
+    )
 
 # =====================================================================
 # 3. Summary Generation (recursive L1-Ln) — 仍保留，用于抽象事件合成

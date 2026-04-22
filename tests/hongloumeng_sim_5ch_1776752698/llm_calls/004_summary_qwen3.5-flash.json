@@ -1,0 +1,22 @@
+{
+  "call_id": 4,
+  "task_type": "summary",
+  "model": "qwen3.5-flash",
+  "messages": [
+    {
+      "role": "system",
+      "content": "你是 REMS 递归摘要生成组件。根据给定文本生成指定层级的摘要。\n\n摘要层级规则：\n- L1（核心事实种子）：最大化保真压缩，剥离修饰语，严谨保留事实主干。\n- L2 及以上：渐进式抽象，基于语义重要性密度进行动态截断。\n- 每一级的摘要应基于上一级生成（L2 基于 L1，L3 基于 L2 …）。\n- 熔断条件：若某一级摘要不足 20 字则停止。\n- 字数预算：若系统提供了「目标字数上限」，请将 L1 摘要控制在该字数以内。\n\n输出严格 JSON。"
+    },
+    {
+      "role": "user",
+      "content": "## 待摘要文本（L3）\n石头记托梦隐真事，甄贾寓名叹闺阁胜须眉悔潦倒。\n\n【字数预算】请将本级摘要严格控制在 20 字以内。\n请生成下一级摘要（L4）。返回 JSON：\n```json\n{\n  \"summary\": \"生成的摘要文本\",\n  \"char_count\": 字符数\n}\n```"
+    }
+  ],
+  "response": "{\n  \"summary\": \"托梦隐真，叹女胜男悔落魄。\",\n  \"char_count\": 13\n}",
+  "metrics": {
+    "latency_ms": 42394.13110000896,
+    "prompt_tokens": 247,
+    "completion_tokens": 4824,
+    "total_tokens": 5071
+  }
+}

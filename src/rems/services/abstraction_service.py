@@ -18,9 +18,10 @@ logger = logging.getLogger(__name__)
 class AbstractionService:
     """Detects when a recall cluster exceeds threshold and synthesises an abstract event.
 
-    以某条锚点事件的向量表示检索近邻事件；当非抽象基本事件数量达到 ``recall_cluster_threshold`` 时，
-    调用 ``InductiveEvolutionSkill`` 合成 ``is_abstract=True`` 的新事件，写入摘要与向量索引，
-    并将簇内来源事件标记 ``is_abstracted``。``run_background_evolution`` 则扫描未吸收的基本事件批量尝试（白皮书 3.2）。
+    以某条锚点事件的向量表示检索近邻；``check_and_abstract`` 在同时满足
+    ``abstraction_vector_min_total_events`` 与 L1 总长度 > ``len_msg * abstraction_vector_l1_len_msg_min_ratio`` 时
+    调用 ``InductiveEvolutionSkill`` 合成 ``is_abstract=True`` 的新事件。
+    ``_reconsolidate`` 触发的 ``abstract_event_cluster`` 不经过本函数（白皮书 3.2、4.4）。
     """
 
     def __init__(
@@ -39,34 +40,53 @@ class AbstractionService:
 
     # ------------------------------------------------------------------
     def check_and_abstract(self, anchor_event: Event) -> Event | None:
-        """If the anchor event's recall cluster >= threshold, generate an abstract event.
-        
-        Note: This is the 'background scan' or 'per-event' trigger. In most dialogue 
-        scenarios, ``abstract_event_cluster`` (triggered by space pressure) is preferred.
+        """Vector-neighbour cluster must reach both size and L1-total vs ``len_msg`` (see config).
+
+        近邻数（不含锚点）从 ``abstraction_vector_min_total_events-1`` 起向上扩展，直到
+        簇内 L1 总长度**严格大于** ``len_msg * abstraction_vector_l1_len_msg_min_ratio``；仍不足则再增加近邻
+        直至满足或耗尽检索结果。近邻需 ``not is_abstract`` 且 ``not is_abstracted``。
         """
+        cfg = self._config
+        min_total = max(2, cfg.abstraction_vector_min_total_events)
+        min_related = min_total - 1
+        n_search = max(64, min_total * 3)
+        ratio = cfg.abstraction_vector_l1_len_msg_min_ratio
+
         index_text = anchor_event.summaries.get("L1", anchor_event.content_raw)
-        hits = self._vector.search(index_text, n_results=self._config.recall_cluster_threshold + 5)
+        hits = self._vector.search(index_text, n_results=n_search)
 
-        related_ids = [
-            h["event_id"]
-            for h in hits
-            if h["event_id"] != anchor_event.event_id
-        ]
-
-        if len(related_ids) < self._config.recall_cluster_threshold:
-            return None
-
-        related_events: list[Event] = []
-        for eid in related_ids[:self._config.recall_cluster_threshold + 3]:
+        candidates: list[Event] = []
+        seen: set[str] = {anchor_event.event_id}
+        for h in hits:
+            eid = h.get("event_id")
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
             evt = self._event_repo.get(eid)
-            if evt and not evt.is_abstract:
-                related_events.append(evt)
+            if not evt or evt.is_abstract or evt.is_abstracted:
+                continue
+            candidates.append(evt)
 
-        if len(related_events) < self._config.recall_cluster_threshold:
+        if len(candidates) < min_related:
             return None
 
-        cluster = [anchor_event] + related_events
-        return self.abstract_event_cluster(cluster)
+        for k in range(min_related, len(candidates) + 1):
+            rel = candidates[:k]
+            cluster = [anchor_event] + rel
+            l1sum = self._sum_l1_text_len(cluster)
+            if ratio > 0.0 and l1sum <= cfg.len_msg * ratio:
+                continue
+            if ratio <= 0.0 and l1sum <= 0:
+                continue
+            return self.abstract_event_cluster(cluster)
+        return None
+
+    @staticmethod
+    def _sum_l1_text_len(events: list[Event]) -> int:
+        return sum(
+            len((e.summaries or {}).get("L1") or e.content_raw or "")
+            for e in events
+        )
 
     def abstract_event_cluster(self, cluster: list[Event]) -> Event | None:
         """Synthesize an abstract event from an explicit list of events.
@@ -108,7 +128,7 @@ class AbstractionService:
         将其 ``source_events`` 记入 ``processed_ids`` 以避免同一批子事件重复参与后续锚点扫描（白皮书 3.2 演化驱动触发）。
         """
         candidates = self._event_repo.list_all(is_abstract=False, is_abstracted=False)
-        if len(candidates) < self._config.recall_cluster_threshold:
+        if len(candidates) < self._config.abstraction_vector_min_total_events:
             return []
 
         created: list[Event] = []

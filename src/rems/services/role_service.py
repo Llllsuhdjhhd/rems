@@ -127,8 +127,8 @@ class RoleService:
             self._repo.add_white_painting_entry(role.role_id, wp)
             logger.debug("WP appended for %s from event %s (AE=%.2f)", role.role_id, event.event_id, memory_weight)
 
-            # 语义卡片（insight）只对「主要角色」(S/A 或单人模式核心用户) 刷新，
-            # 次要角色跳过以节省 LLM 调用开销；与收集端的动态粒度路由一致（白皮书 2.3）。
+            # 语义卡片（insight 任务）只对「主要角色」(S/A 或单人模式核心用户) 且 ``enable_insight`` 时刷新，
+            # 次要角色跳过以节省 LLM 调用；与收集端的动态粒度路由一致（白皮书 2.3）。
             if self._is_primary_role(entry):
                 self._refresh_semantic_card(role.role_id)
             else:
@@ -191,6 +191,8 @@ class RoleService:
     # ------------------------------------------------------------------
 
     def _refresh_semantic_card(self, role_id: str, recent_n: int = 10) -> None:
+        if not self._config.enable_insight:
+            return
         if self._llm is None:
             return
         try:

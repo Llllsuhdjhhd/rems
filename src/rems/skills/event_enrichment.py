@@ -13,13 +13,14 @@ from pydantic import BaseModel, Field
 
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
-from ..llm.prompts import ENRICHMENT_SYSTEM, ENRICHMENT_USER, build_user_mode_block
+from ..llm.prompts import ENRICHMENT_USER, build_enrichment_system_message
 from ..models.event import EmotionalModel, Klesha, RoleSnapshot, Vedana
 from ..skills.role_extraction import ExtractedRole
 
 if TYPE_CHECKING:
     from ..models.event import CompressionBudget
     from ..models.role import Role
+    from .role_extraction import RoleExtractionSkill
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,17 @@ class EventEnrichmentSkill:
     输出：``summaries`` / ``summary_lengths`` / ``actual_max_level`` / ``roles``。
     """
 
-    def __init__(self, llm: LLMProvider, config: REMSConfig):
+    def __init__(
+        self,
+        llm: LLMProvider,
+        config: REMSConfig,
+        *,
+        role_fallback: "RoleExtractionSkill | None" = None,
+    ):
         self._llm = llm
         self._config = config
+        # 合规模型仍漏掉 roles 时，用一次专用 role_extraction 调用补全（与主调用摘要结果合并）。
+        self._role_fallback = role_fallback
 
     def enrich(
         self,
@@ -81,9 +90,7 @@ class EventEnrichmentSkill:
             snapshot_budget_table=snapshot_budget_text,
             fuse_min_chars=fuse_min,
         )
-        system_msg = build_user_mode_block(self._config) + ENRICHMENT_SYSTEM.format(
-            fuse_min_chars=fuse_min,
-        )
+        system_msg = build_enrichment_system_message(self._config, fuse_min_chars=fuse_min)
 
         data = self._llm.complete_json(
             "event_enrichment",
@@ -111,7 +118,8 @@ class EventEnrichmentSkill:
 
         # ---- Roles ------------------------------------------------------
         extracted: list[ExtractedRole] = []
-        for rd in data.get("roles", []) or []:
+        role_rows = data.get("roles", []) or data.get("characters", [])
+        for rd in role_rows if isinstance(role_rows, list) else []:
             if not isinstance(rd, dict):
                 continue
             snap = rd.get("snapshot") or {}
@@ -152,6 +160,13 @@ class EventEnrichmentSkill:
                     klesha=Klesha(**k_init),
                 ),
             ))
+
+        if not extracted and self._role_fallback and content_raw.strip():
+            logger.info("EventEnrichment: empty roles; running role_extraction fallback")
+            fr = self._role_fallback.extract(
+                content_raw, known_roles=known_roles, budget=budget,
+            )
+            extracted = list(fr.roles)
 
         return EnrichmentResult(
             summaries=summaries,

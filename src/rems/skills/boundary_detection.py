@@ -41,6 +41,38 @@ class BoundaryDetectionSkill:
     封存或挂起（白皮书 4.1、1.1.7 防碎片化条款体现在系统/用户 prompt 中）。
     """
 
+    @staticmethod
+    def _decode_new_unclosed_list(raw: list, sentences: list[str]) -> list[NewUnclosed]:
+        """Map ``new_unclosed_indices`` JSON to ``NewUnclosed`` list.
+
+        - **扁平数字列表** ``[1,2,3]``：视为**同一条**未完成叙事内连续句子（只落库一行）。
+        - **嵌套列表** ``[[1,2],[8,9]]``：多线程时多条未完成，每组一行。
+        若对扁平表逐项解码，会误将 ``[1,2,3]`` 拆成 3 条只含一句的未完成（DB 里「一条叙事多行」）
+        —— 这是此前异常膨胀的主要原因。
+        """
+        if not raw:
+            return []
+        is_flat_indices = all(
+            isinstance(x, (int, float)) and not isinstance(x, bool)
+            for x in raw
+        )
+        if is_flat_indices:
+            idxs = [int(x) for x in raw]
+            content = decode_indices(sentences, idxs)
+            if not content:
+                return []
+            return [NewUnclosed(content=content, logical_gaps=None)]
+
+        new_unc: list[NewUnclosed] = []
+        for item in raw:
+            if isinstance(item, list):
+                content = decode_indices(sentences, item)
+            else:
+                content = decode_indices(sentences, [int(item)])
+            if content:
+                new_unc.append(NewUnclosed(content=content, logical_gaps=None))
+        return new_unc
+
     def __init__(self, llm: LLMProvider, config: REMSConfig):
         self._llm = llm
         self._config = config
@@ -98,19 +130,10 @@ class BoundaryDetectionSkill:
             # 兼容历史输出：若模型仍返回原文字段，则回退使用。
             remaining_shadow = data.get("remaining_shadow", "")
 
-        new_unc = []
-        for item in data.get("new_unclosed_indices", []):
-            # new_unclosed 现在也是序号列表或单个序号
-            if isinstance(item, list):
-                content = decode_indices(sentences, item)
-            else:
-                content = decode_indices(sentences, [item])
-            
-            if content:
-                new_unc.append(NewUnclosed(
-                    content=content,
-                    logical_gaps=None, # 序号模式暂不强制要求 gap 描述
-                ))
+        new_unc = self._decode_new_unclosed_list(
+            data.get("new_unclosed_indices", []),
+            sentences,
+        )
 
         return BoundaryResult(
             completed_events=completed,

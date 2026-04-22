@@ -172,7 +172,7 @@ class REMSPipeline:
         summary_skill = SummaryGenerationSkill(llm, config)
         role_skill = RoleExtractionSkill(llm, config)
         boundary_skill = BoundaryDetectionSkill(llm, config)
-        enrichment_skill = EventEnrichmentSkill(llm, config)
+        enrichment_skill = EventEnrichmentSkill(llm, config, role_fallback=role_skill)
         evolution_skill = InductiveEvolutionSkill(llm, config)
 
         emotion_evolver = EMAEvolver(config, role_repo)

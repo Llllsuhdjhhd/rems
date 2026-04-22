@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # REMS 全局配置（对照《REMS 记忆系统规范解析》白皮书）。
 # - len_msg / physical_redline / safe_watermark：1.1.7 事件长度与物理防御、4.2 触发与截断；
-# - recall_cluster_threshold：3.2、4.4 召回聚集与记忆重组触发阈值；
+# - recall_cluster_threshold：兼容旧配置名，抽象条数见 abstraction_vector_*；
 # - ae_*、wp_*：1.1.4、2.2 情感能量（AE）与白描动态遗忘；
 # - hallucination_anchor_prob：3.3 递归抽象时锚定子事件摘要的概率；
 # - tombstone_prefix：4.3 墓碑化时在 insight 中的审计标记前缀；
@@ -35,15 +35,14 @@ class TaskModelMapping(BaseModel):
 
     # 以下为各技能默认模型名；可按任务强度分流成本（摘要/边界/抽取/抽象等）。
 
-    summary: str = "qwen3.6-flash"
-    boundary_detection: str = "qwen3.6-flash"
-    role_extraction: str = "qwen-flash-character"
-    # 事件充实：一次调用产出摘要 + 角色。需要在单次响应里兼顾递归摘要与结构化角色抽取，
-    # 用与 summary 同档的 qwen3.6-flash（flash-character 在混合任务下容易漏掉 roles）。
-    event_enrichment: str = "qwen3.6-flash"
-    abstraction: str = "qwen3.6-flash"
-    insight: str = "qwen-flash-character"
-    default: str = "qwen3.6-flash"
+    summary: str = "qwen3-coder-next"
+    boundary_detection: str = "qwen3-coder-next"
+    role_extraction: str = "qwen3-coder-next"
+    # 事件充实：一次调用产出摘要 + 角色；与 summary 同主模型时便于在 DashScope 侧统一配额。
+    event_enrichment: str = "qwen3-coder-next"
+    abstraction: str = "qwen3-coder-next"
+    insight: str = "qwen3-coder-next"
+    default: str = "qwen3-coder-next"
 
 
 class LLMConfig(BaseModel):
@@ -99,12 +98,19 @@ class REMSConfig(BaseSettings):
     # 摘要最低字数门槛：某档摘要字数 ≤ 此值时视为已最大压缩，不再向上推进档位。
     recall_summary_min_chars: int = 20
 
-    # 回忆块中「同主题」基本事件数达到阈值则触发抽象/再巩固（白皮书 3.2、4.4）。
+    # 历史/报告用字段；抽象触发条数现由 ``abstraction_vector_min_total_events`` 等控制（全库代码不再读取本字段）。
     recall_cluster_threshold: int = 5
+
+    # ---- Abstraction: vector anchor path only (``check_and_abstract``) ----
+    # 以锚点做向量近邻，须同时满足
+    # 1) 聚类内事件数（锚点 + 非抽象/未 is_abstracted 的近邻）≥ 该值，默认 11 即「多于 10 条」
+    # 2) 上述簇内 L1 文本总长度 > len_msg * abstraction_vector_l1_len_msg_min_ratio（默认 1/3）
+    abstraction_vector_min_total_events: int = 11
+    abstraction_vector_l1_len_msg_min_ratio: float = 1.0 / 3.0
     # 未闭合事件总长超过 len_msg * 该比例则强制封存（白皮书 4.2：兜底 1.2×len_msg）。
     # 同时作为物理红线触发时的强制封存阈值；是否「可疑」由角色抽取与 RoleService 仲裁判断。
     unclosed_force_ratio: float = 1.2
-    # 递归摘要熔断：低于该字数则不再生成更高级摘要（白皮书 1.1.3 actual_max_level）。
+    # 递归摘要熔断：某级摘要字符数 **低于** 该阈值则不再生成更高级（白皮书 1.1.3）；按产品约定为 20 字。
     summary_fuse_min_chars: int = 20
 
     # AE（Affective Energy，情感能量）：高于 ae_high_threshold 时增强抗遗忘权重（白皮书 1.1.4、2.2）。
@@ -131,6 +137,9 @@ class REMSConfig(BaseSettings):
 
     # 角色语义卡片最多保留的键数量（白皮书 2.3）。
     semantic_card_max_keys: int = 20
+    # 封存后是否对主要角色（S/A）自动调用 LLM 合并刷新语义卡片（``task_type=insight``，见 TaskModelMapping.insight）；
+    # 关闭时白描仍正常写入，仅跳过卡片更新。默认关以降低成本与延迟。
+    enable_insight: bool = False
 
     # ---- Role capacity & soft-forgetting (白皮书 2.3 容量分配与软遗忘) ----
     # 角色白描容量上限倍率：实际容量 = context_chars / wp_role_capacity_divisor（默认 6.6，即与 len_msg 同阶）。

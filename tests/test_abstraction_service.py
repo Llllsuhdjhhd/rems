@@ -20,6 +20,9 @@ from .conftest import FakeLLM
 @pytest.fixture()
 def abstraction_env(config: REMSConfig, db: Database, fake_llm: FakeLLM, tmp_dir):
     config.recall_cluster_threshold = 3
+    # 窄测例：5 条即可形成 1+4 的簇；正式默认须 ≥11 条且 L1 和 > len_msg/3
+    config.abstraction_vector_min_total_events = 5
+    config.abstraction_vector_l1_len_msg_min_ratio = 0.0
     event_repo = EventRepository(db)
     vector_store = VectorStore(config)
     evolution_skill = InductiveEvolutionSkill(fake_llm, config)
