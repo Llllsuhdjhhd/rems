@@ -43,34 +43,40 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 
 class ProcessingMode(str, Enum):
-    """Output mode controlling pipeline behaviour.
+    """Output mode controlling what the pipeline **returns** to the caller.
+
+    重要设计约定（与白皮书 §5 一致）：**模式只影响"输出形态"，不影响"内部记忆动力学"**。
+    回忆块组装、``recall_log`` 登记、频繁子集挖掘 (§3.2) 等一律无条件执行——因为：
+        (a) 抽象事件的唯一触发路径是 ``recall_log``，跳过回忆等于放弃所有抽象合成；
+        (b) 白描、AE、语义卡片等后台巩固机制都依赖对事件的持续检索相关性；
+        (c) "静默倾听"的语义是「不对用户可见」，而不是「不要构建记忆」。
+
+    所以模式的差异收敛到一个布尔属性 :pyattr:`returns_context_package` 以及少量输出
+    装配逻辑（例如 NPC 的 Directive）。新增模式时只需在枚举中追加成员、覆盖属性或
+    扩展 ``_build_*_directives``，不需要触动 ``ingest`` 的主干流程。
 
     DIALOGUE
-        Standard interactive mode.  Assembles full Context Package for LLM
-        response generation.  Metabolism (sealing, indexing) runs in the
-        same call (in-process; use async/worker in production for latency).
-
+        标准强输出交互。ingest 返回完整 ContextPackage，供上游 LLM 生成自然语言回复。
     PASSIVE_LOG
-        "Silent listener" mode for wearables, meeting recordings, etc.
-        No context package is assembled.  Input is fed directly to shadow
-        buffer and sealed when thresholds are met.  No text output expected.
-
+        "静默倾听"：穿戴录音、会议转写等「只记不说」场景。回忆、代谢、抽象合成**仍然执行**
+        且登记入库，只是 ``ContextPackage`` 不对外暴露（:pyattr:`returns_context_package`
+        ``= False``），不产出人类可见的文本回复。
     NPC_AGENT
-        Generative-agent / virtual-sandbox mode.  Output is a structured
-        dict with ``action`` and updated Klesha/Vedana deltas, intended
-        for a downstream Directive Parser.  No natural-language reply.
-
-    中文（对照白皮书第 5 章）：
-        DIALOGUE：标准强输出交互；组装完整 Context Package供 LLM 生成自然语言回复；
-        代谢（封存、索引）可与本次调用同进程执行（生产环境建议异步/队列以降低延迟）。
-        PASSIVE_LOG：被动日志/静默倾听；不组装上下文包；输入进入残影并按阈值封存；
-        不向用户输出任何文本（穿戴设备、会议转写等「只记不说」场景）。
-        NPC_AGENT：生成式智能体/沙盒 NPC；输出含 ``action`` 与 Klesha/Vedana 增量等的结构化字典，
-        交由下游 Directive Parser 转为引擎调用，无需人类可见的对话文本。
+        生成式 NPC / 沙盒 Agent。除了 ContextPackage 外，还输出结构化 ``npc_directives``
+        （动作 + Klesha/Vedana 增量等），交给下游 Directive Parser 转为引擎调用。
     """
     DIALOGUE = "dialogue"
     PASSIVE_LOG = "passive_log"
     NPC_AGENT = "npc_agent"
+
+    @property
+    def returns_context_package(self) -> bool:
+        """Whether ``ingest`` should expose the ContextPackage to the caller.
+
+        默认对外暴露；被动日志等"静默"模式重写为 False。新增对外不回复、只沉淀记忆的模式
+        时复写此属性即可，内部回忆与抽象管线不需要改动。
+        """
+        return self != ProcessingMode.PASSIVE_LOG
 
 
 # =====================================================================
@@ -243,48 +249,41 @@ class REMSPipeline:
         npc_role_id: str | None = None,
         input_id: str | None = None,
     ) -> ProcessingResult:
-        """Full processing cycle with multi-scenario output.
+        """Full processing cycle.
 
-        PASSIVE_LOG:
-            Skip context package assembly; feed directly to metabolism.
+        **内部记忆动力学（所有模式一律执行）**：
+            1. 取残影 + 焦点角色；
+            2. 组装 ``ContextPackage``（回忆块 + 残影 + 当前输入）；
+            3. 把回忆块真实事件 ID 登记到 ``recall_log``——白皮书 §3.2 规定这是抽象事件的**唯一**触发路径，
+               因此即使被动日志模式"不对用户说话"，也必须完成回忆与登记，否则系统永远不会演化出抽象规律；
+            4. 代谢：边界检测、封存基本事件、维护残影与未完成库（§4.1–§4.2）；
+            5. 角色更新：对每个新基本事件追加白描时间线、必要时刷新语义卡片（§2.2–§2.3，抽象事件自动跳过）；
+            6. 抽象合成：扫 ``recall_log`` 全量历史做极大频繁子集挖掘（§3.2）。
 
-        DIALOGUE:
-            Assemble context package first, then metabolism.
-
-        NPC_AGENT:
-            Assemble context package, derive action directives from recalled
-            memories, run metabolism in background.
-
-        完整处理周期（多场景输出形态由 ``mode`` 决定）：
-
-        PASSIVE_LOG：
-            不组装 Context Package；输入直接进入代谢（残影/边界/封存），适用于「只记不说」的被动日志场景。
-
-        DIALOGUE：
-            先基于残影与当前输入组装 Context Package（供上游 LLM 生成回复），
-            再执行代谢封存；两者在同一调用内顺序执行（生产可改为后台代谢）。
-
-        NPC_AGENT：
-            同样组装 Context Package；根据回忆块等生成 NPC 结构化指令；
-            代谢仍执行以持久化环境事件（注释中所述 background 指与「对话生成」解耦的语义，
-            本实现仍为同进程顺序调用，部署时可拆分为异步工作者）。
+        **外部输出形态（由 ``mode`` 决定）**：
+            - ``returns_context_package == True``：对外返回 ContextPackage 供上游 LLM 生成回复；
+            - ``returns_context_package == False``：ContextPackage 留在内部，对外返回 ``None``
+              （"静默倾听"）；
+            - ``NPC_AGENT``：额外基于回忆块派生 ``npc_directives``；
+            - 新增模式只需在 :class:`ProcessingMode` 追加成员并复写 ``returns_context_package``
+              （或扩展专属装配步骤），不需要改动主干流程。
         """
         shadow = self.meta_repo.get_shadow()
 
         # 从当前输入和残影中提取焦点角色（用于回忆时的角色感知摘要档位选择）。
         focus_role_ids = self._extract_focus_roles(raw_input, shadow.content if shadow else "")
 
-        # 对话/NPC：用「残影 + 当前输入」检索并组装 ContextPackage；被动日志跳过（白皮书 5.2）。
-        ctx: Optional[ContextPackage] = None
-        if mode != ProcessingMode.PASSIVE_LOG:
-            ctx = self.recall_service.build_context_package(
-                raw_input, shadow, focus_role_ids=focus_role_ids
-            )
+        # 回忆（所有模式必须执行）：
+        # 抽象事件的唯一触发路径是 recall_log 的频繁子集挖掘，跳过回忆等于放弃所有归纳演化；
+        # "静默倾听"等模式只是不把 ctx 交给外部，内部仍然完整组装、登记与挖掘。
+        ctx: ContextPackage = self.recall_service.build_context_package(
+            raw_input, shadow, focus_role_ids=focus_role_ids
+        )
 
         # 登记本次回忆块 event_id 到 recall_log（白皮书 §3.2 唯一抽象触发路径的输入流）。
         # 只记录真实 basic/abstract 事件，过滤 CARD:* 伪条目；抽象事件 id 同样进入命名空间，
         # 便于后续更高阶抽象在同一空间继续挖掘。
-        if ctx and ctx.recall_block.items and mode != ProcessingMode.PASSIVE_LOG:
+        if ctx.recall_block.items:
             recall_event_ids: list[str] = []
             seen_ids: set[str] = set()
             for it in ctx.recall_block.items:
@@ -303,23 +302,26 @@ class REMSPipeline:
         sealed = self.metabolism_service.process_input(raw_input, force_save=force_save, input_id=input_id)
 
         # 角色：每个新事件更新白描时间线并刷新语义卡片（第 2.2–2.3）。
+        # RoleService 对 is_abstract=True 的事件自带早退，抽象事件不会污染白描。
         for event in sealed:
             self.role_service.update_from_event(event)
 
         # 抽象事件触发 —— 唯一路径：``recall_log`` 中的极大频繁子集（白皮书 §3.2）。
-        abstract_events: list[Event] = []
-        if mode != ProcessingMode.PASSIVE_LOG:
-            abstract_events = self.abstraction_service.mine_and_synthesize()
+        # 所有模式都跑：被动日志场景下仍然需要持续演化出抽象规律供未来检索或审计。
+        abstract_events: list[Event] = self.abstraction_service.mine_and_synthesize()
 
         # NPC：由回忆与威胁启发式生成行为指令（第 5.3）。
         npc_directives: list[dict] = []
         if mode == ProcessingMode.NPC_AGENT and npc_role_id:
             npc_directives = self._build_npc_directives(npc_role_id, ctx, sealed)
 
+        # 输出路由：``returns_context_package`` 控制 ctx 是否对外暴露；内部管线与产物不变。
+        exposed_ctx: Optional[ContextPackage] = ctx if mode.returns_context_package else None
+
         return ProcessingResult(
             sealed_events=sealed,
             abstract_events=abstract_events,
-            context_package=ctx,
+            context_package=exposed_ctx,
             mode=mode,
             npc_directives=npc_directives,
         )
