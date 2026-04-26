@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # - len_msg / physical_redline / safe_watermark：1.1.7 事件长度与物理防御、4.2 触发与截断；
 # - abstract_subset_min_size / abstract_subset_min_support：3.2 频繁极大子集挖掘触发抽象；
 # - ae_*、wp_*：1.1.4、2.2 情感能量（AE）与白描动态遗忘；
-# - hallucination_anchor_prob：3.3 递归抽象时锚定子事件摘要的概率；
+# - hallucination_anchor_prob：兼容旧配置；当前抽象合成始终使用叶子基本事件 content_raw；
 # - tombstone_prefix：4.3 墓碑化时在 insight 中的审计标记前缀；
 # - user_mode / core_user_role_id / active_participants：2.2 单人/多人模式与提示词注入引擎。
 # 加载：环境变量前缀 REMS_，嵌套键用 __ 分隔；可选 .env。
@@ -130,7 +130,7 @@ class REMSConfig(BaseSettings):
     # 初始保持高保真摘要的头部条目比例（由条目数决定）。
     recall_head_ratio: float = 0.66
 
-    # 抽象演化时以该概率强制用子事件 L1/原文锚定，抑制「推理当事实」闭环（白皮书 3.3）。
+    # 兼容旧配置：当前实现已改为始终展开到叶子基本事件并使用 content_raw 作为抽象证据。
     hallucination_anchor_prob: float = 0.3
 
     # 角色语义卡片最多保留的键数量（白皮书 2.3）。
@@ -138,6 +138,9 @@ class REMSConfig(BaseSettings):
     # 封存后是否对主要角色（S/A）自动调用 LLM 合并刷新语义卡片（``task_type=insight``，见 TaskModelMapping.insight）；
     # 关闭时白描仍正常写入，仅跳过卡片更新。默认关以降低成本与延迟。
     enable_insight: bool = False
+    # 抽象事件是否额外生成 ``insight``。关闭时抽象合成只产出压缩后的 ``content_raw`` 与可选 decoration；
+    # 打开时才要求模型提炼跨事件规律，且该 insight 不是事实摘要本身。
+    enable_abstract_insight: bool = False
 
     # ---- Role capacity & soft-forgetting (白皮书 2.3 容量分配与软遗忘) ----
     # 角色白描容量上限倍率：实际容量 = context_chars / wp_role_capacity_divisor（默认 6.6，即与 len_msg 同阶）。

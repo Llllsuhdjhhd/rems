@@ -27,7 +27,8 @@ class AbstractionService:
     抽象事件特点（白皮书 §3.1/§3.2）：
         - ``role_list=[]``：抽象事件不登记角色，不写入任何角色白描，也不触发语义卡片；
         - ``summaries``：与基本事件同规则（``SummaryGenerationSkill`` L1…Ln 递归 + 熔断）；
-        - ``insight``：由 LLM 基于 ``content_raw`` 生成规律/见解，不由各级 summaries 派生。
+        - 合成输入：始终展开到叶子基本事件，拼接其 ``content_raw`` 与角色线索作为证据；
+        - ``insight``：由 ``enable_abstract_insight`` 开关控制，关闭时抽象事件不生成 insight。
 
     触发是「唯一路径」——不再经向量近邻锚点或回忆压力区重组；由 ``mine_and_synthesize``
     扫描 ``recall_log`` 全量历史，找支持度 ≥ ``abstract_subset_min_support`` 且大小
@@ -111,8 +112,18 @@ class AbstractionService:
             )
             return None
 
+        events.sort(key=lambda e: (e.create_time, e.event_id))
+        evidence_events = self._collect_basic_evidence_events(events)
+        if not evidence_events:
+            logger.debug("abstract mining: no basic content_raw evidence for subset")
+            return None
+
         max_level = max((e.abstraction_level or 0) for e in events) + 1
-        abstract_event = self._evolution.synthesize(events, abstraction_level=max_level)
+        abstract_event = self._evolution.synthesize(
+            events,
+            abstraction_level=max_level,
+            evidence_events=evidence_events,
+        )
 
         # 抽象事件的摘要与基本事件同规则（白皮书 §1.1.3）。
         sr = self._summary.generate(abstract_event.content_raw)
@@ -128,6 +139,37 @@ class AbstractionService:
                 self._event_repo.update_status(evt.event_id, is_abstracted=True)
 
         return abstract_event
+
+    # ------------------------------------------------------------------
+    def _collect_basic_evidence_events(self, events: list[Event]) -> list[Event]:
+        """Return leaf basic events used as synthesis evidence.
+
+        ``source_events`` still records the mined subset itself, but prompt evidence is always
+        basic-event ``content_raw``. This keeps high-order abstractions from repeatedly
+        compressing prior abstract text.
+        """
+        basic_ids: list[str] = []
+        seen: set[str] = set()
+        for event in events:
+            ids = (
+                self._event_repo.resolve_basic_event_ids(event.event_id)
+                if event.is_abstract
+                else [event.event_id]
+            )
+            for eid in ids:
+                if eid in seen:
+                    continue
+                seen.add(eid)
+                basic_ids.append(eid)
+
+        basics: list[Event] = []
+        for eid in basic_ids:
+            event = self._event_repo.get(eid)
+            if event is None or event.is_abstract or event.is_tombstoned:
+                continue
+            basics.append(event)
+        basics.sort(key=lambda e: (e.create_time, e.event_id))
+        return basics
 
     # ------------------------------------------------------------------
     def _index_abstract(self, event: Event) -> None:
