@@ -9,6 +9,7 @@ import logging
 
 from ..config import REMSConfig
 from ..models.event import Event
+from ..strategies.abstraction import AbstractionEvidencePolicy, LeafContentRawEvidencePolicy
 from ..skills.inductive_evolution import InductiveEvolutionSkill
 from ..skills.summary_generation import SummaryGenerationSkill
 from ..storage.repository import (
@@ -44,6 +45,7 @@ class AbstractionService:
         summary_skill: SummaryGenerationSkill,
         recall_log_repo: RecallLogRepository,
         abstracted_subset_repo: AbstractedSubsetRepository,
+        evidence_policy: AbstractionEvidencePolicy | None = None,
     ):
         self._config = config
         self._event_repo = event_repo
@@ -52,6 +54,7 @@ class AbstractionService:
         self._summary = summary_skill
         self._recall_log_repo = recall_log_repo
         self._fired_repo = abstracted_subset_repo
+        self._evidence_policy = evidence_policy or LeafContentRawEvidencePolicy()
 
     # ------------------------------------------------------------------
     # Public entry
@@ -113,7 +116,7 @@ class AbstractionService:
             return None
 
         events.sort(key=lambda e: (e.create_time, e.event_id))
-        evidence_events = self._collect_basic_evidence_events(events)
+        evidence_events = self._evidence_policy.collect(events, self._event_repo)
         if not evidence_events:
             logger.debug("abstract mining: no basic content_raw evidence for subset")
             return None
@@ -140,38 +143,6 @@ class AbstractionService:
 
         return abstract_event
 
-    # ------------------------------------------------------------------
-    def _collect_basic_evidence_events(self, events: list[Event]) -> list[Event]:
-        """Return leaf basic events used as synthesis evidence.
-
-        ``source_events`` still records the mined subset itself, but prompt evidence is always
-        basic-event ``content_raw``. This keeps high-order abstractions from repeatedly
-        compressing prior abstract text.
-        """
-        basic_ids: list[str] = []
-        seen: set[str] = set()
-        for event in events:
-            ids = (
-                self._event_repo.resolve_basic_event_ids(event.event_id)
-                if event.is_abstract
-                else [event.event_id]
-            )
-            for eid in ids:
-                if eid in seen:
-                    continue
-                seen.add(eid)
-                basic_ids.append(eid)
-
-        basics: list[Event] = []
-        for eid in basic_ids:
-            event = self._event_repo.get(eid)
-            if event is None or event.is_abstract or event.is_tombstoned:
-                continue
-            basics.append(event)
-        basics.sort(key=lambda e: (e.create_time, e.event_id))
-        return basics
-
-    # ------------------------------------------------------------------
     def _index_abstract(self, event: Event) -> None:
         # 与基本事件保持一致：向量索引使用默认档（mid）摘要，对齐回忆块展示档位（白皮书 §4.4）。
         text = event.summaries.get(event.mid_summary_key, event.content_raw)

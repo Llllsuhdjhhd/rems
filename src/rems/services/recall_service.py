@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
-from datetime import datetime
 
 # 回忆服务：向量检索 + 混合打分（相似度/时间衰减/角色重要性/AE）+ 懒摘要降级 + 语义卡片注入。
 # 总长约束约 1/6.6 上下文（config.physical_redline）。对照白皮书 4.4。
@@ -10,6 +8,12 @@ from datetime import datetime
 from ..config import REMSConfig
 from ..models.event import Event
 from ..models.metabolism import ContextPackage, RecallBlock, RecallItem, Shadow
+from ..strategies.recall import (
+    DefaultRecallScoringStrategy,
+    DefaultSummaryTierPolicy,
+    RecallScoringStrategy,
+    SummaryTierPolicy,
+)
 from ..storage.repository import EventRepository, RoleRepository
 from ..storage.vector_store import VectorStore
 
@@ -39,11 +43,15 @@ class RecallService:
         event_repo: EventRepository,
         role_repo: RoleRepository,
         vector_store: VectorStore,
+        scoring_strategy: RecallScoringStrategy | None = None,
+        summary_tier_policy: SummaryTierPolicy | None = None,
     ):
         self._config = config
         self._event_repo = event_repo
         self._role_repo = role_repo
         self._vector = vector_store
+        self._scoring_strategy = scoring_strategy or DefaultRecallScoringStrategy(config)
+        self._summary_tier_policy = summary_tier_policy or DefaultSummaryTierPolicy(config)
 
     # ------------------------------------------------------------------
     def build_recall_block(
@@ -74,7 +82,7 @@ class RecallService:
                 continue
             raw_sim = 1.0 - hit.get("distance", 1.0)
             
-            time_decay = self._time_decay(event.create_time)
+            time_decay = DefaultRecallScoringStrategy.time_decay(event.create_time)
             p1_score = 0.8 * raw_sim + 0.2 * time_decay
             phase1_candidates.append((event, p1_score, raw_sim))
 
@@ -141,32 +149,12 @@ class RecallService:
         ``time_decay`` 与 ``role_boost`` 固定为 0.15 / 0.20；``ae_w``、``act_w`` 从 config 读取，
         余量自动回填到余弦项，保证总权重恒为 1。
         """
-        time_decay = self._time_decay(event.create_time)
-
-        role_boost = 0.0
-        importance_weights = {"S": 0.3, "A": 0.2, "B": 0.1, "C": 0.05, "D": 0.0}
-        for re in event.role_list:
-            key = re.importance.value if hasattr(re.importance, "value") else str(re.importance)
-            role_boost = max(role_boost, importance_weights.get(key, 0.0))
-
-        ae = event.affective_energy
-        act = event.activation_energy
-        ae_w = self._config.ae_score_weight                 # 事件级 AE 权重
-        act_w = self._config.activation_energy_weight       # EMA 演化后的激活能量权重
-        cosine_w = max(0.0, 1.0 - ae_w - act_w - 0.15 - 0.20)
-        return (
-            cosine_w * cosine_sim
-            + 0.15 * time_decay
-            + 0.20 * role_boost
-            + ae_w * ae
-            + act_w * act
-        )
+        return self._scoring_strategy.score(event, cosine_sim).total
 
     @staticmethod
-    def _time_decay(create_time: datetime, half_life_days: float = 30.0) -> float:
-        age_seconds = (datetime.now() - create_time).total_seconds()
-        age_days = max(age_seconds / 86400, 0.0)
-        return math.exp(-0.693 * age_days / half_life_days)
+    def _time_decay(create_time, half_life_days: float = 30.0) -> float:
+        """Backward-compatible wrapper for the default recall time decay."""
+        return DefaultRecallScoringStrategy.time_decay(create_time, half_life_days)
 
     # ------------------------------------------------------------------
     # Assembly with role-aware Lazy Index degradation
@@ -323,25 +311,7 @@ class RecallService:
         * C / D  →  mid + ``recall_minor_role_compress_shift``   (more compressed)
         * absent →  mid + ``recall_minor_role_compress_shift``   (same as C/D)
         """
-        cfg = self._config
-        if not focus_role_ids:
-            return cfg.recall_default_tier_offset
-
-        best = "absent"
-        rank = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4, "absent": 5}
-        for entry in event.role_list:
-            if entry.role_id not in focus_role_ids:
-                continue
-            imp = entry.importance.value if hasattr(entry.importance, "value") else str(entry.importance)
-            if rank.get(imp, 5) < rank.get(best, 5):
-                best = imp
-
-        if best in ("S", "A"):
-            return cfg.recall_default_tier_offset - cfg.recall_primary_role_detail_shift
-        if best == "B":
-            return cfg.recall_default_tier_offset
-        # C, D, absent
-        return cfg.recall_default_tier_offset + cfg.recall_minor_role_compress_shift
+        return self._summary_tier_policy.tier_offset(event, focus_role_ids)
 
     def _role_aware_pick_summary(
         self,
