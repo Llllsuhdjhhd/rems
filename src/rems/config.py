@@ -35,19 +35,19 @@ class TaskModelMapping(BaseModel):
 
     # 以下为各技能默认模型名；可按任务强度分流成本（摘要/边界/抽取/抽象等）。
 
-    summary: str = "qwen3-coder-next"
-    boundary_detection: str = "qwen3-coder-next"
-    role_extraction: str = "qwen3-coder-next"
+    summary: str = "deepseek-v4-flash"
+    boundary_detection: str = "deepseek-v4-flash"
+    role_extraction: str = "deepseek-v4-flash"
     # 事件充实：一次调用产出摘要 + 角色；与 summary 同主模型时便于在 DashScope 侧统一配额。
-    event_enrichment: str = "qwen3-coder-next"
-    abstraction: str = "qwen3-coder-next"
-    insight: str = "qwen3-coder-next"
-    default: str = "qwen3-coder-next"
+    event_enrichment: str = "deepseek-v4-flash"
+    abstraction: str = "deepseek-v4-flash"
+    insight: str = "deepseek-v4-flash"
+    default: str = "deepseek-v4-flash"
 
 
 class LLMConfig(BaseModel):
-    # 兼容 OpenAI 协议的对话 API（如 DashScope 兼容模式）。
-    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    # 兼容 OpenAI 协议的对话 API（DeepSeek / DashScope 等）。密钥与基址用环境变量覆盖（见 .env.example）。
+    base_url: str = "https://api.deepseek.com"
     api_key: str = ""
     task_models: TaskModelMapping = Field(default_factory=TaskModelMapping)
     temperature: float = 0.3

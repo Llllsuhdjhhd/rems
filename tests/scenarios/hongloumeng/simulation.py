@@ -27,7 +27,7 @@ def run_simulation(max_chunks=5):
     2. Detailed LLM request/response logging (literal Chinese).
     """
     timestamp = int(time.time())
-    test_dir = Path(__file__).parent / "outputs" / "sim_runs" / f"sim_5ch_{timestamp}"
+    test_dir = Path(__file__).parent / "outputs" / "sim_runs" / f"sim_run_{timestamp}"
     test_dir.mkdir(parents=True, exist_ok=True)
     
     # Create directory for LLM logs
@@ -38,7 +38,7 @@ def run_simulation(max_chunks=5):
     chroma_path = test_dir / "chroma_sim"
     
     print(f"\n{'='*60}")
-    print(f" REMS 5-CHUNK SIMULATION: HONGLOUMENG ")
+    print(f" REMS HONGLOUMENG SIMULATION ({max_chunks} chunks) ")
     print(f"{'='*60}")
     print(f"Workspace: {test_dir}")
     print(f"LLM Logs:  {log_dir}")
@@ -145,11 +145,11 @@ def run_simulation(max_chunks=5):
 
     # 4. Final Diagnostic Report
     print(f"\n{'='*60}")
-    print(f" FINAL PERFORMANCE REPORT (5 CHUNKS) ")
+    print(f" FINAL PERFORMANCE REPORT ({max_chunks} CHUNKS) ")
     print(f"{'='*60}")
     print(f"Total Wall Time: {total_duration:.2f}s")
     print(f"Workspace: {test_dir}")
     print(f"Total LLM Calls Logged: {call_counter}")
 
 if __name__ == "__main__":
-    run_simulation(9)
+    run_simulation(3)
