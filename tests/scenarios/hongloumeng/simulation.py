@@ -114,7 +114,13 @@ def run_simulation(max_chunks=5):
         print(f"\n--- CHUNK {i+1} START (Chars: {len(content)}) ---")
         
         chunk_start = time.perf_counter()
-        result = pipeline.ingest(content, mode=ProcessingMode.DIALOGUE)
+        try:
+            import traceback
+            result = pipeline.ingest(content, mode=ProcessingMode.DIALOGUE)
+        except Exception as e:
+            print("FATAL ERROR IN INGEST:")
+            traceback.print_exc()
+            sys.exit(1)
         chunk_duration = time.perf_counter() - chunk_start
         chunk_times.append(chunk_duration)
         
@@ -152,4 +158,4 @@ def run_simulation(max_chunks=5):
     print(f"Total LLM Calls Logged: {call_counter}")
 
 if __name__ == "__main__":
-    run_simulation(3)
+    run_simulation(1)

@@ -57,7 +57,9 @@ import pytest
 from rems.config import REMSConfig, StorageConfig
 from rems.pipeline import REMSPipeline
 
-from .conftest import FakeEmbeddingFunction
+class FakeEmbeddingFunction:
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        return [[0.1] * 128 for _ in input]
 
 
 def _fake_embedding_escape_enabled() -> bool:

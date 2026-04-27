@@ -77,6 +77,11 @@ class VectorStore:
             embedding_function=self._ef,
             metadata={"hnsw:space": "cosine"},
         )
+        self._wp_collection = self._client.get_or_create_collection(
+            name="rems_white_paintings",
+            embedding_function=self._ef,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     # ------------------------------------------------------------------
     def add_event(
@@ -127,3 +132,55 @@ class VectorStore:
 
     def count(self) -> int:
         return self._collection.count()
+
+    # ------------------------------------------------------------------
+    # White-Painting Vector Methods (Stream B)
+    # ------------------------------------------------------------------
+    def add_white_painting(
+        self,
+        role_id: str,
+        event_id: str,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        wp_id = f"{role_id}::{event_id}"
+        meta = metadata or {}
+        meta["role_id"] = role_id
+        meta["event_id"] = event_id
+        self._wp_collection.upsert(
+            ids=[wp_id],
+            documents=[text],
+            metadatas=[meta],
+        )
+
+    def search_white_paintings(
+        self,
+        query: str,
+        n_results: int = 10,
+        where: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {"query_texts": [query], "n_results": n_results}
+        if where:
+            kwargs["where"] = where
+
+        results = self._wp_collection.query(**kwargs)
+
+        items: list[dict[str, Any]] = []
+        ids = results.get("ids", [[]])[0]
+        docs = (results.get("documents") or [[]])[0]
+        dists = (results.get("distances") or [[]])[0]
+        metas = (results.get("metadatas") or [[]])[0]
+        for i, wid in enumerate(ids):
+            items.append({
+                "wp_id": wid,
+                "document": docs[i] if i < len(docs) else "",
+                "distance": dists[i] if i < len(dists) else 0.0,
+                "metadata": metas[i] if i < len(metas) else {},
+            })
+        return items
+
+    def delete_white_painting(self, role_id: str, event_id: str) -> None:
+        try:
+            self._wp_collection.delete(ids=[f"{role_id}::{event_id}"])
+        except Exception:
+            logger.warning("Failed to delete WP %s::%s from vector store", role_id, event_id)

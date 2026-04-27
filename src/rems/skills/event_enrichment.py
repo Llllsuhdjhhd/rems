@@ -14,7 +14,6 @@ from pydantic import BaseModel, Field
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import ENRICHMENT_USER, build_enrichment_system_message
-from ..models.event import EmotionalModel, Klesha, RoleSnapshot, Vedana
 from ..skills.role_extraction import ExtractedRole
 
 if TYPE_CHECKING:
@@ -52,13 +51,9 @@ class EventEnrichmentSkill:
         self,
         llm: LLMProvider,
         config: REMSConfig,
-        *,
-        role_fallback: "RoleExtractionSkill | None" = None,
     ):
         self._llm = llm
         self._config = config
-        # 合规模型仍漏掉 roles 时，用一次专用 role_extraction 调用补全（与主调用摘要结果合并）。
-        self._role_fallback = role_fallback
 
     def enrich(
         self,
@@ -67,27 +62,16 @@ class EventEnrichmentSkill:
         known_roles: "list[Role] | None" = None,
         budget: "CompressionBudget | None" = None,
     ) -> EnrichmentResult:
-        known_desc = "无已知角色" if not known_roles else "\n".join(
-            f"- {r.role_id}: {r.name} ({r.entity_type}), 别名={r.aliases}"
-            for r in (known_roles or [])
-        )
-
         summary_budget_text = "按系统默认要求"
-        snapshot_budget_text = "按系统默认要求"
         if budget:
             summary_budget_text = "\n".join(
                 f"- {lvl}: {b} 字以内" for lvl, b in budget.summary_level_budgets.items()
             )
-            snapshot_budget_text = "\n".join(
-                f"- {lvl}: {b} 字以内" for lvl, b in budget.snapshot_level_budgets.items()
-            )
 
         fuse_min = self._config.summary_fuse_min_chars
         user_msg = ENRICHMENT_USER.format(
-            known_roles=known_desc,
             content_raw=content_raw,
             summary_budget_table=summary_budget_text,
-            snapshot_budget_table=snapshot_budget_text,
             fuse_min_chars=fuse_min,
         )
         system_msg = build_enrichment_system_message(self._config, fuse_min_chars=fuse_min)
@@ -116,61 +100,9 @@ class EventEnrichmentSkill:
         summary_lengths = {k: len(v) for k, v in summaries.items()}
         actual_max_level = len(summaries)
 
-        # ---- Roles ------------------------------------------------------
-        extracted: list[ExtractedRole] = []
-        role_rows = data.get("roles", []) or data.get("characters", [])
-        for rd in role_rows if isinstance(role_rows, list) else []:
-            if not isinstance(rd, dict):
-                continue
-            snap = rd.get("snapshot") or {}
-            emo = rd.get("emotion") or {}
-            vedana_d = emo.get("vedana") or {}
-            klesha_d = emo.get("klesha") or {}
-
-            v_init: dict = {}
-            if isinstance(vedana_d, dict):
-                for k, v in vedana_d.items():
-                    if k in Vedana.model_fields:
-                        try:
-                            v_init[k] = float(v)
-                        except (TypeError, ValueError):
-                            continue
-
-            k_init: dict = {}
-            if isinstance(klesha_d, dict):
-                for k, v in klesha_d.items():
-                    if k in Klesha.model_fields:
-                        try:
-                            k_init[k] = float(v)
-                        except (TypeError, ValueError):
-                            continue
-
-            extracted.append(ExtractedRole(
-                role_id=rd.get("role_id"),
-                name=rd.get("name", ""),
-                entity_type=rd.get("entity_type", "person"),
-                importance=rd.get("importance", "C"),
-                snapshot=RoleSnapshot(
-                    l1_mention=snap.get("l1_mention") if isinstance(snap, dict) else None,
-                    l2_interaction=snap.get("l2_interaction") if isinstance(snap, dict) else None,
-                    l3_decision=snap.get("l3_decision") if isinstance(snap, dict) else None,
-                ),
-                emotional_model=EmotionalModel(
-                    vedana=Vedana(**v_init),
-                    klesha=Klesha(**k_init),
-                ),
-            ))
-
-        if not extracted and self._role_fallback and content_raw.strip():
-            logger.info("EventEnrichment: empty roles; running role_extraction fallback")
-            fr = self._role_fallback.extract(
-                content_raw, known_roles=known_roles, budget=budget,
-            )
-            extracted = list(fr.roles)
-
         return EnrichmentResult(
             summaries=summaries,
             summary_lengths=summary_lengths,
             actual_max_level=actual_max_level,
-            roles=extracted,
+            roles=[],  # No longer extracted here
         )

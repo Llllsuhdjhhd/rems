@@ -14,6 +14,7 @@ from ..strategies.recall import (
     RecallScoringStrategy,
     SummaryTierPolicy,
 )
+from ..strategies.forgetting import DefaultWhitePaintingRetentionStrategy
 from ..storage.repository import EventRepository, RoleRepository
 from ..storage.vector_store import VectorStore
 
@@ -52,6 +53,7 @@ class RecallService:
         self._vector = vector_store
         self._scoring_strategy = scoring_strategy or DefaultRecallScoringStrategy(config)
         self._summary_tier_policy = summary_tier_policy or DefaultSummaryTierPolicy(config)
+        self._forgetting_strategy = DefaultWhitePaintingRetentionStrategy(config)
 
     # ------------------------------------------------------------------
     def build_recall_block(
@@ -66,39 +68,71 @@ class RecallService:
             search_text = shadow.content + "\n" + query
 
         # ========================================================
-        # Phase 1: Expansion & Numerically Scored Search (Vector + Time)
+        # Dual-Stream Hybrid Recall
         # ========================================================
-        # Increased hits via recall_expansion_factor (approx 2x redline) 
-        # to ensure enough variety for dynamic compression.
-        expansion_hits = 60  # Heuristic for ~2x redline; could be dynamic if needed.
-        hits = self._vector.search(search_text, n_results=expansion_hits)
-        if not hits:
-            return RecallBlock()
-
-        phase1_candidates = []
-        for hit in hits:
+        # Stream A: Event semantic search
+        hits_a = self._vector.search(search_text, n_results=60)
+        stream_a: dict[str, tuple[Event, float]] = {}
+        for hit in hits_a:
             event = self._event_repo.get(hit["event_id"])
-            if event is None or event.is_tombstoned:
+            if event is None or event.is_tombstoned or event.status.value == "silent":
                 continue
             raw_sim = 1.0 - hit.get("distance", 1.0)
-            
-            time_decay = DefaultRecallScoringStrategy.time_decay(event.create_time)
-            p1_score = 0.8 * raw_sim + 0.2 * time_decay
-            phase1_candidates.append((event, p1_score, raw_sim))
-
-        # Sort by P1 score and keep a generous set for fine-ranking
-        phase1_candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = phase1_candidates[:30] # Double the previous set for scaling
-
-        # ========================================================
-        # Phase 2: Hybrid Scoring & Emotional Filter (1.2x Redline)
-        # ========================================================
-        scored_events: list[tuple[Event, float]] = []
-        for event, p1_score, raw_sim in top_candidates:
             score = self._hybrid_score(event, raw_sim)
-            scored_events.append((event, score))
+            stream_a[event.event_id] = (event, score)
 
-        scored_events.sort(key=lambda x: x[1], reverse=True)
+        # Stream B: White-painting (Role) semantic search
+        hits_b = self._vector.search_white_paintings(search_text, n_results=60)
+        stream_b: dict[str, tuple[Event, float]] = {}
+        for hit in hits_b:
+            wp_id = hit["wp_id"]
+            try:
+                role_id, event_id = wp_id.split("::")
+            except ValueError:
+                continue
+            
+            event = self._event_repo.get(event_id)
+            if event is None or event.is_tombstoned or event.status.value == "silent":
+                continue
+
+            wp_entry = self._role_repo.get_white_painting_by_event(role_id, event_id)
+            if not wp_entry:
+                continue
+            
+            f_score = self._forgetting_strategy.score(wp_entry, is_penalized=True)
+            if f_score.is_silenced:
+                # Silenced entry: skip completely
+                continue
+                
+            raw_sim = 1.0 - hit.get("distance", 1.0)
+            score = self._hybrid_score(event, raw_sim) * f_score.effective_forgetting
+            
+            if event_id not in stream_b or stream_b[event_id][1] < score:
+                stream_b[event_id] = (event, score)
+
+        # Merge streams
+        sorted_a = sorted(stream_a.items(), key=lambda x: x[1][1], reverse=True)
+        sorted_b = sorted(stream_b.items(), key=lambda x: x[1][1], reverse=True)
+        
+        intersection_ids = set(stream_a.keys()).intersection(set(stream_b.keys()))
+        merged_events: list[tuple[Event, float]] = []
+        
+        intersection_items = []
+        for eid in intersection_ids:
+            max_score = max(stream_a[eid][1], stream_b[eid][1])
+            intersection_items.append((stream_a[eid][0], max_score))
+        intersection_items.sort(key=lambda x: x[1], reverse=True)
+        merged_events.extend(intersection_items[:40])
+        
+        used_ids = {e.event_id for e, _ in merged_events}
+        a_surplus = [v for k, v in sorted_a if k not in used_ids][:10]
+        used_ids.update(e.event_id for e, _ in a_surplus)
+        b_surplus = [v for k, v in sorted_b if k not in used_ids][:10]
+        
+        merged_events.extend(a_surplus)
+        merged_events.extend(b_surplus)
+        
+        scored_events = sorted(merged_events, key=lambda x: x[1], reverse=True)
 
         # Apply intermediate filter target (1.2/6.6)
         redline = self._config.physical_redline
@@ -121,6 +155,22 @@ class RecallService:
 
         block = self._assemble_block(filtered_events, focus_role_ids=focus_role_ids or set())
         block = self._append_semantic_cards(block, filtered_events)
+        
+        # 恢复逻辑（Recovery Logic）: 当事件被实际回忆（即包含在 block 中），
+        # 加强该事件包含的所有角色白描的遗忘因子，实现回忆后记忆加强。
+        for item in block.items:
+            event = self._event_repo.get(item.event_id)
+            if not event:
+                continue
+            for role_entry in event.role_list:
+                wp_entry = self._role_repo.get_white_painting_by_event(role_entry.role_id, event.event_id)
+                if wp_entry:
+                    # 恢复系数：每次回忆，将遗忘因子在现有基础上增加 1.5 倍（可配置，或简单粗暴乘以 1.5 并更新访问时间）
+                    new_factor = min(wp_entry.forgetting_factor * 1.5, wp_entry.base_forgetting_factor)
+                    if new_factor < 1.0:
+                        new_factor = 1.0
+                    self._role_repo.update_white_painting_access(role_entry.role_id, event.event_id, new_factor)
+
         return block
 
     # ------------------------------------------------------------------

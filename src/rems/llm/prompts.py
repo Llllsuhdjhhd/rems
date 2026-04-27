@@ -115,63 +115,28 @@ BOUNDARY_USER = """\
 # 设计要点：先强调「角色」、JSON 中 roles 在 summaries 之前，避免模型因长摘要说明漏填 roles（见
 #   ENRICHMENT_PRIORITY_ADDENDUM）。角色级语义卡片的 LLM 刷新由下游 S/A 过滤后另起调用。
 
-ENRICHMENT_PRIORITY_ADDENDUM = """\
-【角色输出优先（硬约束，优先于后文摘要长说明）】
-- 若原文为叙事/史传/章回/神话/寓言/对话等，**凡出现可区分之专名、道号、神怪/仙真称谓、以及明确叙述对象，均须各对应一条 `roles` 项**；不得合并为无名单一「旁白」后把 `roles` 留空。
-- 在「摘要写满」与「`roles` 非空且覆盖主要专名」二选一相冲突时，**先保证 `roles` 与专名覆盖**；摘要可略短，但 `roles` 不可整段留空或 `[]`（除非原文全无可列实体，且须自行判定确无专名/人物）。
-- 去代词化：见下方已知角色表；`role_id` 可复用或 null 由下游注册。
-
-"""
-
 ENRICHMENT_SYSTEM = """\
-你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，在**同一条 JSON** 中同时交付：
+你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，交付事件摘要：
 
-A. **roles（与摘要同等优先；JSON 中键名顺序建议 roles 在 summaries 前）**
-   - 重要性 S/A/B/C/D；S 级给满 L1/L2/L3 快照，其余至少 L1，遵守【角色快照预算表】。
-   - Vedana/Klesha 各子项 ∈ [0,1]；无依据可省略子键。
+**summaries：L1…Ln 递归压缩**
+- 遵守【摘要字数预算表】；L1 保真主干，L2+ 逐层约减半。
+- **熔断**：当某级摘要字符数 **≤ {fuse_min_chars}** 时，**不得再生成**下一级更压缩摘要（`summaries` 只含已产出的各级）。
 
-B. **summaries：L1…Ln 递归压缩**
-   - 遵守【摘要字数预算表】；L1 保真主干，L2+ 逐层约减半。
-   - **熔断**：当某级摘要字符数 **≤ {fuse_min_chars}** 时，**不得再生成**下一级更压缩摘要（`summaries` 只含已产出的各级）。
-
-只输出一个 JSON 对象，勿附加说明。"""
+只输出一个 JSON 对象，包含 `summaries` 字典，勿附加说明。"""
 
 ENRICHMENT_USER = """\
-## 已知角色（去代词化复用）
-{known_roles}
-
-## 任务一：角色（先满足再写任务二）
-从原文中列出**所有**应记录的实体（人名/神怪/可区分主语等），填 `roles`；有专名时禁止 `[]`。
-
-## 任务二：摘要（L1 起，遵守熔断 {fuse_min_chars}）
-生成 `summaries` 各级，直至熔断或达预算上限。
-
 ## 事件原文
 {content_raw}
 
 ## 摘要字预算
 {summary_budget_table}
 
-## 角色快照字预算
-{snapshot_budget_table}
+## 任务：摘要（L1 起，遵守熔断 {fuse_min_chars}）
+生成 `summaries` 各级，直至熔断或达预算上限。
 
-## 输出 JSON（**roles 在前，summaries 在后**）
+## 输出 JSON
 ```json
 {{
-  "roles": [
-    {{
-      "role_id": "已有ID 或 null",
-      "name": "角色名",
-      "entity_type": "person",
-      "importance": "S|A|B|C|D",
-      "snapshot": {{
-        "l1_mention": "L1 骨架（S/A/B/C/D 均必填）",
-        "l2_interaction": "L2 互动（仅 S 级有内容）",
-        "l3_decision": "L3 意图（仅 S 级有内容）"
-      }},
-      "emotion": {{ "vedana": {{}}, "klesha": {{}} }}
-    }}
-  ],
   "summaries": {{
     "L1": "…",
     "L2": "…"
@@ -181,10 +146,9 @@ ENRICHMENT_USER = """\
 
 
 def build_enrichment_system_message(config: "REMSConfig", *, fuse_min_chars: int) -> str:
-    """System prompt for event enrichment: mode injection + 角色优先 + 主规则。"""
+    """System prompt for event enrichment: mode injection + 主规则。"""
     return (
         build_user_mode_block(config)
-        + ENRICHMENT_PRIORITY_ADDENDUM
         + ENRICHMENT_SYSTEM.format(fuse_min_chars=fuse_min_chars)
     )
 

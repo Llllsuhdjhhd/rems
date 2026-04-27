@@ -54,11 +54,9 @@ class EventService:
         self,
         content_raw: str,
         *,
-        role_entries: list[EventRoleEntry] | None = None,
-        skip_roles: bool = False,
-        known_roles: list | None = None,
         is_suspicious: bool = False,
         input_id: str | None = None,
+        role_entries: list["EventRoleEntry"] | None = None,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
@@ -85,39 +83,14 @@ class EventService:
             budget.snapshot_budget_per_role, budget.wp_budget_per_role, budget.decoration_budget,
         )
 
-        # 只有在既没有预置 role_entries、又未显式 skip_roles 时，才需要跑 enrichment 抽角色。
-        # 但摘要永远需要，因此总是调用 enrichment 产出 summaries（角色部分按需使用）。
-        need_roles = role_entries is None and not skip_roles
         enrichment: EnrichmentResult = self._enrichment_skill.enrich(
             content_raw,
-            known_roles=known_roles,
             budget=budget,
         )
 
-        if need_roles:
-            roles = list(enrichment.roles)
-
-            if not roles and is_suspicious:
-                import secrets
-                from ..models.event import Importance
-
-                roles.append(ExtractedRole(
-                    name=f"临时记录角色_{secrets.token_hex(2)}",
-                    entity_type="unknown",
-                    importance=Importance.D.value,
-                ))
-
-            id_mapping: dict[str, str] = {}
-            if self._role_service:
-                id_mapping = self._role_service.resolve_and_register(
-                    roles, is_suspicious=is_suspicious,
-                )
-
+        # role_entries is passed from the pipeline early extraction stage
+        if role_entries is None:
             role_entries = []
-            for er in roles:
-                lookup_key = er.role_id or er.name
-                assigned_id = id_mapping.get(lookup_key, lookup_key)
-                role_entries.append(RoleExtractionSkill.to_event_role_entry(er, assigned_id))
 
         # 3. 生成主观装饰 (Decoration) - 受开关管控
         decoration = ""

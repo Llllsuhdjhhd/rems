@@ -55,6 +55,7 @@ class MetabolismService:
         *,
         force_save: bool = False,
         input_id: str | None = None,
+        role_entries: list["EventRoleEntry"] | None = None,
     ) -> list[Event]:
         """Ingest *raw_input*, return list of newly sealed events (may be empty).
 
@@ -76,11 +77,11 @@ class MetabolismService:
         unclosed = self._repo.get_unclosed_events()
 
         if force_save:
-            return self._force_save_all(shadow, raw_input, unclosed, input_id=input_id)
+            return self._force_save_all(shadow, raw_input, unclosed, input_id=input_id, role_entries=role_entries)
 
         # 边界检测仅负责事件切分；摘要/角色等衍生字段由 EventEnrichment 在 seal 时生成。
         result = self._boundary.detect(shadow.content, raw_input, unclosed)
-        return self._apply_boundary_result(result, unclosed, input_id=input_id)
+        return self._apply_boundary_result(result, unclosed, input_id=input_id, role_entries=role_entries)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -91,6 +92,7 @@ class MetabolismService:
         result: BoundaryResult,
         unclosed: list[UnclosedEvent],
         input_id: str | None = None,
+        role_entries: list["EventRoleEntry"] | None = None,
     ) -> list[Event]:
         sealed: list[Event] = []
 
@@ -108,6 +110,7 @@ class MetabolismService:
             event = self._event_svc.seal_event(
                 content,
                 input_id=input_id,
+                role_entries=role_entries,
             )
             sealed.append(event)
 
@@ -128,6 +131,7 @@ class MetabolismService:
                 event = self._event_svc.seal_event(
                     nu.content,
                     input_id=input_id,
+                    role_entries=role_entries,
                 )
                 sealed.append(event)
                 continue
@@ -152,6 +156,7 @@ class MetabolismService:
         *,
         is_suspicious: bool = False,
         input_id: str | None = None,
+        role_entries: list["EventRoleEntry"] | None = None,
     ) -> list[Event]:
         """Manual trigger (/save, /mem) or length-based fallback: seal everything immediately.
 
@@ -162,12 +167,12 @@ class MetabolismService:
 
         combined = (shadow.content + "\n" + raw_input).strip()
         if combined:
-            event = self._event_svc.seal_event(combined, is_suspicious=is_suspicious, input_id=input_id)
+            event = self._event_svc.seal_event(combined, is_suspicious=is_suspicious, input_id=input_id, role_entries=role_entries)
             sealed.append(event)
 
         for ue in unclosed:
             if ue.total_length > 0:
-                event = self._event_svc.seal_event(ue.merged_content, is_suspicious=is_suspicious, input_id=input_id)
+                event = self._event_svc.seal_event(ue.merged_content, is_suspicious=is_suspicious, input_id=input_id, role_entries=role_entries)
                 sealed.append(event)
             self._repo.delete_unclosed_event(ue.id)
 

@@ -33,6 +33,12 @@ class WhitePaintingEntry(BaseModel):
     create_time: datetime = Field(default_factory=datetime.now)
     # 由 AE 映射的记忆权重 [0,1]，越高越抗遗忘（白皮书 2.2 动态遗忘）。
     memory_weight: float = 0.0
+    # 动态遗忘因子，基于情绪极端值初始化，低于 0.02 则静默。
+    forgetting_factor: float = 1.0
+    # 基础遗忘因子，记录特殊事件的高额初始值（如初恋 = 100）。
+    base_forgetting_factor: float = 1.0
+    # 上次计算/访问时间，用于动态遗忘因子衰减
+    last_accessed_time: datetime = Field(default_factory=datetime.now)
     # 该条目是否包含可疑标记（事件边界/仲裁不确定的产物）
     is_suspicious: bool = False
 

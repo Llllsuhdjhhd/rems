@@ -260,6 +260,9 @@ class RoleRepository:
                 importance=importance_val,
                 create_time=entry.create_time,
                 memory_weight=entry.memory_weight,
+                forgetting_factor=entry.forgetting_factor,
+                base_forgetting_factor=entry.base_forgetting_factor,
+                last_accessed_time=entry.last_accessed_time,
                 is_suspicious=entry.is_suspicious,
             )
             s.add(record)
@@ -283,6 +286,36 @@ class RoleRepository:
             if limit:
                 q = q.limit(limit)
             return [self._to_wp_entry(e) for e in q.all()]
+
+    def get_white_painting_by_event(self, role_id: str, event_id: str) -> WhitePaintingEntry | None:
+        with self._db.session() as s:
+            record = (
+                s.query(WhitePaintingRecord)
+                .filter(
+                    WhitePaintingRecord.role_id == role_id,
+                    WhitePaintingRecord.event_id == event_id
+                )
+                .first()
+            )
+            if record is None:
+                return None
+            return self._to_wp_entry(record)
+
+    def update_white_painting_access(self, role_id: str, event_id: str, new_forgetting_factor: float) -> None:
+        from datetime import datetime
+        with self._db.session() as s:
+            record = (
+                s.query(WhitePaintingRecord)
+                .filter(
+                    WhitePaintingRecord.role_id == role_id,
+                    WhitePaintingRecord.event_id == event_id
+                )
+                .first()
+            )
+            if record:
+                record.forgetting_factor = new_forgetting_factor
+                record.last_accessed_time = datetime.now()
+                s.commit()
 
     def get_wp_total_length(self, role_id: str) -> int:
         """Return the total character length of all white-painting entries for a role.
@@ -344,6 +377,9 @@ class RoleRepository:
             importance=e.importance,
             create_time=e.create_time,
             memory_weight=float(e.memory_weight or 0.0),
+            forgetting_factor=float(getattr(e, "forgetting_factor", 1.0) or 1.0),
+            base_forgetting_factor=float(getattr(e, "base_forgetting_factor", 1.0) or 1.0),
+            last_accessed_time=getattr(e, "last_accessed_time", e.create_time) or e.create_time,
             is_suspicious=bool(e.is_suspicious),
         )
 

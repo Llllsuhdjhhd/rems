@@ -77,6 +77,12 @@ class WhitePaintingRecord(Base):
     create_time = Column(DateTime, nullable=False)
     # 由 AE 映射的记忆权重 [0,1]，越高越抗遗忘
     memory_weight = Column(Float, default=0.0)
+    # 动态遗忘因子，低于 0.02 则静默
+    forgetting_factor = Column(Float, default=1.0)
+    # 基础遗忘因子
+    base_forgetting_factor = Column(Float, default=1.0)
+    # 上次计算/访问时间
+    last_accessed_time = Column(DateTime, nullable=False)
     # 该条目是否包含可疑标记
     is_suspicious = Column(Boolean, default=False)
 

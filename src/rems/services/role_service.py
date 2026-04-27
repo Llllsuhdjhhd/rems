@@ -47,11 +47,13 @@ class RoleService:
         role_repo: RoleRepository,
         role_skill: RoleExtractionSkill,
         llm: LLMProvider | None = None,
+        vector_store: "VectorStore | None" = None,
     ):
         self._config = config
         self._repo = role_repo
         self._skill = role_skill
         self._llm = llm
+        self._vector_store = vector_store
 
     # ------------------------------------------------------------------
     # Registration
@@ -115,6 +117,12 @@ class RoleService:
             # memory_weight uses the higher of event-level and role-level AE
             memory_weight = max(role_ae, event_ae)
 
+            # 初始遗忘因子：情绪极端时给予极高的初始值（例如最高达100）
+            base_forgetting = 1.0
+            if memory_weight >= self._config.ae_high_threshold:
+                excess = (memory_weight - self._config.ae_high_threshold) / (1.0 - self._config.ae_high_threshold + 1e-6)
+                base_forgetting = 1.0 + excess * 99.0
+
             wp = WhitePaintingEntry(
                 event_id=event.event_id,
                 role_summary=summary_text,
@@ -122,9 +130,18 @@ class RoleService:
                 importance=entry.importance,
                 create_time=event.create_time,
                 memory_weight=memory_weight,
+                forgetting_factor=base_forgetting,
+                base_forgetting_factor=base_forgetting,
                 is_suspicious=role.is_suspicious,
             )
             self._repo.add_white_painting_entry(role.role_id, wp)
+            if self._vector_store:
+                self._vector_store.add_white_painting(
+                    role_id=role.role_id,
+                    event_id=event.event_id,
+                    text=summary_text,
+                    metadata={"forgetting_factor": base_forgetting}
+                )
             logger.debug("WP appended for %s from event %s (AE=%.2f)", role.role_id, event.event_id, memory_weight)
 
             # 语义卡片（insight 任务）只对「主要角色」(S/A 或单人模式核心用户) 且 ``enable_insight`` 时刷新，

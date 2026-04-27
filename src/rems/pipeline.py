@@ -149,6 +149,7 @@ class REMSPipeline:
         recall_service: RecallService,
         abstraction_service: AbstractionService,
         belief_revision_service: BeliefRevisionService,
+        role_skill: RoleExtractionSkill | None = None,
     ):
         self.config = config
         self.llm = llm
@@ -164,6 +165,7 @@ class REMSPipeline:
         self.recall_service = recall_service
         self.abstraction_service = abstraction_service
         self.belief_revision_service = belief_revision_service
+        self.role_skill = role_skill
 
     # ------------------------------------------------------------------
     @classmethod
@@ -189,12 +191,12 @@ class REMSPipeline:
         summary_skill = SummaryGenerationSkill(llm, config)
         role_skill = RoleExtractionSkill(llm, config)
         boundary_skill = BoundaryDetectionSkill(llm, config)
-        enrichment_skill = EventEnrichmentSkill(llm, config, role_fallback=role_skill)
+        enrichment_skill = EventEnrichmentSkill(llm, config)
         evolution_skill = InductiveEvolutionSkill(llm, config)
 
         emotion_evolver = EMAEvolver(config, role_repo)
         # Pass llm to role_service so semantic cards can be refreshed in-process
-        role_service = RoleService(config, role_repo, role_skill, llm=llm)
+        role_service = RoleService(config, role_repo, role_skill, llm=llm, vector_store=vector_store)
 
         event_service = EventService(
             config,
@@ -234,6 +236,7 @@ class REMSPipeline:
             recall_service=recall_service,
             abstraction_service=abstraction_service,
             belief_revision_service=belief_revision_service,
+            role_skill=role_skill,
         )
 
     # ------------------------------------------------------------------
@@ -270,8 +273,25 @@ class REMSPipeline:
         """
         shadow = self.meta_repo.get_shadow()
 
-        # 从当前输入和残影中提取焦点角色（用于回忆时的角色感知摘要档位选择）。
-        focus_role_ids = self._extract_focus_roles(raw_input, shadow.content if shadow else "")
+        # Step 1: LLM Character Extraction (Before Recall)
+        # 提前进行人物提取（输入+残影），抽取的结果既用于回忆块的人物关联，也透传给封存阶段
+        combined_text = (shadow.content + "\n" + raw_input).strip()
+        role_entries = []
+        if self.role_skill and combined_text:
+            extraction_result = self.role_skill.extract(combined_text)
+            extracted_roles = list(extraction_result.roles)
+            if extracted_roles:
+                id_mapping = self.role_service.resolve_and_register(extracted_roles, is_suspicious=False)
+                for er in extracted_roles:
+                    lookup_key = er.role_id or er.name
+                    assigned_id = id_mapping.get(lookup_key, lookup_key)
+                    role_entries.append(self.role_skill.to_event_role_entry(er, assigned_id))
+
+        # 从当前输入、残影以及刚抽取的角色中提取焦点角色
+        focus_role_ids = set(r.role_id for r in role_entries)
+        if self.config.user_mode == UserMode.SINGLE and self.config.core_user_role_id:
+            focus_role_ids.add(self.config.core_user_role_id)
+        focus_role_ids.update(self._extract_focus_roles(raw_input, shadow.content if shadow else ""))
 
         # 回忆（所有模式必须执行）：
         # 抽象事件的唯一触发路径是 recall_log 的频繁子集挖掘，跳过回忆等于放弃所有归纳演化；
@@ -299,7 +319,13 @@ class REMSPipeline:
                 )
 
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
-        sealed = self.metabolism_service.process_input(raw_input, force_save=force_save, input_id=input_id)
+        # 将前期提取到的 role_entries 传给 metabolism_service
+        sealed = self.metabolism_service.process_input(
+            raw_input, 
+            force_save=force_save, 
+            input_id=input_id,
+            role_entries=role_entries,
+        )
 
         # 角色：每个新事件更新白描时间线并刷新语义卡片（第 2.2–2.3）。
         # RoleService 对 is_abstract=True 的事件自带早退，抽象事件不会污染白描。
