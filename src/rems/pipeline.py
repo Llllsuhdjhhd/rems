@@ -298,7 +298,7 @@ class REMSPipeline:
         # 抽象事件的唯一触发路径是 recall_log 的频繁子集挖掘，跳过回忆等于放弃所有归纳演化；
         # "静默倾听"等模式只是不把 ctx 交给外部，内部仍然完整组装、登记与挖掘。
         ctx: ContextPackage = self.recall_service.build_context_package(
-            raw_input, shadow, focus_role_ids=focus_role_ids
+            raw_input, shadow, focus_role_ids=focus_role_ids, focus_role_entries=role_entries
         )
 
         # 登记本次回忆块 event_id 到 recall_log（白皮书 §3.2 唯一抽象触发路径的输入流）。

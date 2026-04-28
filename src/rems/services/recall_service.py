@@ -6,7 +6,7 @@ import logging
 # 总长约束约 1/6.6 上下文（config.physical_redline）。对照白皮书 4.4。
 
 from ..config import REMSConfig
-from ..models.event import Event
+from ..models.event import Event, EventStatus
 from ..models.metabolism import ContextPackage, RecallBlock, RecallItem, Shadow
 from ..strategies.recall import (
     DefaultRecallScoringStrategy,
@@ -61,6 +61,7 @@ class RecallService:
         query: str,
         shadow: Shadow | None = None,
         focus_role_ids: set[str] | None = None,
+        focus_role_entries: list["EventRoleEntry"] | None = None,
     ) -> RecallBlock:
         """Build the recall block for *query*. Multi-stage retrieval implementation (白皮书 4.4)."""
         search_text = query
@@ -68,21 +69,44 @@ class RecallService:
             search_text = shadow.content + "\n" + query
 
         # ========================================================
+        # Collective Forgetting & Lifecycle Maintenance
+        # ========================================================
+        # 在每次检索前，尝试清理/静默那些已被所有参与角色“集体遗忘”的事件。
+        # 实际工程中可异步执行，此处为确保逻辑闭环，对检索到的潜在命中做实时校验。
+
+        # ========================================================
         # Dual-Stream Hybrid Recall
         # ========================================================
-        # Stream A: Event semantic search
-        hits_a = self._vector.search(search_text, n_results=60)
+        # Stream A: Event semantic search (with Tiered Capacity & 70/30 Rule)
+        hits_a = self._get_stream_a_hits(search_text, focus_role_ids or set())
         stream_a: dict[str, tuple[Event, float]] = {}
         for hit in hits_a:
             event = self._event_repo.get(hit["event_id"])
             if event is None or event.is_tombstoned or event.status.value == "silent":
                 continue
+            
+            # 集体遗忘检查：若事件关联的所有角色遗忘因子均低于阈值，则静默该事件
+            if self._check_and_silence_event(event):
+                continue
+
             raw_sim = 1.0 - hit.get("distance", 1.0)
             score = self._hybrid_score(event, raw_sim)
             stream_a[event.event_id] = (event, score)
 
         # Stream B: White-painting (Role) semantic search
-        hits_b = self._vector.search_white_paintings(search_text, n_results=60)
+        # 优化：将当前提取的角色摘要（Snapshots）也作为检索词的一部分，实现“摘要对摘要”的精准匹配
+        b_query = search_text
+        if focus_role_entries:
+            snapshot_texts = []
+            for r in focus_role_entries:
+                if r.role_snapshot.l2_interaction:
+                    snapshot_texts.append(r.role_snapshot.l2_interaction)
+                elif r.role_snapshot.l1_mention:
+                    snapshot_texts.append(r.role_snapshot.l1_mention)
+            if snapshot_texts:
+                b_query += "\n" + "\n".join(snapshot_texts)
+                
+        hits_b = self._get_stream_b_hits(b_query)
         stream_b: dict[str, tuple[Event, float]] = {}
         for hit in hits_b:
             wp_id = hit["wp_id"]
@@ -179,8 +203,11 @@ class RecallService:
         raw_input: str,
         shadow: Shadow,
         focus_role_ids: set[str] | None = None,
+        focus_role_entries: list["EventRoleEntry"] | None = None,
     ) -> ContextPackage:
-        recall = self.build_recall_block(raw_input, shadow, focus_role_ids=focus_role_ids)
+        recall = self.build_recall_block(
+            raw_input, shadow, focus_role_ids=focus_role_ids, focus_role_entries=focus_role_entries
+        )
         return ContextPackage(
             recall_block=recall,
             shadow=shadow,
@@ -194,12 +221,98 @@ class RecallService:
     def _hybrid_score(self, event: Event, cosine_sim: float) -> float:
         """Hybrid recall score.
 
-        四项贡献：余弦相似度、时间半衰、角色重要性 max boost、事件级情感能量（AE）与
-        ``activation_energy``（白皮书 2.5：重大情感事件的硬绑定抗遗忘初值）。权重分配上，
-        ``time_decay`` 与 ``role_boost`` 固定为 0.15 / 0.20；``ae_w``、``act_w`` 从 config 读取，
-        余量自动回填到余弦项，保证总权重恒为 1。
+        现在由角色白描驱动遗忘逻辑，移除全局时间衰减（time_decay=0），
+        权重已在 DefaultRecallScoringStrategy 内部重分配至余弦相似度。
         """
         return self._scoring_strategy.score(event, cosine_sim).total
+
+    def _check_and_silence_event(self, event: Event) -> bool:
+        """Check if all roles in the event have 'forgotten' it.
+        
+        如果事件关联的所有角色的遗忘因子均低于阈值，则将其设为 SILENT 并返回 True。
+        """
+        if not event.role_list:
+            return False
+            
+        threshold = self._config.event_silence_threshold
+        all_forgot = True
+        for re in event.role_list:
+            wp = self._role_repo.get_white_painting_by_event(re.role_id, event.event_id)
+            if wp:
+                f_score = self._forgetting_strategy.score(wp, is_penalized=True)
+                if not f_score.is_silenced and f_score.effective_forgetting >= threshold:
+                    all_forgot = False
+                    break
+            else:
+                # 缺失白描条目的角色视为已遗忘
+                continue
+        
+        if all_forgot:
+            logger.info("Event %s silenced: all %d roles have forgotten it", event.event_id, len(event.role_list))
+            self._event_repo.update_status(event.event_id, status=EventStatus.SILENT)
+            return True
+        return False
+
+    def _get_stream_a_hits(self, query: str, focus_role_ids: set[str]) -> list[dict]:
+        """Tiered Stream A retrieval implementation (70/30 Rule)."""
+        capacity = self._config.recall_max_capacity
+        global_ratio = self._config.recall_global_ratio
+        
+        total_count = self._vector.count()
+        if total_count <= capacity:
+            # 库容量未达上限，执行标准全局检索
+            return self._vector.search(query, n_results=60, where={"status": "active"})
+            
+        # 超过容量，计算 70% 边界时刻
+        boundary_dt = self._event_repo.find_time_boundary(capacity, global_ratio)
+        if not boundary_dt:
+            return self._vector.search(query, n_results=60, where={"status": "active"})
+            
+        boundary_ts = boundary_dt.timestamp()
+        
+        # 分层检索：
+        # 1. 最近 70% 区域（全局可见）
+        hits_recent = self._vector.search(
+            query, 
+            n_results=60, 
+            where={"$and": [{"status": "active"}, {"create_time": {"$gte": boundary_ts}}]}
+        )
+        
+        # 2. 剩余 30% 区域（仅角色关联可见）
+        hits_older = []
+        if focus_role_ids:
+            # 针对每个焦点角色执行过滤检索（Chroma $or + $contains 组合）
+            or_filters = []
+            for rid in focus_role_ids:
+                or_filters.append({"role_ids": {"$contains": rid}})
+            
+            if or_filters:
+                filter_cond = or_filters[0] if len(or_filters) == 1 else {"$or": or_filters}
+                hits_older = self._vector.search(
+                    query,
+                    n_results=40,
+                    where={"$and": [
+                        {"status": "active"},
+                        {"create_time": {"$lt": boundary_ts}},
+                        filter_cond
+                    ]}
+                )
+        
+        # 合并并去重
+        seen = set()
+        merged = []
+        for h in hits_recent + hits_older:
+            if h["event_id"] not in seen:
+                merged.append(h)
+                seen.add(h["event_id"])
+        
+        # 按距离截断前 60
+        merged.sort(key=lambda x: x.get("distance", 1.0))
+        return merged[:60]
+
+    def _get_stream_b_hits(self, query: str) -> list[dict]:
+        """Stream B: White-painting (Role) semantic search."""
+        return self._vector.search_white_paintings(query, n_results=60)
 
     @staticmethod
     def _time_decay(create_time, half_life_days: float = 30.0) -> float:
