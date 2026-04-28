@@ -51,9 +51,11 @@ class EventEnrichmentSkill:
         self,
         llm: LLMProvider,
         config: REMSConfig,
+        role_fallback: "RoleExtractionSkill | None" = None,
     ):
         self._llm = llm
         self._config = config
+        self._role_fallback = role_fallback
 
     def enrich(
         self,
@@ -100,9 +102,17 @@ class EventEnrichmentSkill:
         summary_lengths = {k: len(v) for k, v in summaries.items()}
         actual_max_level = len(summaries)
 
+        roles = []
+        if self._role_fallback:
+            try:
+                extraction = self._role_fallback.extract(content_raw, known_roles=known_roles)
+                roles = list(extraction.roles)
+            except Exception as e:
+                logger.warning("Fallback role extraction failed: %s", e)
+
         return EnrichmentResult(
             summaries=summaries,
             summary_lengths=summary_lengths,
             actual_max_level=actual_max_level,
-            roles=[],  # No longer extracted here
+            roles=roles,
         )

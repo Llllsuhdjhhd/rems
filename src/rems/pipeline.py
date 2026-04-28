@@ -191,7 +191,7 @@ class REMSPipeline:
         summary_skill = SummaryGenerationSkill(llm, config)
         role_skill = RoleExtractionSkill(llm, config)
         boundary_skill = BoundaryDetectionSkill(llm, config)
-        enrichment_skill = EventEnrichmentSkill(llm, config)
+        enrichment_skill = EventEnrichmentSkill(llm, config, role_fallback=role_skill)
         evolution_skill = InductiveEvolutionSkill(llm, config)
 
         emotion_evolver = EMAEvolver(config, role_repo)
@@ -274,9 +274,10 @@ class REMSPipeline:
         shadow = self.meta_repo.get_shadow()
 
         # Step 1: LLM Character Extraction (Before Recall)
-        # 提前进行人物提取（输入+残影），抽取的结果既用于回忆块的人物关联，也透传给封存阶段
+        # 提前进行人物提取（输入+残影），用于提取焦点角色辅助召回（不直接传给封存阶段）
         combined_text = (shadow.content + "\n" + raw_input).strip()
         role_entries = []
+        print(f"DEBUG pipeline.ingest: role_skill={self.role_skill is not None}, combined_text_len={len(combined_text)}")
         if self.role_skill and combined_text:
             extraction_result = self.role_skill.extract(combined_text)
             extracted_roles = list(extraction_result.roles)
@@ -319,12 +320,10 @@ class REMSPipeline:
                 )
 
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
-        # 将前期提取到的 role_entries 传给 metabolism_service
         sealed = self.metabolism_service.process_input(
             raw_input, 
             force_save=force_save, 
             input_id=input_id,
-            role_entries=role_entries,
         )
 
         # 角色：每个新事件更新白描时间线并刷新语义卡片（第 2.2–2.3）。

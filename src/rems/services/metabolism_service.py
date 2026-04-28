@@ -55,7 +55,6 @@ class MetabolismService:
         *,
         force_save: bool = False,
         input_id: str | None = None,
-        role_entries: list["EventRoleEntry"] | None = None,
     ) -> list[Event]:
         """Ingest *raw_input*, return list of newly sealed events (may be empty).
 
@@ -110,7 +109,6 @@ class MetabolismService:
             event = self._event_svc.seal_event(
                 content,
                 input_id=input_id,
-                role_entries=role_entries,
             )
             sealed.append(event)
 
@@ -131,7 +129,6 @@ class MetabolismService:
                 event = self._event_svc.seal_event(
                     nu.content,
                     input_id=input_id,
-                    role_entries=role_entries,
                 )
                 sealed.append(event)
                 continue
@@ -156,7 +153,6 @@ class MetabolismService:
         *,
         is_suspicious: bool = False,
         input_id: str | None = None,
-        role_entries: list["EventRoleEntry"] | None = None,
     ) -> list[Event]:
         """Manual trigger (/save, /mem) or length-based fallback: seal everything immediately.
 
@@ -167,12 +163,12 @@ class MetabolismService:
 
         combined = (shadow.content + "\n" + raw_input).strip()
         if combined:
-            event = self._event_svc.seal_event(combined, is_suspicious=is_suspicious, input_id=input_id, role_entries=role_entries)
+            event = self._event_svc.seal_event(combined, is_suspicious=is_suspicious, input_id=input_id)
             sealed.append(event)
 
         for ue in unclosed:
             if ue.total_length > 0:
-                event = self._event_svc.seal_event(ue.merged_content, is_suspicious=is_suspicious, input_id=input_id, role_entries=role_entries)
+                event = self._event_svc.seal_event(ue.merged_content, is_suspicious=is_suspicious, input_id=input_id)
                 sealed.append(event)
             self._repo.delete_unclosed_event(ue.id)
 
