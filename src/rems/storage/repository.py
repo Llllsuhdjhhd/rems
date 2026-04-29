@@ -80,6 +80,10 @@ class EventRepository:
                 q = q.filter(EventRecord.is_tombstoned == False)  # noqa: E712
             return [self._to_model(r) for r in q.order_by(EventRecord.create_time).all()]
 
+    def count(self) -> int:
+        with self._db.session() as s:
+            return s.query(EventRecord).count()
+
     def resolve_basic_event_ids(self, event_id: str) -> list[str]:
         """Flatten the abstraction chain rooted at *event_id* down to basic-event leaves.
 

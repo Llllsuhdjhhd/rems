@@ -71,7 +71,10 @@ class VectorStore:
             self._ef = SentenceTransformerEmbeddingFunction(
                 model_name=config.embedding.model_name,
             )
-        self._client = chromadb.PersistentClient(path=config.storage.chromadb_path)
+        if config.storage.chromadb_path:
+            self._client = chromadb.PersistentClient(path=config.storage.chromadb_path)
+        else:
+            self._client = chromadb.Client()
         self._collection = self._client.get_or_create_collection(
             name="rems_events",
             embedding_function=self._ef,

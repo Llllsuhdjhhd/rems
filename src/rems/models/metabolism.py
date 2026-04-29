@@ -10,9 +10,10 @@ from pydantic import BaseModel, Field
 
 
 class Shadow(BaseModel):
-    """Raw-text buffer for unprocessed input fragments.
+    """Raw-text buffer derived from unclosed events.
 
-    残影：尚未经边界检测整理、未封存入库的原始文本缓冲；随代谢不断更新 ``content`` 与 ``updated_at``（白皮书 4.1）。
+    残影：由所有未完成事件的原始片段拼接而成，作为当前摄入的即时上下文（白皮书 4.1）。
+    在代谢过程中，它作为边界检测的输入之一，并在代谢后根据最新的未完成事件库进行同步更新。
     """
 
     content: str = ""
@@ -26,8 +27,9 @@ class Shadow(BaseModel):
 class UnclosedEvent(BaseModel):
     """A logically-opened but not-yet-closed event object.
 
-    未完成事件：叙事上已启动但缺关键结果或上下文的事实对象；可累积 ``content_fragments``、
-    记录 ``logical_gaps``，并在后续输入中由边界模型决定续写、合并或转封存（白皮书 4.1）。
+    未完成事件：叙事上已启动但缺关键结果或上下文的事实对象（白皮书 4.1）。
+    所有的未完成事件拼接在一起构成了系统的“残影”。当边界模型识别到逻辑闭环时，
+    对应的未完成事件将被封存为基本事件，并从残影中移除。
     """
 
     id: str

@@ -72,15 +72,16 @@ class MetabolismService:
                 self._config.len_msg,
             )
 
-        shadow = self._repo.get_shadow()
         unclosed = self._repo.get_unclosed_events()
+        # 白皮书新定义：残影是未完成事件的直接拼接
+        shadow_content = "\n".join(ue.merged_content for ue in unclosed)
 
         if force_save:
-            return self._force_save_all(shadow, raw_input, unclosed, input_id=input_id, role_entries=role_entries)
+            return self._force_save_all(shadow_content, raw_input, unclosed, input_id=input_id)
 
         # 边界检测仅负责事件切分；摘要/角色等衍生字段由 EventEnrichment 在 seal 时生成。
-        result = self._boundary.detect(shadow.content, raw_input, unclosed)
-        return self._apply_boundary_result(result, unclosed, input_id=input_id, role_entries=role_entries)
+        result = self._boundary.detect(shadow_content, raw_input, unclosed)
+        return self._apply_boundary_result(result, unclosed, input_id=input_id)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -112,8 +113,6 @@ class MetabolismService:
             )
             sealed.append(event)
 
-        self._repo.update_shadow(Shadow(content=result.remaining_shadow, updated_at=datetime.now()))
-
         # 白皮书 4.2 底线兜底：对单条未闭环片段逐项判定；若长度越过 ``len_msg × 1.2`` 红线，
         # 立即强制封存为事件，防止内存/计算爆炸。是否「可疑」交由 EventService 内部的
         # 角色抽取与 RoleService 仲裁判断（角色清晰时不应被盲目标脏）。
@@ -140,6 +139,11 @@ class MetabolismService:
             )
             self._repo.save_unclosed_event(ue)
 
+        # 更新残影记录（为保持一致性，每次代谢后同步更新）
+        final_unclosed = self._repo.get_unclosed_events()
+        new_shadow_content = "\n".join(ue.merged_content for ue in final_unclosed)
+        self._repo.update_shadow(Shadow(content=new_shadow_content, updated_at=datetime.now()))
+
         self._check_physical_redline()
 
         return sealed
@@ -147,7 +151,7 @@ class MetabolismService:
     # ------------------------------------------------------------------
     def _force_save_all(
         self,
-        shadow: Shadow,
+        shadow_content: str,
         raw_input: str,
         unclosed: list[UnclosedEvent],
         *,
@@ -161,7 +165,7 @@ class MetabolismService:
         """
         sealed: list[Event] = []
 
-        combined = (shadow.content + "\n" + raw_input).strip()
+        combined = (shadow_content + "\n" + raw_input).strip()
         if combined:
             event = self._event_svc.seal_event(combined, is_suspicious=is_suspicious, input_id=input_id)
             sealed.append(event)

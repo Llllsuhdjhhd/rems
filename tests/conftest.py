@@ -1,0 +1,61 @@
+import pytest
+import json
+import os
+import shutil
+from typing import Any
+from rems.config import REMSConfig
+from rems.storage.database import Database
+
+@pytest.fixture
+def tmp_dir(tmp_path):
+    d = tmp_path / "rems_test"
+    d.mkdir()
+    yield str(d)
+
+@pytest.fixture
+def config(tmp_dir):
+    cfg = REMSConfig()
+    cfg.storage.database_url = f"sqlite:///{tmp_dir}/test.db"
+    cfg.storage.chromadb_path = ""  # Use in-memory for tests
+    cfg.embedding.provider = "hash"  # Use deterministic hash to avoid downloading models
+    return cfg
+
+@pytest.fixture
+def db(config):
+    database = Database(config.storage.database_url)
+    database.create_tables()
+    return database
+
+class FakeLLM:
+    """Mock LLM provider for tests."""
+    def __init__(self, config=None):
+        self.config = config
+        self._responses = []
+
+    def push_response(self, response: Any):
+        self._responses.append(response)
+
+    def complete(self, task_type: str, messages: list[dict], **kwargs) -> str:
+        if not self._responses:
+            return "Fake response"
+        res = self._responses.pop(0)
+        return json.dumps(res) if not isinstance(res, str) else res
+
+    def complete_json(self, task_type: str, messages: list[dict], **kwargs) -> dict[str, Any]:
+        if not self._responses:
+            return {}
+        res = self._responses.pop(0)
+        if isinstance(res, dict):
+            return res
+        return json.loads(res)
+
+@pytest.fixture
+def fake_llm(config):
+    return FakeLLM(config)
+
+class FakeEmbeddingFunction:
+    """Mock embedding function for tests."""
+    def __call__(self, input):
+        return [[0.1] * 128 for _ in input]
+    def embed_query(self, text):
+        return [0.1] * 128

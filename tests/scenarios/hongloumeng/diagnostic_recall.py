@@ -43,8 +43,15 @@ def run_diagnostic_recall():
         content = orig_complete(self, task_type, messages, **kwargs)
         metrics = self._invocations[-1]
         log_file = log_dir / f"diag_chunk_{last_idx + 1}_{task_type}_{time.time()}.json"
+        log_data = {
+            "task": task_type,
+            "model": model,
+            "messages": messages,
+            "response": content,
+            "metrics": asdict(metrics)
+        }
         with open(log_file, "w", encoding="utf-8") as f:
-            json.dump({"task": task_type, "response": content, "metrics": asdict(metrics)}, f, ensure_ascii=False, indent=2)
+            json.dump(log_data, f, ensure_ascii=False, indent=2)
         return content
     LLMProvider.complete = complete_with_logging
     

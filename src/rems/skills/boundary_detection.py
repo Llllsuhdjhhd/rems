@@ -29,7 +29,6 @@ class NewUnclosed(BaseModel):
 
 class BoundaryResult(BaseModel):
     completed_events: list[CompletedFragment] = Field(default_factory=list)
-    remaining_shadow: str = ""
     new_unclosed: list[NewUnclosed] = Field(default_factory=list)
 
 
@@ -123,13 +122,6 @@ class BoundaryDetectionSkill:
                 continuation_of=item.get("continuation_of"),
             ))
 
-        # 解码剩余残影（白皮书 4.2：优先遵循序号编码协议）
-        shadow_indices = data.get("remaining_shadow_indices", [])
-        remaining_shadow = decode_indices(sentences, shadow_indices)
-        if not remaining_shadow:
-            # 兼容历史输出：若模型仍返回原文字段，则回退使用。
-            remaining_shadow = data.get("remaining_shadow", "")
-
         new_unc = self._decode_new_unclosed_list(
             data.get("new_unclosed_indices", []),
             sentences,
@@ -137,6 +129,5 @@ class BoundaryDetectionSkill:
 
         return BoundaryResult(
             completed_events=completed,
-            remaining_shadow=remaining_shadow,
             new_unclosed=new_unc,
         )

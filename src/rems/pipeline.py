@@ -276,8 +276,8 @@ class REMSPipeline:
         # Step 1: LLM Character Extraction (Before Recall)
         # 提前进行人物提取（输入+残影），用于提取焦点角色辅助召回（不直接传给封存阶段）
         combined_text = (shadow.content + "\n" + raw_input).strip()
+        print(f"  [DEBUG] role_skill exists: {self.role_skill is not None}, combined_text length: {len(combined_text)}")
         role_entries = []
-        print(f"DEBUG pipeline.ingest: role_skill={self.role_skill is not None}, combined_text_len={len(combined_text)}")
         if self.role_skill and combined_text:
             extraction_result = self.role_skill.extract(combined_text)
             extracted_roles = list(extraction_result.roles)

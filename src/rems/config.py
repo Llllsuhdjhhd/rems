@@ -97,6 +97,12 @@ class REMSConfig(BaseSettings):
     recall_minor_role_compress_shift: int = 1
     # 摘要最低字数门槛：某档摘要字数 ≤ 此值时视为已最大压缩，不再向上推进档位。
     recall_summary_min_chars: int = 20
+    
+    # ---- Recall Capacity & Tiered Retrieval (70/30 Rule) ----
+    # 系统级全量检索容量上限（基本事件数）。低于此值全量可见；超过后开启 70/30 分层。
+    recall_max_capacity: int = 1000
+    # 分层比例：最近 N% 的条目对全局可见，剩余部分仅焦点角色关联可见。
+    recall_global_ratio: float = 0.7
 
     # ---- Abstraction: Frequent Maximal Subset Mining (白皮书 §3.2 唯一触发) ----
     # 每次回忆产生的回忆块 event_id 集合被登记到 ``recall_log``；在集合族中找满足：
@@ -121,6 +127,9 @@ class REMSConfig(BaseSettings):
     # 白描时间线遗忘：低 AE 条目半衰期（天）；高 AE 条目半衰期乘以 ae_forgetting_multiplier。
     wp_half_life_days: float = 60.0
     ae_forgetting_multiplier: float = 5.0
+    
+    # 事件静默阈值：当所有角色的有效遗忘因子均低于此值时，事件被设为 SILENT。
+    event_silence_threshold: float = 0.02
 
     # ---- Dynamic Recall Compression (白皮书 4.4 扩展与分级压缩) ----
     # 初始向量检索的目标长度倍率（相对于 physical_redline）。
