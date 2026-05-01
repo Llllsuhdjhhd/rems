@@ -120,7 +120,7 @@ def run_continuous_simulation(num_chunks_to_process=3):
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump({"last_chunk_idx": last_chunk_idx}, f, indent=2)
 
-    total_events = pipeline.event_repo._db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    total_events = pipeline.event_repo.count()
     final_shadow = pipeline.meta_repo.get_shadow()
     
     print(f"\n{'='*60}")
