@@ -287,7 +287,7 @@ $$\text{base\_forgetting\_factor} = 100 \cdot a^{\gamma}, \quad \gamma = 2 \text
 
 结构与基本事件一致，但存在以下硬性差异：
 
-- **content_raw**：大模型基于 source_events 展开得到的叶子基本事件 content_raw 拼接输入，按基本事件同样的“抓住重点”规则压缩生成；目标长度约等于叶子基本事件 content_raw 的均值的大小的1.2倍；
+- **content_raw**：大模型基于 source_events 展开得到的叶子基本事件 content_raw 拼接输入，按基本事件同样的“抓住重点”规则压缩生成；目标长度约等于叶子基本事件 content_raw 均值的 1.2 倍；
 - **summaries**：按 §1.1.3 递归摘要体系基于 content_raw 正常生成（L1…Ln + 弹性浮动与 <40字符截止），与基本事件同规则；
 - **insight**：由 enable_abstract_insight 开关控制。开启时生成跨事件提炼出的规律/认知结论，不复述事实本身；关闭时不生成；
 - **is_abstract**：固定为 True；
@@ -399,6 +399,16 @@ $$\text{base\_forgetting\_factor} = 100 \cdot a^{\gamma}, \quad \gamma = 2 \text
 
 ## 5. 系统输出机制与多场景架构适配
 
+### 5.-1 参考环境
+
+本参考实现当前以 Python 3.12 为主环境验证。推荐使用 conda 创建隔离环境：
+
+```
+conda create -n py3125 python=3.12.5
+conda activate py3125
+python -m pip install -e ".[dev]"
+```
+
 REMS 作为一个底层代谢架构，不强制绑定单一的响应模式。系统根据不同的商业与应用需求，灵活调整“代谢素材包（回忆块 + 残影 + 当前输入）”的处理管线与输出形态。
 
 ### 5.0 模式的边界：只管"输出形态"，不碰"记忆动力学"
@@ -413,7 +423,7 @@ REMS 作为一个底层代谢架构，不强制绑定单一的响应模式。系
 模式差异只在最后一步——要不要把 ContextPackage 对外暴露、以及是否额外派生指令。这样设计的刚性理由：
 
 - 抽象事件的唯一触发路径是 recall_log；如果"静默"模式跳过回忆，系统永远不会演化出归纳规律；
-- 语义卡片、AE、白描等巩固机制都依赖检索相关性信号；跳过回忆等于让记忆静态化。
+- 白描、情绪遗忘与抽象巩固机制都依赖检索相关性信号；跳过回忆等于让记忆静态化。
 
 因此"静默倾听"的正确语义是 "不对用户说话"，而不是 "不要构建记忆"。工程上通过 ProcessingMode.returns_context_package 这个布尔属性做路由：True 表示把 ctx 交给上游，False 表示 ctx 留在内部、对外返回 None。
 

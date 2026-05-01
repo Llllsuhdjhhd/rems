@@ -16,7 +16,7 @@ class RecallScoreBreakdown:
     cosine: float
     time_decay: float
     role_boost: float
-    affective_energy: float
+    arousal: float
     activation_energy: float
     total: float
 
@@ -46,23 +46,23 @@ class DefaultRecallScoringStrategy:
     def score(self, event: Event, cosine_sim: float) -> RecallScoreBreakdown:
         time_decay = self.time_decay(event.create_time)
         role_boost = self.role_boost(event)
-        ae = event.affective_energy
+        arousal = event.affective_energy
         act = event.activation_energy
-        ae_w = self._config.ae_score_weight
-        act_w = self._config.activation_energy_weight
-        cosine_w = max(0.0, 1.0 - ae_w - act_w - 0.15 - 0.20)
+        arousal_w = 0.10
+        act_w = 0.05
+        cosine_w = max(0.0, 1.0 - arousal_w - act_w - 0.15 - 0.20)
         total = (
             cosine_w * cosine_sim
             + 0.15 * time_decay
             + 0.20 * role_boost
-            + ae_w * ae
+            + arousal_w * arousal
             + act_w * act
         )
         return RecallScoreBreakdown(
             cosine=cosine_sim,
             time_decay=time_decay,
             role_boost=role_boost,
-            affective_energy=ae,
+            arousal=arousal,
             activation_energy=act,
             total=total,
         )

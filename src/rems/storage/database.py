@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Iterator
 
-# SQLAlchemy ORM：事件、角色、白描条目、残影、未完成事件、语义卡片的持久化表定义与 Database 门面。
+# SQLAlchemy ORM：事件、角色、白描条目、残影、未完成事件的持久化表定义与 Database 门面。
 # 领域含义见《REMS 记忆系统规范解析》第 1–2 章与第 4.1 节。
 
 from sqlalchemy import (
@@ -105,14 +105,6 @@ class UnclosedEventRecord(Base):
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
     last_hit_time = Column(DateTime, nullable=False)
-
-
-class SemanticCardRecord(Base):
-    __tablename__ = "semantic_cards"
-
-    role_id = Column(String, ForeignKey("roles.role_id"), primary_key=True)
-    updated_at = Column(DateTime, nullable=False)
-    data = Column(JSON, default=dict)
 
 
 # ------------------------------------------------------------------

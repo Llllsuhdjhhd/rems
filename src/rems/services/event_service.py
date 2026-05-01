@@ -56,6 +56,8 @@ class EventService:
         *,
         is_suspicious: bool = False,
         input_id: str | None = None,
+        role_entries: list[EventRoleEntry] | None = None,
+        skip_roles: bool = False,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
@@ -88,13 +90,13 @@ class EventService:
         )
 
         from ..skills.role_extraction import RoleExtractionSkill
-        role_entries = []
-        if enrichment.roles:
+        resolved_role_entries = list(role_entries or [])
+        if not skip_roles and not resolved_role_entries and enrichment.roles:
             id_mapping = self._role_service.resolve_and_register(enrichment.roles, is_suspicious=is_suspicious)
             for r in enrichment.roles:
                 lookup_key = r.role_id or r.name
                 assigned_id = id_mapping.get(lookup_key, lookup_key)
-                role_entries.append(RoleExtractionSkill.to_event_role_entry(r, assigned_id))
+                resolved_role_entries.append(RoleExtractionSkill.to_event_role_entry(r, assigned_id))
 
         # 3. 生成主观装饰 (Decoration) - 受开关管控
         decoration = ""
@@ -105,7 +107,7 @@ class EventService:
 
         # 白皮书 1.2：计算实际压缩率 sum_len / raw_len
         compression_ratio = self._compute_compression_ratio(
-            content_raw, enrichment, role_entries or [], decoration,
+            content_raw, enrichment, resolved_role_entries, decoration,
         )
 
         event = Event(
@@ -113,7 +115,7 @@ class EventService:
             summaries=enrichment.summaries,
             summary_lengths=enrichment.summary_lengths,
             actual_max_level=enrichment.actual_max_level,
-            role_list=role_entries or [],
+            role_list=resolved_role_entries,
             status=EventStatus.ACTIVE,
             decoration=decoration,
             input_id=input_id,

@@ -4,9 +4,8 @@ import logging
 from typing import TYPE_CHECKING
 
 # 事件充实（Event Enrichment）技能：
-#   一次 LLM 调用同时产出「L1..Ln 递归摘要」+「角色列表（含快照与 Vedana/Klesha）」。
+#   生成「L1..Ln 递归摘要」；角色列表由 RoleExtractionSkill 单独抽取。
 #   替代原来分离的 SummaryGenerationSkill + RoleExtractionSkill 组合（仅基本事件流使用）。
-#   角色级语义卡片（insight）刷新由下游按「主要角色」过滤后另起调用，见 RoleService._refresh_semantic_card。
 # 对照《REMS 记忆系统规范解析》1.1.3、2.1、2.3。
 
 from pydantic import BaseModel, Field

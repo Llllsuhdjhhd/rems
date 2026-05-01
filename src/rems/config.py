@@ -119,17 +119,15 @@ class REMSConfig(BaseSettings):
     # 递归摘要熔断：某级摘要字符数 **低于** 该阈值则不再生成更高级（白皮书 1.1.3）；按产品约定为 20 字。
     summary_fuse_min_chars: int = 20
 
-    # AE（Affective Energy，情感能量）：高于 ae_high_threshold 时增强抗遗忘权重（白皮书 1.1.4、2.2）。
-    ae_high_threshold: float = 0.6
-    # 回忆混合打分中来自事件级 AE 的权重（余下与时间衰减、角色重要性、相似度分配）。
-    ae_score_weight: float = 0.15
+    # 情绪唤醒度映射遗忘因子的幂指数：base_forgetting_factor = 100 * arousal ** gamma。
+    emotion_arousal_gamma: float = 2.0
 
-    # 白描时间线遗忘：低 AE 条目半衰期（天）；高 AE 条目半衰期乘以 ae_forgetting_multiplier。
+    # 白描时间线遗忘半衰期（天）。
     wp_half_life_days: float = 60.0
-    ae_forgetting_multiplier: float = 5.0
     
     # 事件静默阈值：当所有角色的有效遗忘因子均低于此值时，事件被设为 SILENT。
     event_silence_threshold: float = 0.02
+    forgetting_silence_threshold: float = 0.02
 
     # ---- Dynamic Recall Compression (白皮书 4.4 扩展与分级压缩) ----
     # 初始向量检索的目标长度倍率（相对于 physical_redline）。
@@ -142,11 +140,6 @@ class REMSConfig(BaseSettings):
     # 兼容旧配置：当前实现已改为始终展开到叶子基本事件并使用 content_raw 作为抽象证据。
     hallucination_anchor_prob: float = 0.3
 
-    # 角色语义卡片最多保留的键数量（白皮书 2.3）。
-    semantic_card_max_keys: int = 20
-    # 封存后是否对主要角色（S/A）自动调用 LLM 合并刷新语义卡片（``task_type=insight``，见 TaskModelMapping.insight）；
-    # 关闭时白描仍正常写入，仅跳过卡片更新。默认关以降低成本与延迟。
-    enable_insight: bool = False
     # 抽象事件是否额外生成 ``insight``。关闭时抽象合成只产出压缩后的 ``content_raw`` 与可选 decoration；
     # 打开时才要求模型提炼跨事件规律，且该 insight 不是事实摘要本身。
     enable_abstract_insight: bool = False
@@ -187,14 +180,19 @@ class REMSConfig(BaseSettings):
     active_participants: list[str] = Field(default_factory=list)
 
     # ---- Emotion: EMA (Emotion & Adaptation) dynamic evolution (白皮书 2.5) ----
-    # EMA 指数平滑系数；越大越偏向"新事件"，越小越延续"历史心境"。
-    ema_smoothing_alpha: float = 0.4
-    # EMA 回溯读取白描尾部的条数（用于生成历史心境基线）。
+    # 情绪滚动状态的时间衰减核（小时）：phi(delta) = exp(-lambda * delta_hours)。
+    emotion_decay_lambda_per_hour: float = 0.1
+    # 情绪滚动状态回溯读取白描尾部的条数。
     ema_history_window: int = 10
-    # 将事件 AE 映射为 ``activation_energy`` 的增益；超过 ae_high_threshold 触发重大事件硬绑定。
+    # 事件 activation_energy 由角色滚动 energy 聚合后可选放大。
     activation_energy_gain: float = 1.0
-    # 回忆混合打分中 ``activation_energy`` 的权重（从余弦相似度份额中扣除）。
-    activation_energy_weight: float = 0.10
+
+    # ---- RRF recall modifiers (白皮书 4.4) ----
+    recall_rrf_k: int = 60
+    recall_factor_alpha: float = 0.5
+    recall_mood_beta: float = 0.2
+    recall_reinforce_multiplier: float = 1.5
+    recall_forgetting_factor_cap: float = 300.0
 
     # ---- White-painting collection tier (白皮书 2.3 动态粒度路由·收集端) ----
     # 白描收集时对主要角色（S/A 或单人核心用户）落盘的默认档位字段：l3_decision / l2_interaction / l1_mention。

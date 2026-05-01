@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 
-# 回忆服务：向量检索 + 混合打分（相似度/时间衰减/角色重要性/AE）+ 懒摘要降级 + 语义卡片注入。
+# 回忆服务：事件流 + 白描流检索、RRF 融合、遗忘/情绪修饰与懒摘要降级。
 # 总长约束约 1/6.6 上下文（config.physical_redline）。对照白皮书 4.4。
 
 from ..config import REMSConfig
@@ -107,7 +108,7 @@ class RecallService:
                 b_query += "\n" + "\n".join(snapshot_texts)
                 
         hits_b = self._get_stream_b_hits(b_query)
-        stream_b: dict[str, tuple[Event, float]] = {}
+        stream_b: dict[str, tuple[Event, float, float]] = {}
         for hit in hits_b:
             wp_id = hit["wp_id"]
             try:
@@ -129,34 +130,12 @@ class RecallService:
                 continue
                 
             raw_sim = 1.0 - hit.get("distance", 1.0)
-            score = self._hybrid_score(event, raw_sim) * f_score.effective_forgetting
+            score = self._hybrid_score(event, raw_sim)
             
             if event_id not in stream_b or stream_b[event_id][1] < score:
-                stream_b[event_id] = (event, score)
+                stream_b[event_id] = (event, score, f_score.effective_forgetting)
 
-        # Merge streams
-        sorted_a = sorted(stream_a.items(), key=lambda x: x[1][1], reverse=True)
-        sorted_b = sorted(stream_b.items(), key=lambda x: x[1][1], reverse=True)
-        
-        intersection_ids = set(stream_a.keys()).intersection(set(stream_b.keys()))
-        merged_events: list[tuple[Event, float]] = []
-        
-        intersection_items = []
-        for eid in intersection_ids:
-            max_score = max(stream_a[eid][1], stream_b[eid][1])
-            intersection_items.append((stream_a[eid][0], max_score))
-        intersection_items.sort(key=lambda x: x[1], reverse=True)
-        merged_events.extend(intersection_items[:40])
-        
-        used_ids = {e.event_id for e, _ in merged_events}
-        a_surplus = [v for k, v in sorted_a if k not in used_ids][:10]
-        used_ids.update(e.event_id for e, _ in a_surplus)
-        b_surplus = [v for k, v in sorted_b if k not in used_ids][:10]
-        
-        merged_events.extend(a_surplus)
-        merged_events.extend(b_surplus)
-        
-        scored_events = sorted(merged_events, key=lambda x: x[1], reverse=True)
+        scored_events = self._rrf_merge(stream_a, stream_b, focus_role_entries or [])
 
         # Apply intermediate filter target (1.2/6.6)
         redline = self._config.physical_redline
@@ -178,7 +157,6 @@ class RecallService:
             current_len += len(text)
 
         block = self._assemble_block(filtered_events, focus_role_ids=focus_role_ids or set())
-        block = self._append_semantic_cards(block, filtered_events)
         
         # 恢复逻辑（Recovery Logic）: 当事件被实际回忆（即包含在 block 中），
         # 加强该事件包含的所有角色白描的遗忘因子，实现回忆后记忆加强。
@@ -189,13 +167,54 @@ class RecallService:
             for role_entry in event.role_list:
                 wp_entry = self._role_repo.get_white_painting_by_event(role_entry.role_id, event.event_id)
                 if wp_entry:
-                    # 恢复系数：每次回忆，将遗忘因子在现有基础上增加 1.5 倍（可配置，或简单粗暴乘以 1.5 并更新访问时间）
-                    new_factor = min(wp_entry.forgetting_factor * 1.5, wp_entry.base_forgetting_factor)
-                    if new_factor < 1.0:
-                        new_factor = 1.0
+                    new_factor = min(
+                        max(wp_entry.forgetting_factor, 1.0) * self._config.recall_reinforce_multiplier,
+                        self._config.recall_forgetting_factor_cap,
+                    )
                     self._role_repo.update_white_painting_access(role_entry.role_id, event.event_id, new_factor)
 
         return block
+
+    def _rrf_merge(
+        self,
+        stream_a: dict[str, tuple[Event, float]],
+        stream_b: dict[str, tuple[Event, float, float]],
+        focus_role_entries: list["EventRoleEntry"],
+    ) -> list[tuple[Event, float]]:
+        sorted_a = sorted(stream_a.items(), key=lambda x: x[1][1], reverse=True)
+        sorted_b = sorted(stream_b.items(), key=lambda x: x[1][1], reverse=True)
+        rank_a = {eid: idx + 1 for idx, (eid, _) in enumerate(sorted_a)}
+        rank_b = {eid: idx + 1 for idx, (eid, _) in enumerate(sorted_b)}
+        event_ids = set(rank_a) | set(rank_b)
+        current_valence = self._current_query_valence(focus_role_entries)
+
+        merged: list[tuple[Event, float]] = []
+        for eid in event_ids:
+            event = stream_a[eid][0] if eid in stream_a else stream_b[eid][0]
+            rrf = 0.0
+            if eid in rank_a:
+                rrf += 1.0 / (self._config.recall_rrf_k + rank_a[eid])
+            if eid in rank_b:
+                rrf += 1.0 / (self._config.recall_rrf_k + rank_b[eid])
+
+            effective_forgetting = stream_b[eid][2] if eid in stream_b else 1.0
+            factor_modifier = 1.0 + self._config.recall_factor_alpha * math.log10(1.0 + max(effective_forgetting, 0.0))
+            mood_modifier = self._mood_modifier(event.event_valence, current_valence)
+            merged.append((event, rrf * factor_modifier * mood_modifier))
+
+        return sorted(merged, key=lambda x: x[1], reverse=True)[:60]
+
+    def _current_query_valence(self, focus_role_entries: list["EventRoleEntry"]) -> float:
+        if not focus_role_entries:
+            return 0.0
+        return sum(e.emotional_model.valence for e in focus_role_entries) / len(focus_role_entries)
+
+    def _mood_modifier(self, event_valence: float, current_valence: float) -> float:
+        if event_valence == 0.0 or current_valence == 0.0:
+            return 1.0
+        if event_valence * current_valence <= 0:
+            return 1.0
+        return 1.0 + self._config.recall_mood_beta * (event_valence * current_valence)
 
     # ------------------------------------------------------------------
     def build_context_package(
@@ -422,41 +441,6 @@ class RecallService:
 
         block = RecallBlock(items=current_items)
         block.recompute_length()
-        return block
-
-    # ------------------------------------------------------------------
-    def _append_semantic_cards(
-        self,
-        block: RecallBlock,
-        scored: list[tuple[Event, float]],
-    ) -> RecallBlock:
-        """Inject semantic-card summaries for top-scoring roles (if space allows).
-
-        在向量打分靠前的若干事件中收集角色 ID，去重后拉取 ``SemanticCard``；若拼接 ``card_text`` 后仍不超过
-        ``physical_redline``，向 ``RecallBlock`` 追加伪条目（``event_id`` 以 ``CARD:`` 前缀），
-        以便对话模型直接读取压缩状态（白皮书 2.3与 4.4）。
-        """
-        ceiling = self._config.physical_redline
-        seen_roles: set[str] = set()
-
-        for event, _ in scored[:5]:
-            for re in event.role_list:
-                if re.role_id in seen_roles:
-                    continue
-                seen_roles.add(re.role_id)
-                card = self._role_repo.get_semantic_card(re.role_id)
-                if not card or not card.data:
-                    continue
-                card_text = f"[语义卡片:{re.role_id}] {card.data}"
-                if block.total_length + len(card_text) <= ceiling:
-                    block.items.append(RecallItem(
-                        event_id=f"CARD:{re.role_id}",
-                        content=card_text,
-                        score=1.0,
-                        summary_level="card",
-                    ))
-                    block.recompute_length()
-
         return block
 
     # ------------------------------------------------------------------

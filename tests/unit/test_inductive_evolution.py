@@ -70,3 +70,19 @@ def test_abstract_insight_switch():
 
     assert "`insight`：开启" in user_prompt
     assert abstract.insight == "张三倾向通过连续会议推进不确定事项。"
+
+
+def test_target_content_len_is_1_2x_average():
+    config = REMSConfig()
+    llm = _DummyJSONLLM({"content_raw": "抽象事件"})
+    skill = InductiveEvolutionSkill(llm, config)
+    events = [
+        Event(content_raw="a" * 10),
+        Event(content_raw="b" * 20),
+    ]
+
+    skill.synthesize(events)
+
+    assert llm.last_messages is not None
+    user_prompt = llm.last_messages[1]["content"]
+    assert "目标约 18 字" in user_prompt

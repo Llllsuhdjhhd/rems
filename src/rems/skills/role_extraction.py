@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-# 角色抽取：从 L0 得到 role_list 候选、快照层级与 Vedana/Klesha；支持已知角色表去代词化（白皮书 2.1）。
+# 角色抽取：从 L0 得到 role_list 候选、快照层级与 8 维情绪；支持已知角色表去代词化（白皮书 2.1）。
 
 from pydantic import BaseModel, Field
 
@@ -11,12 +11,11 @@ from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import ROLE_EXTRACTION_SYSTEM, ROLE_EXTRACTION_USER, build_user_mode_block
 from ..models.event import (
+    BasicEmotionVector,
     EmotionalModel,
     EventRoleEntry,
     Importance,
-    Klesha,
     RoleSnapshot,
-    Vedana,
 )
 from ..models.role import Role
 
@@ -37,7 +36,7 @@ class RoleExtractionResult(BaseModel):
 
 
 class RoleExtractionSkill:
-    """Extracts structured roles (snapshots + Vedana/Klesha) from raw event text via LLM JSON.
+    """Extracts structured roles (snapshots + 8-d emotion) from raw event text via LLM JSON.
 
     将 ``content_raw`` 与可选 ``known_roles`` 描述一并送入 ``role_extraction`` 模型，解析为
     ``ExtractedRole`` 列表；``to_event_role_entry`` 再转为持久化用的 ``EventRoleEntry``（白皮书 2.1，去代词化在 prompt 层强调）。
@@ -79,17 +78,14 @@ class RoleExtractionSkill:
         for rd in data.get("roles", []):
             snap = rd.get("snapshot") or {}
             emo = rd.get("emotion") or {}
-            vedana_d = emo.get("vedana") or {}
-            klesha_d = emo.get("klesha") or {}
-
-            # 情感鲁棒解析：处理模型可能返回单一数值而非字典的情况
-            v_init = {}
-            if isinstance(vedana_d, dict):
-                v_init = {k: float(v) for k, v in vedana_d.items() if k in Vedana.model_fields}
-            
-            k_init = {}
-            if isinstance(klesha_d, dict):
-                k_init = {k: float(v) for k, v in klesha_d.items() if k in Klesha.model_fields}
+            emotion_init = {}
+            if isinstance(emo, dict):
+                emotion_init = {
+                    k: _safe_float(v)
+                    for k, v in emo.items()
+                    if k in BasicEmotionVector.model_fields
+                }
+            emotion = BasicEmotionVector(**emotion_init)
 
             extracted.append(ExtractedRole(
                 role_id=rd.get("role_id"),
@@ -101,10 +97,7 @@ class RoleExtractionSkill:
                     l2_interaction=snap.get("l2_interaction"),
                     l3_decision=snap.get("l3_decision"),
                 ),
-                emotional_model=EmotionalModel(
-                    vedana=Vedana(**v_init),
-                    klesha=Klesha(**k_init),
-                ),
+                emotional_model=EmotionalModel.from_emotion(emotion),
             ))
 
         return RoleExtractionResult(
@@ -119,3 +112,10 @@ class RoleExtractionSkill:
             role_snapshot=er.snapshot,
             emotional_model=er.emotional_model,
         )
+
+
+def _safe_float(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0

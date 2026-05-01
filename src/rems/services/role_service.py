@@ -2,43 +2,24 @@ from __future__ import annotations
 
 import logging
 import math
-import secrets
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
-# 角色服务：注册、白描追加、语义卡片 LLM 刷新、基于 AE 的白描摘要权重（白皮书第 2 章）。
+# 角色服务：注册、白描追加、基于 arousal 的白描摘要权重（白皮书第 2 章）。
 
 from ..config import REMSConfig, UserMode
-from ..llm.provider import LLMProvider
 from ..models.event import Event, EventRoleEntry, Importance
-from ..models.role import Role, SemanticCard, WhitePaintingEntry, generate_role_id
+from ..models.role import Role, WhitePaintingEntry, generate_role_id
 from ..skills.role_extraction import ExtractedRole, RoleExtractionSkill
 from ..storage.repository import RoleRepository
 
 logger = logging.getLogger(__name__)
 
-# Prompt for semantic-card update (lightweight, use cheap model)
-_CARD_SYSTEM = """\
-你是 REMS 角色语义卡片维护组件。根据角色的最新白描条目，更新并精炼该角色的高密度语义状态卡片。
-卡片存储极致压缩的键值对，例如核心偏好、性格均值、最近状态、长期目标等维度。
-最多保留 {max_keys} 个 key，优先保留高置信度、高频出现的信息。
-输出严格 JSON（flat dict 或嵌套 dict 均可），不要附加解释。"""
-
-_CARD_USER = """\
-## 当前卡片
-{current_card}
-
-## 最新白描条目（最近 {n} 条）
-{recent_entries}
-
-请输出更新后的卡片 JSON："""
-
-
 class RoleService:
-    """Manages global role registry, white-painting system, and semantic cards.
+    """Manages global role registry and the white-painting system.
 
     维护全局 ``role_id`` 注册、按时间排序的白描流水，以及在后台（本实现为同进程同步调用）
-    由 LLM 维护的语义卡片；并提供基于 AE 的白描摘要加权抽取，体现动态遗忘（白皮书第 2 章）。
+    并提供基于 arousal 的白描摘要加权抽取，体现动态遗忘（白皮书第 2 章）。
     """
 
     def __init__(
@@ -46,13 +27,12 @@ class RoleService:
         config: REMSConfig,
         role_repo: RoleRepository,
         role_skill: RoleExtractionSkill,
-        llm: LLMProvider | None = None,
+        llm: object | None = None,
         vector_store: "VectorStore | None" = None,
     ):
         self._config = config
         self._repo = role_repo
         self._skill = role_skill
-        self._llm = llm
         self._vector_store = vector_store
 
     # ------------------------------------------------------------------
@@ -99,8 +79,6 @@ class RoleService:
         if event.is_abstract:
             return
 
-        event_ae = event.affective_energy
-
         for entry in event.role_list:
             role = self._repo.get(entry.role_id)
             if role is None:
@@ -108,20 +86,8 @@ class RoleService:
 
             summary_text = self._pick_wp_summary(entry)
 
-            # Role-level AE: per-role emotion intensity
-            v = entry.emotional_model.vedana
-            k = entry.emotional_model.klesha
-            vedana_peak = max(v.joy, v.suffering, v.happiness, v.worry, v.equanimity)
-            klesha_peak = max(k.greed, k.anger, k.ignorance, k.pride, k.doubt, k.wrong_view)
-            role_ae = min((vedana_peak + klesha_peak) / 2.0, 1.0)
-            # memory_weight uses the higher of event-level and role-level AE
-            memory_weight = max(role_ae, event_ae)
-
-            # 初始遗忘因子：情绪极端时给予极高的初始值（例如最高达100）
-            base_forgetting = 1.0
-            if memory_weight >= self._config.ae_high_threshold:
-                excess = (memory_weight - self._config.ae_high_threshold) / (1.0 - self._config.ae_high_threshold + 1e-6)
-                base_forgetting = 1.0 + excess * 99.0
+            memory_weight = min(max(entry.emotional_model.arousal, 0.0), 1.0)
+            base_forgetting = 100.0 * (memory_weight ** self._config.emotion_arousal_gamma)
 
             wp = WhitePaintingEntry(
                 event_id=event.event_id,
@@ -143,13 +109,6 @@ class RoleService:
                     metadata={"forgetting_factor": base_forgetting}
                 )
             logger.debug("WP appended for %s from event %s (AE=%.2f)", role.role_id, event.event_id, memory_weight)
-
-            # 语义卡片（insight 任务）只对「主要角色」(S/A 或单人模式核心用户) 且 ``enable_insight`` 时刷新，
-            # 次要角色跳过以节省 LLM 调用；与收集端的动态粒度路由一致（白皮书 2.3）。
-            if self._is_primary_role(entry):
-                self._refresh_semantic_card(role.role_id)
-            else:
-                logger.debug("Skip semantic-card refresh for minor role %s", role.role_id)
 
     # ------------------------------------------------------------------
     # Dynamic granularity routing — 收集端（白皮书 2.3）
@@ -204,50 +163,6 @@ class RoleService:
         return False
 
     # ------------------------------------------------------------------
-    # Semantic card maintenance
-    # ------------------------------------------------------------------
-
-    def _refresh_semantic_card(self, role_id: str, recent_n: int = 10) -> None:
-        if not self._config.enable_insight:
-            return
-        if self._llm is None:
-            return
-        try:
-            entries = self._repo.get_white_painting(role_id, limit=recent_n)
-            if not entries:
-                return
-
-            existing_card = self._repo.get_semantic_card(role_id)
-            current_card_json = (existing_card.data if existing_card else {})
-
-            recent_text = "\n".join(
-                f"[{e.create_time.strftime('%Y-%m-%d')}] ({e.importance.value if hasattr(e.importance, 'value') else e.importance}) AE={e.memory_weight:.2f} {e.role_summary}"
-                for e in entries[-recent_n:]
-            )
-
-            sys_msg = _CARD_SYSTEM.format(max_keys=self._config.semantic_card_max_keys)
-            user_msg = _CARD_USER.format(
-                current_card=current_card_json,
-                n=recent_n,
-                recent_entries=recent_text,
-            )
-
-            new_data: dict[str, Any] = self._llm.complete_json(
-                "insight",
-                [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-                temperature=0.1,
-            )
-
-            card = existing_card or SemanticCard(role_id=role_id)
-            card.merge(new_data, max_keys=self._config.semantic_card_max_keys)
-            self._repo.save_semantic_card(card)
-        except Exception:
-            logger.debug("Semantic card refresh failed for %s", role_id, exc_info=True)
-
-    def get_semantic_card(self, role_id: str) -> Optional[SemanticCard]:
-        return self._repo.get_semantic_card(role_id)
-
-    # ------------------------------------------------------------------
     # Dynamic forgetting: weight-based decay for white-painting retrieval
     # ------------------------------------------------------------------
 
@@ -291,9 +206,7 @@ class RoleService:
             if is_penalized:
                 # 受惩罚条目：施加时间半衰 + AE 遗忘因子
                 age_days = max((now - e.create_time).total_seconds() / 86400, 0.0)
-                half_life = self._config.wp_half_life_days * (
-                    self._config.ae_forgetting_multiplier if e.memory_weight >= self._config.ae_high_threshold else 1.0
-                )
+                half_life = self._config.wp_half_life_days
                 retention = math.exp(-0.693 * age_days / half_life)
                 score = e.memory_weight * 0.4 + retention * 0.6
             else:
@@ -348,7 +261,7 @@ class RoleService:
                     er.name.lower() in ("null", "none", "unknown", "核心用户", "未知角色")
                 )
                 if is_invalid:
-                    clean_name = f"未知人物_{secrets.token_hex(2)}"
+                    clean_name = f"未知人物_{generate_role_id()[-4:]}"
                     mark_suspicious = True  # 仲裁边界不定产生垃圾名称，强制标记为可疑
                 
                 new_role = self.register_role(clean_name, er.entity_type, is_suspicious=mark_suspicious)

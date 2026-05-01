@@ -71,6 +71,15 @@ class VectorStore:
             self._ef = SentenceTransformerEmbeddingFunction(
                 model_name=config.embedding.model_name,
             )
+        self._in_memory = not bool(config.storage.chromadb_path)
+        self._memory_events: dict[str, dict[str, Any]] = {}
+        self._memory_wp: dict[str, dict[str, Any]] = {}
+        if self._in_memory:
+            self._client = None
+            self._collection = None
+            self._wp_collection = None
+            return
+
         if config.storage.chromadb_path:
             self._client = chromadb.PersistentClient(path=config.storage.chromadb_path)
         else:
@@ -93,6 +102,13 @@ class VectorStore:
         text: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        if self._in_memory:
+            self._memory_events[event_id] = {
+                "document": text,
+                "metadata": metadata or {},
+                "embedding": self._ef.embed_query(text)[0],
+            }
+            return
         self._collection.upsert(
             ids=[event_id],
             documents=[text],
@@ -106,6 +122,9 @@ class VectorStore:
         n_results: int = 10,
         where: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        if self._in_memory:
+            return self._memory_search(self._memory_events, query, n_results, where, id_key="event_id")
+
         kwargs: dict[str, Any] = {"query_texts": [query], "n_results": n_results}
         if where:
             kwargs["where"] = where
@@ -128,12 +147,17 @@ class VectorStore:
 
     # ------------------------------------------------------------------
     def delete_event(self, event_id: str) -> None:
+        if self._in_memory:
+            self._memory_events.pop(event_id, None)
+            return
         try:
             self._collection.delete(ids=[event_id])
         except Exception:
             logger.warning("Failed to delete event %s from vector store", event_id)
 
     def count(self) -> int:
+        if self._in_memory:
+            return len(self._memory_events)
         return self._collection.count()
 
     # ------------------------------------------------------------------
@@ -150,6 +174,13 @@ class VectorStore:
         meta = metadata or {}
         meta["role_id"] = role_id
         meta["event_id"] = event_id
+        if self._in_memory:
+            self._memory_wp[wp_id] = {
+                "document": text,
+                "metadata": meta,
+                "embedding": self._ef.embed_query(text)[0],
+            }
+            return
         self._wp_collection.upsert(
             ids=[wp_id],
             documents=[text],
@@ -162,6 +193,9 @@ class VectorStore:
         n_results: int = 10,
         where: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        if self._in_memory:
+            return self._memory_search(self._memory_wp, query, n_results, where, id_key="wp_id")
+
         kwargs: dict[str, Any] = {"query_texts": [query], "n_results": n_results}
         if where:
             kwargs["where"] = where
@@ -183,7 +217,69 @@ class VectorStore:
         return items
 
     def delete_white_painting(self, role_id: str, event_id: str) -> None:
+        if self._in_memory:
+            self._memory_wp.pop(f"{role_id}::{event_id}", None)
+            return
         try:
             self._wp_collection.delete(ids=[f"{role_id}::{event_id}"])
         except Exception:
             logger.warning("Failed to delete WP %s::%s from vector store", role_id, event_id)
+
+    def _memory_search(
+        self,
+        store: dict[str, dict[str, Any]],
+        query: str,
+        n_results: int,
+        where: dict[str, Any] | None,
+        *,
+        id_key: str,
+    ) -> list[dict[str, Any]]:
+        query_embedding = self._ef.embed_query(query)[0]
+        rows: list[dict[str, Any]] = []
+        for item_id, row in store.items():
+            metadata = row["metadata"]
+            if where and not self._matches_where(metadata, where):
+                continue
+            distance = 1.0 - self._cosine(query_embedding, row["embedding"])
+            rows.append({
+                id_key: item_id,
+                "document": row["document"],
+                "distance": distance,
+                "metadata": metadata,
+            })
+        rows.sort(key=lambda item: item["distance"])
+        return rows[:n_results]
+
+    @staticmethod
+    def _cosine(a: list[float], b: list[float]) -> float:
+        denom = (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))) or 1.0
+        return sum(x * y for x, y in zip(a, b)) / denom
+
+    @classmethod
+    def _matches_where(cls, metadata: dict[str, Any], where: dict[str, Any]) -> bool:
+        if "$and" in where:
+            return all(cls._matches_where(metadata, clause) for clause in where["$and"])
+        if "$or" in where:
+            return any(cls._matches_where(metadata, clause) for clause in where["$or"])
+        for key, expected in where.items():
+            actual = metadata.get(key)
+            if key == "status" and expected == "active" and actual is None:
+                continue
+            if isinstance(expected, dict):
+                if "$gte" in expected and not (actual is not None and actual >= expected["$gte"]):
+                    return False
+                if "$lt" in expected and not (actual is not None and actual < expected["$lt"]):
+                    return False
+                if "$contains" in expected:
+                    needle = expected["$contains"]
+                    if isinstance(actual, str):
+                        if needle not in actual:
+                            return False
+                    elif isinstance(actual, list):
+                        if needle not in actual:
+                            return False
+                    else:
+                        return False
+            elif actual != expected:
+                return False
+        return True

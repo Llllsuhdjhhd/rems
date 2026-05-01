@@ -50,10 +50,10 @@ class UnclosedEvent(BaseModel):
 
 
 class RecallItem(BaseModel):
-    """One recalled snippet placed into the recall block (event or semantic-card pseudo-entry).
+    """One recalled snippet placed into the recall block."""
 
-    单条回忆条目：``event_id`` 通常为真实事件 ID，语义卡片注入时使用 ``CARD:{role_id}`` 形式；
-    ``content`` 为已按预算降级后的文本；``score`` 为混合相关度；``summary_level`` 标记选用的摘要层级或 ``card``/``ultra``。
+    """单条回忆条目：``event_id`` 为真实事件 ID；
+    ``content`` 为已按预算降级后的文本；``score`` 为融合相关度；``summary_level`` 标记选用的摘要层级或 ``ultra``。
     """
 
     event_id: str

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import secrets
-import time
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -9,7 +7,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 # 事件与情感量化领域模型；对齐《REMS 记忆系统规范解析》第 1 章（L0/L1~Ln、角色快照、
-# Vedana/Klesha、抽象字段、墓碑）及 AE 工程化抗遗忘逻辑。
+# 8 维基础情绪、抽象字段、墓碑）及白描遗忘逻辑。
 
 
 import uuid
@@ -44,36 +42,61 @@ class EventStatus(str, Enum):
 
 
 # ---------- Emotional model ----------
-# 白皮书 1.1.4：五受、六烦恼的工程量化字段名采用英文键，与 LLM JSON 输出对齐。
+# 白皮书 2.5：LLM 只输出 8 维基础情绪；arousal / valence 由后端合成。
 
-class Vedana(BaseModel):
-    """五受量化 — joy/suffering/happiness/worry/equanimity.
+class BasicEmotionVector(BaseModel):
+    """8 basic emotions emitted by the LLM, each normalized to [0, 1]."""
 
-    佛学五受（乐、苦、喜、忧、舍）在工程上映射为上述英文字段，便于 LLM JSON 键稳定输出（白皮书 1.1.4）。
-    """
-    joy: float = 1.0
-    suffering: float = 1.0
-    happiness: float = 1.0
-    worry: float = 1.0
-    equanimity: float = 1.0
+    anger: float = 0.0
+    fear: float = 0.0
+    joy: float = 0.0
+    sadness: float = 0.0
+    surprise: float = 0.0
+    disgust: float = 0.0
+    trust: float = 0.0
+    anticipation: float = 0.0
 
-
-class Klesha(BaseModel):
-    """六根本烦恼量化 — greed/anger/ignorance/pride/doubt/wrong_view.
-
-    贪、嗔、痴、慢、疑、恶见映射为上述英文键；与 Vedana 一起构成事件内情感量化，驱动 AE 与 NPC 增量等（1.1.4）。
-    """
-    greed: float = 1.0
-    anger: float = 1.0
-    ignorance: float = 1.0
-    pride: float = 1.0
-    doubt: float = 1.0
-    wrong_view: float = 1.0
+    def clamped(self) -> BasicEmotionVector:
+        values = {
+            name: min(max(float(getattr(self, name, 0.0)), 0.0), 1.0)
+            for name in type(self).model_fields
+        }
+        return BasicEmotionVector(**values)
 
 
 class EmotionalModel(BaseModel):
-    vedana: Vedana = Field(default_factory=Vedana)
-    klesha: Klesha = Field(default_factory=Klesha)
+    """Event-local and rolling affective state for one role snapshot."""
+
+    emotion: BasicEmotionVector = Field(default_factory=BasicEmotionVector)
+    arousal: float = 0.0
+    valence: float = 0.0
+    rolling_arousal: float = 0.0
+    rolling_valence: float = 0.0
+    energy: float = 0.0
+
+    @classmethod
+    def from_emotion(cls, emotion: BasicEmotionVector) -> EmotionalModel:
+        emotion = emotion.clamped()
+        arousal = max(
+            emotion.anger,
+            emotion.fear,
+            emotion.joy,
+            emotion.sadness,
+            emotion.disgust,
+            emotion.surprise,
+            emotion.anticipation,
+        )
+        positive = emotion.joy + emotion.trust
+        negative = emotion.anger + emotion.fear + emotion.sadness + emotion.disgust
+        valence = (positive - negative) / (positive + negative + 1e-6)
+        return cls(
+            emotion=emotion,
+            arousal=arousal,
+            valence=valence,
+            rolling_arousal=arousal,
+            rolling_valence=valence,
+            energy=arousal,
+        )
 
 
 # ---------- Role within an event ----------
@@ -156,10 +179,7 @@ class Event(BaseModel):
     # 墓碑化：逻辑上被修正覆盖，保留审计但回忆排除（白皮书 4.3）。
     is_tombstoned: bool = False
 
-    # 激活能量（Activation Energy，白皮书 2.5 与记忆初始值硬绑定）：
-    # 由 EMA + 事件级 AE 计算；重大情感事件（极乐/大苦）在封存时写入较高初值，
-    # 作为进入回忆混合打分的独立权重（与 AE 组合但不等同：AE 是事件瞬时最大值，
-    # activation_energy 是与角色长期心境做动态调节后的"落地权重"）。
+    # 激活能量：新版以角色 arousal / rolling energy 聚合得到，用于检索与审计。
     activation_energy: float = 0.0
 
     # 动态压缩率（白皮书 1.2）：封存后实际的 sum_len / raw_len，用于审计与追踪。
@@ -170,33 +190,31 @@ class Event(BaseModel):
             self.event_length = len(self.content_raw)
 
     # ------------------------------------------------------------------
-    # Affective Energy helpers
+    # Affective helpers
     # ------------------------------------------------------------------
 
     @property
     def affective_energy(self) -> float:
-        """Event-level AE based on deviation from baseline (1.0).
-
-        [接口占位] 当前仅提供临时算法：计算全要素偏离基础值 1.0 的最大波动（绝对差值）平均作为初步实现。
-        ※ TODO: 这里的算法留出接口，后续需由业务或数据科学重新评估及重新实写。
-        """
+        """Event-level affective intensity, defined as max role arousal."""
         if not self.role_list:
             return 0.0
-            
-        max_ae = 0.0
-        for entry in self.role_list:
-            v = entry.emotional_model.vedana
-            k = entry.emotional_model.klesha
-            
-            # 使用与 1.0 基础值的偏离程度（绝对值）作为波动能量的粗略估计
-            vedana_peak_diff = max(abs(v.joy-1.0), abs(v.suffering-1.0), abs(v.happiness-1.0), abs(v.worry-1.0), abs(v.equanimity-1.0))
-            klesha_peak_diff = max(abs(k.greed-1.0), abs(k.anger-1.0), abs(k.ignorance-1.0), abs(k.pride-1.0), abs(k.doubt-1.0), abs(k.wrong_view-1.0))
-            
-            ae = (vedana_peak_diff + klesha_peak_diff) / 2.0
-            max_ae = max(max_ae, ae)
-            
-        # 限制在某一合理上限或继续返回 0~1 的百分比
-        return min(max_ae, 1.0)
+        return min(max(entry.emotional_model.arousal for entry in self.role_list), 1.0)
+
+    @property
+    def event_valence(self) -> float:
+        """Mean event valence across role snapshots."""
+        if not self.role_list:
+            return 0.0
+        total = sum(entry.emotional_model.valence for entry in self.role_list)
+        return total / len(self.role_list)
+
+    @property
+    def rolling_valence(self) -> float:
+        """Mean rolling valence across role snapshots."""
+        if not self.role_list:
+            return 0.0
+        total = sum(entry.emotional_model.rolling_valence for entry in self.role_list)
+        return total / len(self.role_list)
 
     @property
     def mid_summary_key(self) -> str:

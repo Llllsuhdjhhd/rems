@@ -152,15 +152,6 @@ def list_roles():
     return [r.model_dump(mode="json", exclude={"white_painting"}) for r in roles]
 
 
-@router.get("/roles/{role_id}/card")
-def get_semantic_card(role_id: str):
-    pipeline = get_pipeline()
-    card = pipeline.role_service.get_semantic_card(role_id)
-    if not card:
-        raise HTTPException(404, f"No semantic card for role {role_id}")
-    return card.model_dump(mode="json")
-
-
 @router.get("/roles/{role_id}/conflicts")
 def detect_conflicts(role_id: str, top_n: int = 50):
     pipeline = get_pipeline()

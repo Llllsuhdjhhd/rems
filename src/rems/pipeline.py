@@ -63,7 +63,7 @@ class ProcessingMode(str, Enum):
         ``= False``），不产出人类可见的文本回复。
     NPC_AGENT
         生成式 NPC / 沙盒 Agent。除了 ContextPackage 外，还输出结构化 ``npc_directives``
-        （动作 + Klesha/Vedana 增量等），交给下游 Directive Parser 转为引擎调用。
+        （动作 + 情绪增量等），交给下游 Directive Parser 转为引擎调用。
     """
     DIALOGUE = "dialogue"
     PASSIVE_LOG = "passive_log"
@@ -302,14 +302,14 @@ class REMSPipeline:
         )
 
         # 登记本次回忆块 event_id 到 recall_log（白皮书 §3.2 唯一抽象触发路径的输入流）。
-        # 只记录真实 basic/abstract 事件，过滤 CARD:* 伪条目；抽象事件 id 同样进入命名空间，
+        # 只记录真实 basic/abstract 事件；抽象事件 id 同样进入命名空间，
         # 便于后续更高阶抽象在同一空间继续挖掘。
         if ctx.recall_block.items:
             recall_event_ids: list[str] = []
             seen_ids: set[str] = set()
             for it in ctx.recall_block.items:
                 eid = it.event_id
-                if not eid or eid.startswith("CARD:") or eid in seen_ids:
+                if not eid or eid in seen_ids:
                     continue
                 seen_ids.add(eid)
                 recall_event_ids.append(eid)
@@ -404,7 +404,7 @@ class REMSPipeline:
 
         为指定 ``npc_role_id`` 生成结构化 NPC 指令：在当前 ``ContextPackage`` 的回忆条目中，
         用启发式统计该 ID 在文本中的出现次数以估计威胁程度，并映射为 ``idle`` / ``watch`` /
-        ``flee`` 等 ``action`` 及 ``klesha_delta``。下游 Directive Parser 将其翻译为
+        ``flee`` 等 ``action`` 及 ``emotion_delta``。下游 Directive Parser 将其翻译为
         寻路、动画或状态机变更（白皮书 5.3）；本实现为轻量示例，非完整游戏 AI。
         """
         directives: list[dict] = []
@@ -418,19 +418,19 @@ class REMSPipeline:
                 threat_score += 0.2  # heuristic bump per mention
 
         action = "idle"
-        klesha_delta: dict[str, float] = {}
+        emotion_delta: dict[str, float] = {}
         if threat_score >= 0.6:
             action = "flee"
-            klesha_delta = {"anger": 0.3, "ignorance": -0.1}
+            emotion_delta = {"fear": 0.4, "anger": 0.2}
         elif threat_score >= 0.3:
             action = "watch"
-            klesha_delta = {"doubt": 0.2}
+            emotion_delta = {"anticipation": 0.2, "fear": 0.1}
 
         if action != "idle":
             directives.append({
                 "npc_role_id": npc_role_id,
                 "action": action,
-                "klesha_delta": klesha_delta,
+                "emotion_delta": emotion_delta,
                 "reason": f"threat_score={threat_score:.2f}",
             })
         return directives
@@ -444,11 +444,9 @@ class REMSPipeline:
         if not role:
             return {"error": f"Role '{name_or_id}' not found"}
         summary = self.role_service.get_white_painting_summary(role.role_id)
-        card = self.role_service.get_semantic_card(role.role_id)
         return {
-            "role": role.model_dump(mode="json", exclude={"white_painting", "semantic_card"}),
+            "role": role.model_dump(mode="json", exclude={"white_painting"}),
             "white_painting_summary": summary,
-            "semantic_card": card.data if card else {},
         }
 
     def run_evolution(self) -> list[Event]:

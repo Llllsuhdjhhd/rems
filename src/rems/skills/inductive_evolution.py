@@ -41,7 +41,7 @@ class InductiveEvolutionSkill:
         """
         evidence = evidence_events or events
         event_contents = self._build_content_raw_text(evidence)
-        target_content_len = self._average_content_len(evidence)
+        target_content_len = self._target_content_len(evidence)
         insight_enabled = self._config.enable_abstract_insight
         insight_instruction = (
             "- `insight`：开启。请提炼跨事件的认知/规律，强调角色行为模式或关系变化；不要复述事实本身。"
@@ -103,10 +103,11 @@ class InductiveEvolutionSkill:
         return "\n\n".join(lines)
 
     @staticmethod
-    def _average_content_len(events: list[Event]) -> int:
+    def _target_content_len(events: list[Event]) -> int:
         if not events:
             return 0
-        return max(1, int(sum(len(e.content_raw) for e in events) / len(events)))
+        avg = sum(len(e.content_raw) for e in events) / len(events)
+        return max(1, int(avg * 1.2))
 
     @staticmethod
     def _build_role_context(event: Event) -> str:

@@ -51,14 +51,10 @@ class DefaultWhitePaintingRetentionStrategy:
 
         # 计算动态遗忘因子
         age_since_access = max((now - getattr(entry, "last_accessed_time", entry.create_time)).total_seconds() / 86400, 0.0)
-        half_life = self._config.wp_half_life_days * (
-            self._config.ae_forgetting_multiplier
-            if entry.memory_weight >= self._config.ae_high_threshold
-            else 1.0
-        )
+        half_life = self._config.wp_half_life_days
         forgetting_decay = math.exp(-0.693 * age_since_access / half_life)
         effective_forgetting = float(getattr(entry, "forgetting_factor", 1.0)) * forgetting_decay
-        is_silenced = effective_forgetting < 0.02
+        is_silenced = effective_forgetting < self._config.forgetting_silence_threshold
 
         if not is_penalized:
             return ForgettingScore(

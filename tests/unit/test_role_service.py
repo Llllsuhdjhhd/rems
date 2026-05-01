@@ -6,19 +6,19 @@ import pytest
 
 from rems.config import REMSConfig
 from rems.models.event import (
+    BasicEmotionVector,
     EmotionalModel,
     Event,
     EventRoleEntry,
     Importance,
     RoleSnapshot,
-    Vedana,
 )
 from rems.services.role_service import RoleService
 from rems.skills.role_extraction import RoleExtractionSkill
 from rems.storage.database import Database
 from rems.storage.repository import RoleRepository
 
-from .conftest import FakeLLM
+from tests.conftest import FakeLLM
 
 
 @pytest.fixture()
@@ -68,7 +68,7 @@ class TestWhitePainting:
                         l1_mention="Frank appeared",
                         l2_interaction="Frank went shopping",
                     ),
-                    emotional_model=EmotionalModel(vedana=Vedana(joy=0.5)),
+                    emotional_model=EmotionalModel.from_emotion(BasicEmotionVector(joy=0.5)),
                 ),
             ],
         )
@@ -77,6 +77,10 @@ class TestWhitePainting:
 
         summary = role_service.get_white_painting_summary(role.role_id)
         assert "Frank went shopping" in summary
+
+        stored = role_service.get_role(role.role_id)
+        assert stored is not None
+        assert stored.white_painting[0].base_forgetting_factor == pytest.approx(25.0)
 
     def test_abstract_events_skipped(self, role_service: RoleService):
         role = role_service.register_role("Ghost")

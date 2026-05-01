@@ -107,11 +107,7 @@ BOUNDARY_USER = """\
 # =====================================================================
 # 2. Event Enrichment — 统一的「事件摘要 + 角色抽取」技能
 # =====================================================================
-# 以 boundary 剥离出的 content_raw 为输入，一次 LLM 调用同时产出：
-# 1) L1…Ln 递归摘要（带熔断）
-# 2) 角色列表（快照层级 + Vedana/Klesha）
-# 设计要点：先强调「角色」、JSON 中 roles 在 summaries 之前，避免模型因长摘要说明漏填 roles（见
-#   ENRICHMENT_PRIORITY_ADDENDUM）。角色级语义卡片的 LLM 刷新由下游 S/A 过滤后另起调用。
+# 以 boundary 剥离出的 content_raw 为输入，生成 L1…Ln 递归摘要（带熔断）。
 
 ENRICHMENT_SYSTEM = """\
 你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，交付事件摘要：
@@ -183,7 +179,7 @@ SUMMARY_USER = """\
 # =====================================================================
 
 ROLE_EXTRACTION_SYSTEM = """\
-你是 REMS 角色提取组件。从事件原文中识别所有参与实体，并生成分级快照（Snapshot）和情感量化。
+你是 REMS 角色提取组件。从事件原文中识别所有参与实体，并生成分级快照（Snapshot）和 8 维基础情绪。
 
 核心规则：
 1. **角色重要性**：评定为 S（核心主角）/ A / B / C / D。
@@ -193,8 +189,10 @@ ROLE_EXTRACTION_SYSTEM = """\
    - **L1：骨架白描快照**。必须符合 **【L1 预算】**。极致简练，仅说明最核心的行为事实。
 3. **【层级分配策略】**：
    - **主角（S级）**：**必须**同时生成 L1、L2 和 L3，各层级间需有明显的语义密度差异。
-   - **配角（A/B/C/D）**：**仅生成 L1**。将 L2、L3 字段留空。
-4. **情感量化**：Vedana/Klesha 数值在 0-1 之间。
+   - **主要互动对象（A级）**：**必须**生成 L1 和 L2，将 L3 字段留空。
+   - **B/C/D 级角色**：**仅生成 L1**。将 L2、L3 字段留空。
+4. **情感量化**：输出 8 维基础情绪，键为 anger/fear/joy/sadness/surprise/disgust/trust/anticipation，数值在 0-1 之间。
+   后端会自行合成 arousal 与 valence，不要输出这两个字段。
 
 输出严格 JSON。"""
 
@@ -227,8 +225,14 @@ ROLE_EXTRACTION_USER = """\
         "l3_decision": "L3 文本 (仅 S 级填写)"
       }},
       "emotion": {{
-        "vedana": {{...}},
-        "klesha": {{...}}
+        "anger": 0.0,
+        "fear": 0.0,
+        "joy": 0.0,
+        "sadness": 0.0,
+        "surprise": 0.0,
+        "disgust": 0.0,
+        "trust": 0.0,
+        "anticipation": 0.0
       }}
     }}
   ]
@@ -246,7 +250,7 @@ EVOLUTION_SYSTEM = """\
 - 抽象事件**不登记任何角色**，不生成角色快照、角色级摘要、情感量化，也不触发语义卡片；
 - 但压缩 `content_raw` 时**不能漏掉关键角色/实体**：角色线索只用于帮助保留主体、行为与关系，不作为 `role_list` 输出；
 - `content_raw` 不是高阶泛化口号，也不是罗列所有原文；它应像基本事件一样抓住重点做事实压缩，保留共现事件中的主干人物、动作、对象与结果；
-- `content_raw` 的目标长度约等于输入基本事件 `content_raw` 的平均长度；
+- `content_raw` 的目标长度约等于输入叶子基本事件 `content_raw` 平均长度的 1.2 倍；
 - L1-L10 摘要不在此处生成，外层会按基本事件同规则继续递归摘要；
 - 仅当用户消息明确要求 `insight` 字段时才输出 insight；insight 是跨事件提炼出的认知/规律，不是对事实文本的再摘要；
 - **禁止**在输出中加入 `roles`、`role_list`、`emotion_trend`、`summaries` 等字段。
@@ -258,7 +262,7 @@ EVOLUTION_USER = """\
 {event_contents}
 
 ## 输出控制
-- `content_raw`：抓住重点压缩，目标约 {target_content_len} 字；保留关键角色/实体，不做角色对象输出。
+- `content_raw`：抓住重点压缩，目标约 {target_content_len} 字（叶子基本事件均值的 1.2 倍）；保留关键角色/实体，不做角色对象输出。
 {insight_instruction}
 
 返回 JSON：

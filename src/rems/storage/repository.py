@@ -6,7 +6,7 @@ from typing import Optional
 
 from ..models.event import EmotionalModel, Event, EventRoleEntry, EventStatus
 from ..models.metabolism import Shadow, UnclosedEvent
-from ..models.role import Role, SemanticCard, WhitePaintingEntry
+from ..models.role import Role, WhitePaintingEntry
 from datetime import datetime
 
 from .database import (
@@ -15,7 +15,6 @@ from .database import (
     EventRecord,
     RecallLogRecord,
     RoleRecord,
-    SemanticCardRecord,
     ShadowRecord,
     UnclosedEventRecord,
     WhitePaintingRecord,
@@ -225,8 +224,7 @@ class RoleRepository:
                 .order_by(WhitePaintingRecord.create_time)
                 .all()
             )
-            card_rec = s.get(SemanticCardRecord, role_id)
-            return self._build_role(record, entries, card_rec)
+            return self._build_role(record, entries)
 
     def list_all(self) -> list[Role]:
         with self._db.session() as s:
@@ -239,8 +237,7 @@ class RoleRepository:
                     .order_by(WhitePaintingRecord.create_time)
                     .all()
                 )
-                card_rec = s.get(SemanticCardRecord, rec.role_id)
-                result.append(self._build_role(rec, entries, card_rec))
+                result.append(self._build_role(rec, entries))
             return result
 
     def find_by_name(self, name: str) -> Optional[Role]:
@@ -333,33 +330,12 @@ class RoleRepository:
             ).scalar()
             return int(result or 0)
 
-    def save_semantic_card(self, card: SemanticCard) -> None:
-        with self._db.session() as s:
-            record = SemanticCardRecord(
-                role_id=card.role_id,
-                updated_at=card.updated_at,
-                data=card.data,
-            )
-            s.merge(record)
-            s.commit()
-
-    def get_semantic_card(self, role_id: str) -> Optional[SemanticCard]:
-        with self._db.session() as s:
-            r = s.get(SemanticCardRecord, role_id)
-            if not r:
-                return None
-            return SemanticCard(role_id=r.role_id, updated_at=r.updated_at, data=r.data or {})
-
     # ------------------------------------------------------------------
     @staticmethod
     def _build_role(
         rec: RoleRecord,
         entries: list[WhitePaintingRecord],
-        card_rec: SemanticCardRecord | None,
     ) -> Role:
-        card = None
-        if card_rec:
-            card = SemanticCard(role_id=card_rec.role_id, updated_at=card_rec.updated_at, data=card_rec.data or {})
         return Role(
             role_id=rec.role_id,
             name=rec.name,
@@ -367,7 +343,6 @@ class RoleRepository:
             aliases=rec.aliases or [],
             created_at=rec.created_at,
             white_painting=[RoleRepository._to_wp_entry(e) for e in entries],
-            semantic_card=card,
             is_suspicious=bool(rec.is_suspicious),
         )
 
