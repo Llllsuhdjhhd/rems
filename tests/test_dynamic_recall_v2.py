@@ -16,6 +16,13 @@ class TestDynamicRecall(unittest.TestCase):
         self.event_repo = MagicMock()
         self.role_repo = MagicMock()
         self.vector_store = MagicMock()
+        # 70/30 容量分层 (白皮书 §4.4) 在 RecallService 内通过 vector_store.count() 决定是否启用，
+        # 必须返回真实 int；默认 MagicMock 不会，会触发 ``int < int`` 比较 TypeError。
+        self.vector_store.count.return_value = 0
+        # 集体遗忘检查 / Stream B 命中分数计算都会问 role_repo 拿白描；MagicMock 默认会返回
+        # MagicMock 实例，后续 ``forgetting_strategy.score`` 内部对其 ``last_accessed_time``
+        # 取 ``now - dt`` 会触发类型错误。让所有"按事件取白描"的查询统一返回 None。
+        self.role_repo.get_white_painting_by_event.return_value = None
         self.service = RecallService(
             self.config, self.event_repo, self.role_repo, self.vector_store
         )

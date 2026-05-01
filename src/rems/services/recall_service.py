@@ -76,29 +76,33 @@ class RecallService:
         # 实际工程中可异步执行，此处为确保逻辑闭环，对检索到的潜在命中做实时校验。
 
         # ========================================================
-        # Dual-Stream Hybrid Recall
+        # Dual-Stream Hybrid Recall (白皮书 §4.4)
         # ========================================================
-        # Stream A: Event semantic search (with Tiered Capacity & 70/30 Rule)
+        # 关键修复（P1-7）：流 A / 流 B 在阶段 1 只持有"原始距离"，**不**与 time_decay /
+        # role_boost / arousal 等绝对量混合。Rank 直接来自按距离的升序排位；
+        # time_decay 与角色重要性、情感共振等修饰统一在阶段 2 的 RRF * Factor * Mood 里施加。
+        # 这样才符合白皮书"摒弃绝对值、用名次驱动"的设计目的。
+
+        # Stream A: 事件语义检索（含 70/30 容量分层）；存 (event, distance)
         hits_a = self._get_stream_a_hits(search_text, focus_role_ids or set())
         stream_a: dict[str, tuple[Event, float]] = {}
         for hit in hits_a:
             event = self._event_repo.get(hit["event_id"])
             if event is None or event.is_tombstoned or event.status.value == "silent":
                 continue
-            
+
             # 集体遗忘检查：若事件关联的所有角色遗忘因子均低于阈值，则静默该事件
             if self._check_and_silence_event(event):
                 continue
 
-            raw_sim = 1.0 - hit.get("distance", 1.0)
-            score = self._hybrid_score(event, raw_sim)
-            stream_a[event.event_id] = (event, score)
+            distance = float(hit.get("distance", 1.0))
+            stream_a[event.event_id] = (event, distance)
 
-        # Stream B: White-painting (Role) semantic search
-        # 优化：将当前提取的角色摘要（Snapshots）也作为检索词的一部分，实现“摘要对摘要”的精准匹配
+        # Stream B: 白描（角色）反向激活
+        # 优化：将当前提取的角色摘要（Snapshots）也作为检索词的一部分，实现"摘要对摘要"精准匹配。
         b_query = search_text
         if focus_role_entries:
-            snapshot_texts = []
+            snapshot_texts: list[str] = []
             for r in focus_role_entries:
                 if r.role_snapshot.l2_interaction:
                     snapshot_texts.append(r.role_snapshot.l2_interaction)
@@ -106,8 +110,10 @@ class RecallService:
                     snapshot_texts.append(r.role_snapshot.l1_mention)
             if snapshot_texts:
                 b_query += "\n" + "\n".join(snapshot_texts)
-                
+
         hits_b = self._get_stream_b_hits(b_query)
+        # 流 B 存 (event, effective_distance, effective_forgetting)：
+        # effective_distance = distance / max(effective_forgetting, eps)，让遗忘惩罚作用于排位本身。
         stream_b: dict[str, tuple[Event, float, float]] = {}
         for hit in hits_b:
             wp_id = hit["wp_id"]
@@ -115,7 +121,7 @@ class RecallService:
                 role_id, event_id = wp_id.split("::")
             except ValueError:
                 continue
-            
+
             event = self._event_repo.get(event_id)
             if event is None or event.is_tombstoned or event.status.value == "silent":
                 continue
@@ -123,17 +129,18 @@ class RecallService:
             wp_entry = self._role_repo.get_white_painting_by_event(role_id, event_id)
             if not wp_entry:
                 continue
-            
+
             f_score = self._forgetting_strategy.score(wp_entry, is_penalized=True)
             if f_score.is_silenced:
-                # Silenced entry: skip completely
                 continue
-                
-            raw_sim = 1.0 - hit.get("distance", 1.0)
-            score = self._hybrid_score(event, raw_sim)
-            
-            if event_id not in stream_b or stream_b[event_id][1] < score:
-                stream_b[event_id] = (event, score, f_score.effective_forgetting)
+
+            distance = float(hit.get("distance", 1.0))
+            # 用遗忘因子拉近/拉远名次：高 effective_forgetting → 距离更近（排位前移）。
+            effective_distance = distance / max(f_score.effective_forgetting, 1e-3)
+
+            existing = stream_b.get(event_id)
+            if existing is None or existing[1] > effective_distance:
+                stream_b[event_id] = (event, effective_distance, f_score.effective_forgetting)
 
         scored_events = self._rrf_merge(stream_a, stream_b, focus_role_entries or [])
 
@@ -181,24 +188,42 @@ class RecallService:
         stream_b: dict[str, tuple[Event, float, float]],
         focus_role_entries: list["EventRoleEntry"],
     ) -> list[tuple[Event, float]]:
-        sorted_a = sorted(stream_a.items(), key=lambda x: x[1][1], reverse=True)
-        sorted_b = sorted(stream_b.items(), key=lambda x: x[1][1], reverse=True)
+        """Reciprocal-Rank-Fusion + Modifier 融合（白皮书 §4.4）。
+
+        阶段 1: 各流按"距离升序"独立产出 Rank（流 A 用原始余弦距离，流 B 用按遗忘因子
+        修正后的有效距离）。
+        阶段 2:
+            ``Final = (1/(k+R_A) + 1/(k+R_B)) * Factor_Modifier * Mood_Modifier``
+            - Factor_Modifier 仅作用于流 B 命中（焦点角色对该事件的关注强度）；
+            - Mood_Modifier 在情绪同号时放大，异号时不变（避免负向召回过激）。
+        """
+        # 距离升序 → Rank 1 = 距离最近 = 语义最相关
+        sorted_a = sorted(stream_a.items(), key=lambda x: x[1][1])
+        sorted_b = sorted(stream_b.items(), key=lambda x: x[1][1])
         rank_a = {eid: idx + 1 for idx, (eid, _) in enumerate(sorted_a)}
         rank_b = {eid: idx + 1 for idx, (eid, _) in enumerate(sorted_b)}
         event_ids = set(rank_a) | set(rank_b)
         current_valence = self._current_query_valence(focus_role_entries)
+        k = self._config.recall_rrf_k
 
         merged: list[tuple[Event, float]] = []
         for eid in event_ids:
             event = stream_a[eid][0] if eid in stream_a else stream_b[eid][0]
             rrf = 0.0
             if eid in rank_a:
-                rrf += 1.0 / (self._config.recall_rrf_k + rank_a[eid])
+                rrf += 1.0 / (k + rank_a[eid])
             if eid in rank_b:
-                rrf += 1.0 / (self._config.recall_rrf_k + rank_b[eid])
+                rrf += 1.0 / (k + rank_b[eid])
 
-            effective_forgetting = stream_b[eid][2] if eid in stream_b else 1.0
-            factor_modifier = 1.0 + self._config.recall_factor_alpha * math.log10(1.0 + max(effective_forgetting, 0.0))
+            # 角色重要性 / 关注度调制：只在流 B 命中（被某个焦点角色"反向激活"）时启用。
+            if eid in stream_b:
+                effective_forgetting = stream_b[eid][2]
+                factor_modifier = 1.0 + self._config.recall_factor_alpha * math.log10(
+                    1.0 + max(effective_forgetting, 0.0)
+                )
+            else:
+                factor_modifier = 1.0
+
             mood_modifier = self._mood_modifier(event.event_valence, current_valence)
             merged.append((event, rrf * factor_modifier * mood_modifier))
 
@@ -234,14 +259,16 @@ class RecallService:
         )
 
     # ------------------------------------------------------------------
-    # Scoring (cosine + time_decay 0.15 + role_importance 0.20 + AE + activation_energy)
+    # Legacy hook（白皮书 §4.4 改造前的中间打分，主回路已切到 RRF + Modifier）
     # ------------------------------------------------------------------
 
     def _hybrid_score(self, event: Event, cosine_sim: float) -> float:
-        """Hybrid recall score.
+        """Legacy mixed score, kept only for diagnostic tracers.
 
-        现在由角色白描驱动遗忘逻辑，移除全局时间衰减（time_decay=0），
-        权重已在 DefaultRecallScoringStrategy 内部重分配至余弦相似度。
+        新版主回路（``build_recall_block`` → ``_rrf_merge``）只用"距离 → 名次 → RRF"
+        + Factor / Mood Modifier，不再混合此函数的绝对量打分（白皮书 §4.4 摒弃绝对量
+        融合的设计原则）。该方法保留是为旧观测脚本（recall scoring tracer 等）
+        提供历史兼容入口。
         """
         return self._scoring_strategy.score(event, cosine_sim).total
 
@@ -273,58 +300,55 @@ class RecallService:
         return False
 
     def _get_stream_a_hits(self, query: str, focus_role_ids: set[str]) -> list[dict]:
-        """Tiered Stream A retrieval implementation (70/30 Rule)."""
+        """Tiered Stream A retrieval implementation (70/30 Rule, 白皮书 §4.4)."""
         capacity = self._config.recall_max_capacity
         global_ratio = self._config.recall_global_ratio
-        
+
         total_count = self._vector.count()
         if total_count <= capacity:
-            # 库容量未达上限，执行标准全局检索
-            return self._vector.search(query, n_results=60, where={"status": "active"})
-            
-        # 超过容量，计算 70% 边界时刻
+            # 库容量未达上限，执行标准全局检索（不施加 status 过滤——历史索引可能没写 status 字段）。
+            return self._vector.search(query, n_results=60)
+
+        # 超过容量，计算 70% 边界时刻（基于 SQL 真实活跃事件总数）
         boundary_dt = self._event_repo.find_time_boundary(capacity, global_ratio)
         if not boundary_dt:
-            return self._vector.search(query, n_results=60, where={"status": "active"})
-            
+            return self._vector.search(query, n_results=60)
+
         boundary_ts = boundary_dt.timestamp()
-        
+
         # 分层检索：
-        # 1. 最近 70% 区域（全局可见）
+        # 1. 最近 global_ratio 区域（全局可见）
         hits_recent = self._vector.search(
-            query, 
-            n_results=60, 
-            where={"$and": [{"status": "active"}, {"create_time": {"$gte": boundary_ts}}]}
+            query,
+            n_results=60,
+            where={"create_time": {"$gte": boundary_ts}},
         )
-        
-        # 2. 剩余 30% 区域（仅角色关联可见）
-        hits_older = []
+
+        # 2. 剩余 1-global_ratio 区域（仅焦点角色关联可见）
+        hits_older: list[dict] = []
         if focus_role_ids:
-            # 针对每个焦点角色执行过滤检索（Chroma $or + $contains 组合）
-            or_filters = []
-            for rid in focus_role_ids:
-                or_filters.append({"role_ids": {"$contains": rid}})
-            
+            # 改用每角色一位标志位 ``role_<id>: True``——这是 Chroma metadata 唯一支持的多值过滤方式。
+            # 旧实现用 ``role_ids:{$contains:rid}`` 在真 Chroma 后端无效（$contains 仅作用于 documents）。
+            or_filters = [{f"role_{rid}": True} for rid in focus_role_ids]
             if or_filters:
-                filter_cond = or_filters[0] if len(or_filters) == 1 else {"$or": or_filters}
+                role_clause = or_filters[0] if len(or_filters) == 1 else {"$or": or_filters}
                 hits_older = self._vector.search(
                     query,
                     n_results=40,
                     where={"$and": [
-                        {"status": "active"},
                         {"create_time": {"$lt": boundary_ts}},
-                        filter_cond
-                    ]}
+                        role_clause,
+                    ]},
                 )
-        
+
         # 合并并去重
-        seen = set()
-        merged = []
+        seen: set[str] = set()
+        merged: list[dict] = []
         for h in hits_recent + hits_older:
             if h["event_id"] not in seen:
                 merged.append(h)
                 seen.add(h["event_id"])
-        
+
         # 按距离截断前 60
         merged.sort(key=lambda x: x.get("distance", 1.0))
         return merged[:60]

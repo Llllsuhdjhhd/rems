@@ -87,9 +87,25 @@ class BoundaryDetectionSkill:
             for ue in (unclosed_events or [])
         )
 
-        # 1. 对整体输入（残影 + 当前）进行分句编码
-        full_raw = (shadow_content + "\n" + current_input).strip()
-        sentences = segment_sentences(full_raw)
+        # 1. 对整体输入（残影 + 当前）进行分句编码；分别记录两段范围以便 prompt 显式标记。
+        # 旧实现拼接后再分句，导致模型无法分辨"shadow 内容"与"当前输入"，是 P1-9 修复点。
+        shadow_sentences = segment_sentences(shadow_content) if shadow_content else []
+        current_sentences = segment_sentences(current_input) if current_input else []
+        sentences = shadow_sentences + current_sentences
+        shadow_count = len(shadow_sentences)
+        # 区间提示：让模型知道 [1..shadow_count] 是已存在残影，剩余是新输入。
+        if shadow_count > 0 and current_sentences:
+            range_hint = (
+                f"（【1..{shadow_count}】=既有残影；"
+                f"【{shadow_count + 1}..{len(sentences)}】=本轮新输入）"
+            )
+        elif shadow_count > 0:
+            range_hint = f"（【1..{shadow_count}】=既有残影；本轮无新输入）"
+        elif current_sentences:
+            range_hint = f"（【1..{len(sentences)}】=本轮新输入；无既有残影）"
+        else:
+            range_hint = "（无任何输入）"
+
         indexed_input = format_indexed_text(sentences)
 
         # 2. 构造 prompt：纯事件切分，不涉及摘要/角色等衍生字段
@@ -97,6 +113,7 @@ class BoundaryDetectionSkill:
             shadow=shadow_content or "（空）",
             unclosed_summary=unclosed_summary,
             indexed_input=indexed_input,
+            range_hint=range_hint,
         )
 
         system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM

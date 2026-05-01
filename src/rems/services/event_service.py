@@ -11,6 +11,7 @@ from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import DECORATION_SYSTEM, DECORATION_USER
 from ..models.event import CompressionBudget, Event, EventRoleEntry, EventStatus
+from ..models.role import Role
 from ..skills.event_enrichment import EnrichmentResult, EventEnrichmentSkill
 from ..skills.role_extraction import ExtractedRole, RoleExtractionSkill
 from ..storage.repository import EventRepository
@@ -58,6 +59,7 @@ class EventService:
         input_id: str | None = None,
         role_entries: list[EventRoleEntry] | None = None,
         skip_roles: bool = False,
+        known_roles: list[Role] | None = None,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
@@ -84,9 +86,16 @@ class EventService:
             budget.snapshot_budget_per_role, budget.wp_budget_per_role, budget.decoration_budget,
         )
 
+        # 一次 LLM 调用同时拿摘要 + 角色（白皮书 1.1.3、2.1）。
+        # 仅当外部已经传入 role_entries（pipeline pre-recall 已经抽过角色），或显式 skip_roles
+        # 时，才让 enrichment 走"摘要-only"分支，避免重复角色提取。
+        # ``known_roles`` 仅作为代词消解 hint 透传给 enrichment，不直接覆盖角色子集。
+        external_roles_provided = bool(role_entries) or skip_roles
         enrichment: EnrichmentResult = self._enrichment_skill.enrich(
             content_raw,
             budget=budget,
+            skip_roles=external_roles_provided,
+            known_roles=known_roles,
         )
 
         from ..skills.role_extraction import RoleExtractionSkill
@@ -175,9 +184,15 @@ class EventService:
             "is_abstract": event.is_abstract,
             "status": event.status.value,
             "event_length": event.event_length,
+            # 白皮书 §4.4 70/30 分层依赖按时间过滤：以 POSIX 秒存为标量，方便 $gte/$lt 比较。
+            "create_time": event.create_time.timestamp(),
         }
         if event.role_list:
             metadata["role_ids"] = ",".join(r.role_id for r in event.role_list)
+            # 角色白名单标志位：``role_<id>: True`` 让 70/30 分层用 $or 多角色等值匹配
+            # （Chroma 不支持对 metadata 做 $contains，必须用标量等值；详见 vector_store._sanitize_metadata）。
+            for r in event.role_list:
+                metadata[f"role_{r.role_id}"] = True
         self._vector.add_event(event.event_id, index_text, metadata)
 
     # ------------------------------------------------------------------

@@ -76,7 +76,10 @@ BOUNDARY_SYSTEM = """\
    - **不要生成摘要、角色、情感等衍生字段**，这些由下游组件处理。
 2. **防碎片化（白皮书 1.1.7）**：同一段落内若干琐碎动作若构成同一逻辑闭环，合并为单个事件；不要把每个短句各拆成独立事件。
 3. **续写判定**：若当前片段是未完成事件库中某条的续写，填写 `continuation_of` 为对应未完成 ID；否则为 null。
-5. **未完成事件与残影统一**：与当前事件无关、或尚未闭环的逻辑片段，请统一填入 `new_unclosed_indices`。系统后续将这些片段的拼接定义为“残影”。
+4. **残影 / 当前输入边界**：用户消息会显式给出"既有残影序号区间"与"本轮新输入序号区间"。
+   - 残影序号对应的句子来自此前已挂起的未完成事件；如果它们应当继续保留为未完成，请把它们出现在 `new_unclosed_indices` 中（系统会**用这份列表完整重建未完成库**——未列出的旧残影内容将按白皮书 §4.2.2 机制 3 视为无主碎屑被丢弃）。
+   - 残影中已可与本轮输入闭环的部分，请放入对应 `completed_events.content_raw_indices`，并视情况填 `continuation_of`。
+5. **未完成事件与残影统一**：与当前事件无关、或尚未闭环的逻辑片段，请统一填入 `new_unclosed_indices`。系统后续将这些片段的拼接定义为"残影"。
 
 输出严格 JSON。"""
 
@@ -87,7 +90,7 @@ BOUNDARY_USER = """\
 ## 未完成事件库快照
 {unclosed_summary}
 
-## 当前输入（已分句编码）
+## 当前输入（已分句编码）{range_hint}
 {indexed_input}
 
 请剥离并重组事件，返回如下 JSON：
@@ -102,14 +105,14 @@ BOUNDARY_USER = """\
   "new_unclosed_indices": [12, 13]
 }}
 ```
-单条未完成也可写 `"new_unclosed_indices": [12]`（同一条内多句请写进**同一**扁平列表，勿每句一条记录）。与当前事件无关但需保留的句子，也请放入 `new_unclosed_indices`。"""
+单条未完成也可写 `"new_unclosed_indices": [12]`（同一条内多句请写进**同一**扁平列表，勿每句一条记录）。与当前事件无关但需保留的句子，也请放入 `new_unclosed_indices`。**残影中应继续挂起的句子也必须重新出现在 `new_unclosed_indices`，否则系统会丢弃它们**。"""
 
 # =====================================================================
 # 2. Event Enrichment — 统一的「事件摘要 + 角色抽取」技能
 # =====================================================================
 # 以 boundary 剥离出的 content_raw 为输入，生成 L1…Ln 递归摘要（带熔断）。
 
-ENRICHMENT_SYSTEM = """\
+ENRICHMENT_SUMMARY_ONLY_SYSTEM = """\
 你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，交付事件摘要：
 
 **summaries：L1…Ln 递归压缩**
@@ -118,7 +121,7 @@ ENRICHMENT_SYSTEM = """\
 
 只输出一个 JSON 对象，包含 `summaries` 字典，勿附加说明。"""
 
-ENRICHMENT_USER = """\
+ENRICHMENT_SUMMARY_ONLY_USER = """\
 ## 事件原文
 {content_raw}
 
@@ -139,12 +142,100 @@ ENRICHMENT_USER = """\
 ```"""
 
 
-def build_enrichment_system_message(config: "REMSConfig", *, fuse_min_chars: int) -> str:
-    """System prompt for event enrichment: mode injection + 主规则。"""
-    return (
-        build_user_mode_block(config)
-        + ENRICHMENT_SYSTEM.format(fuse_min_chars=fuse_min_chars)
-    )
+# 真正"一次调用同时输出摘要 + 角色"的合并 prompt：
+ENRICHMENT_FULL_SYSTEM = """\
+你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，**单次输出**两类衍生数据：
+
+A. **summaries：L1…Ln 递归压缩**
+   - 遵守【摘要字数预算表】；L1 保真主干，L2+ 逐层约减半；
+   - **熔断**：当某级摘要字符数 **≤ {fuse_min_chars}** 时，**不得再生成**下一级（`summaries` 仅含已产出层级）。
+
+B. **roles：参与角色识别 + 分级快照 + 8 维基础情绪**
+   1. **角色重要性**：评定为 S（核心主角）/ A / B / C / D；
+   2. **角色快照层级与预算（指数级递减）**：
+      - **L3：详细意图快照**，遵守【L3 预算】，描述深层意图、微观动作与因果；
+      - **L2：互动逻辑快照**，遵守【L2 预算】，侧重实时互动与行为反馈；
+      - **L1：骨架白描快照**，遵守【L1 预算】，仅说明最核心行为事实；
+   3. **层级分配策略**：
+      - **S 级**：必须同时生成 L1 + L2 + L3；
+      - **A 级**：必须生成 L1 + L2，L3 留空；
+      - **B/C/D 级**：仅生成 L1，L2/L3 留空；
+   4. **情感量化**：8 维基础情绪 anger / fear / joy / sadness / surprise / disgust / trust / anticipation，数值 0-1；后端自行合成 arousal / valence，**不要**输出这两个字段。
+   5. **去代词化对齐**：若已知角色列表非空，应优先重用其 `role_id`；遇到代词指代请尝试映射到最可能的已知角色。
+
+输出严格 JSON。"""
+
+ENRICHMENT_FULL_USER = """\
+## 事件原文
+{content_raw}
+
+## 已知角色列表（用于去代词化对齐）
+{known_roles}
+
+## 摘要字预算
+{summary_budget_table}
+
+## 角色快照预算表（硬约束）
+{snapshot_budgets}
+
+## 任务
+1. 生成 `summaries`（L1 起，熔断 {fuse_min_chars}）；
+2. 识别参与角色 + 快照 + 8 维情绪。
+
+## 输出 JSON
+```json
+{{
+  "summaries": {{
+    "L1": "…",
+    "L2": "…"
+  }},
+  "roles": [
+    {{
+      "role_id": "已有ID或null",
+      "name": "角色名",
+      "importance": "S|A|B|C|D",
+      "snapshot": {{
+        "l1_mention": "L1 文本 (S/A/B/C/D 必填)",
+        "l2_interaction": "L2 文本 (仅 S/A 级填写)",
+        "l3_decision": "L3 文本 (仅 S 级填写)"
+      }},
+      "emotion": {{
+        "anger": 0.0,
+        "fear": 0.0,
+        "joy": 0.0,
+        "sadness": 0.0,
+        "surprise": 0.0,
+        "disgust": 0.0,
+        "trust": 0.0,
+        "anticipation": 0.0
+      }}
+    }}
+  ]
+}}
+```"""
+
+
+def build_enrichment_system_message(
+    config: "REMSConfig",
+    *,
+    fuse_min_chars: int,
+    full_mode: bool = True,
+) -> str:
+    """System prompt for event enrichment: mode injection + 主规则。
+
+    ``full_mode=True`` 走"摘要 + 角色"单次合并调用；``False`` 退回纯摘要变体，
+    用于外部已经传入 ``role_entries`` 时（pipeline pre-recall 已完成角色提取）跳过角色字段。
+    """
+    base = build_user_mode_block(config)
+    body = (
+        ENRICHMENT_FULL_SYSTEM if full_mode else ENRICHMENT_SUMMARY_ONLY_SYSTEM
+    ).format(fuse_min_chars=fuse_min_chars)
+    return base + body
+
+
+# 旧符号保留（兼容外部 import）：
+ENRICHMENT_SYSTEM = ENRICHMENT_SUMMARY_ONLY_SYSTEM
+ENRICHMENT_USER = ENRICHMENT_SUMMARY_ONLY_USER
 
 # =====================================================================
 # 3. Summary Generation (recursive L1-Ln) — 仍保留，用于抽象事件合成

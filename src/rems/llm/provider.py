@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
+import uuid
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 # OpenAI 兼容 Chat Completions 封装；按 task_type 选择模型名（见 config.llm.task_models）。
@@ -14,6 +18,31 @@ from ..config import REMSConfig
 from .metrics import LLMInvocationMetrics
 
 logger = logging.getLogger(__name__)
+
+
+def _write_failed_llm_json(text: str) -> Path:
+    """Persist a failed LLM JSON payload for offline debugging.
+
+    旧实现把 ``failed_llm_json.txt`` 直接写到当前工作目录，会污染调用方仓库根
+    且不同失败互相覆盖。修复（P3-16）：
+        - 路径：``$REMS_LOG_DIR``（若设置）/ ``./logs/llm_failures``（默认）；
+        - 文件名：``failed_llm_json_<UTC_timestamp>_<rand>.txt``，避免同进程并发覆盖；
+        - 父目录不存在时自动创建；写入失败时退化为日志告警，不阻断主流程。
+    """
+    base_dir = Path(os.environ.get("REMS_LOG_DIR", "logs/llm_failures"))
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Cannot create LLM failure log dir %s: %s", base_dir, exc)
+        return Path("")
+    fname = f"failed_llm_json_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:6]}.txt"
+    path = base_dir / fname
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Cannot write LLM failure log %s: %s", path, exc)
+        return Path("")
+    return path
 
 
 class LLMProvider:
@@ -196,10 +225,14 @@ class LLMProvider:
                         logger.warning("JSON recovered via structural scraper. HEURISTIC mode used for objects.")
                         return recovered
 
-                    with open("failed_llm_json.txt", "w", encoding="utf-8") as f:
-                        f.write(text)
-                    raise ValueError(f"JSON Recovery failed. Source saved to failed_llm_json.txt. Snippet: {inner[:200]}")
-            
-            with open("failed_llm_json.txt", "w", encoding="utf-8") as f:
-                f.write(text)
-            raise ValueError(f"No JSON structure detected. Snippet: {text[:200]}")
+                    saved = _write_failed_llm_json(text)
+                    raise ValueError(
+                        f"JSON Recovery failed. Source saved to {saved or '<not saved>'}. "
+                        f"Snippet: {inner[:200]}"
+                    )
+
+            saved = _write_failed_llm_json(text)
+            raise ValueError(
+                f"No JSON structure detected. Source saved to {saved or '<not saved>'}. "
+                f"Snippet: {text[:200]}"
+            )

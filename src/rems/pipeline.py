@@ -8,8 +8,9 @@ from typing import Optional
 
 from .config import REMSConfig, UserMode
 from .llm.provider import LLMProvider
-from .models.event import Event
+from .models.event import Event, EventRoleEntry
 from .models.metabolism import ContextPackage
+from .models.role import Role
 from .services.abstraction_service import AbstractionService
 from .services.belief_revision_service import BeliefRevisionService
 from .services.emotion_service import EMAEvolver
@@ -218,6 +219,7 @@ class REMSPipeline:
             summary_skill,
             recall_log_repo,
             abstracted_subset_repo,
+            enrichment_skill=enrichment_skill,
         )
         belief_revision_service = BeliefRevisionService(config, event_repo, role_repo)
 
@@ -273,11 +275,16 @@ class REMSPipeline:
         """
         shadow = self.meta_repo.get_shadow()
 
-        # Step 1: LLM Character Extraction (Before Recall)
-        # 提前进行人物提取（输入+残影），用于提取焦点角色辅助召回（不直接传给封存阶段）
+        # Step 1: 提前角色抽取（输入 + 残影）。
+        # 这一轮主要目的是为 RecallService 准备焦点角色与已知角色快照（白皮书 §4.4 流 B）；
+        # 抽得的 role_entries 同时会作为 ``known_roles`` 透传给代谢层，让 EventEnrichmentSkill
+        # 走 summary-only 分支，省掉 seal 阶段的二次角色提取（P1-6）。
         combined_text = (shadow.content + "\n" + raw_input).strip()
-        print(f"  [DEBUG] role_skill exists: {self.role_skill is not None}, combined_text length: {len(combined_text)}")
-        role_entries = []
+        logger.debug(
+            "ingest pre-recall: role_skill=%s, combined_text_len=%d",
+            self.role_skill is not None, len(combined_text),
+        )
+        role_entries: list[EventRoleEntry] = []
         if self.role_skill and combined_text:
             extraction_result = self.role_skill.extract(combined_text)
             extracted_roles = list(extraction_result.roles)
@@ -320,10 +327,18 @@ class REMSPipeline:
                 )
 
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
+        # 把 pre-recall 已提取的角色作为 enrichment 去代词化 hint 透传，避免事件层面重复抽取。
+        known_roles_hint: list[Role] = []
+        if role_entries:
+            for re_entry in role_entries:
+                role_obj = self.role_repo.get(re_entry.role_id)
+                if role_obj is not None:
+                    known_roles_hint.append(role_obj)
         sealed = self.metabolism_service.process_input(
-            raw_input, 
-            force_save=force_save, 
+            raw_input,
+            force_save=force_save,
             input_id=input_id,
+            known_roles_hint=known_roles_hint or None,
         )
 
         # 角色：每个新事件更新白描时间线并刷新语义卡片（第 2.2–2.3）。

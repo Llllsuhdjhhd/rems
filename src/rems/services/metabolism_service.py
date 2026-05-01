@@ -11,6 +11,7 @@ from typing import Optional
 from ..config import REMSConfig
 from ..models.event import Event
 from ..models.metabolism import Shadow, UnclosedEvent
+from ..models.role import Role
 from ..services.event_service import EventService
 from ..skills.boundary_detection import BoundaryDetectionSkill, BoundaryResult
 from ..storage.repository import MetabolismRepository
@@ -55,6 +56,7 @@ class MetabolismService:
         *,
         force_save: bool = False,
         input_id: str | None = None,
+        known_roles_hint: list[Role] | None = None,
     ) -> list[Event]:
         """Ingest *raw_input*, return list of newly sealed events (may be empty).
 
@@ -77,11 +79,19 @@ class MetabolismService:
         shadow_content = "\n".join(ue.merged_content for ue in unclosed)
 
         if force_save:
-            return self._force_save_all(shadow_content, raw_input, unclosed, input_id=input_id)
+            return self._force_save_all(
+                shadow_content, raw_input, unclosed,
+                input_id=input_id,
+                known_roles_hint=known_roles_hint,
+            )
 
         # 边界检测仅负责事件切分；摘要/角色等衍生字段由 EventEnrichment 在 seal 时生成。
         result = self._boundary.detect(shadow_content, raw_input, unclosed)
-        return self._apply_boundary_result(result, unclosed, input_id=input_id)
+        return self._apply_boundary_result(
+            result, unclosed,
+            input_id=input_id,
+            known_roles_hint=known_roles_hint,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -92,9 +102,27 @@ class MetabolismService:
         result: BoundaryResult,
         unclosed: list[UnclosedEvent],
         input_id: str | None = None,
-        role_entries: list["EventRoleEntry"] | None = None,
+        known_roles_hint: list[Role] | None = None,
     ) -> list[Event]:
+        """Apply LLM boundary result and refresh shadow / unclosed library.
+
+        关键不变量（修自 P0-5 残影跨轮重复 bug）：**残影仅由当前未完成事件拼接而成**
+        （白皮书 §4.1 视图定义）。本轮入口处 ``shadow = join(previous_unclosed)``，
+        模型已经看到 shadow 全部内容；剩余仍未闭合的部分**必须**通过
+        ``result.new_unclosed`` 重新声明，否则按白皮书 §4.2.2 机制 3「无主碎屑垃圾回收」
+        被丢弃（trace decay）。所以本轮结束时：
+
+            1. 已被 ``continuation_of`` 命中的旧 UC 在循环中删除；
+            2. 把**所有**未被命中的旧 UC 一次性清空——避免与 new_unclosed 内容重复持有；
+            3. 用 ``result.new_unclosed`` 重建未完成库；
+            4. 残影 = join(new_unclosed.merged_content)。
+
+        ``known_roles_hint`` 由 pipeline 在 pre-recall 阶段抽取得到，向下传给
+        ``EventEnrichmentSkill``，仅作为代词消解的提示——不直接覆盖事件 role_list，
+        因为单条 sealed event 的真实参与角色应由 enrichment 在该事件原文上重新精确判定。
+        """
         sealed: list[Event] = []
+        consumed_uc_ids: set[str] = set()
 
         for frag in result.completed_events:
             if frag.continuation_of:
@@ -102,6 +130,7 @@ class MetabolismService:
                 if ue:
                     content = ue.merged_content + "\n" + frag.content_raw
                     self._repo.delete_unclosed_event(ue.id)
+                    consumed_uc_ids.add(ue.id)
                 else:
                     content = frag.content_raw
             else:
@@ -110,8 +139,17 @@ class MetabolismService:
             event = self._event_svc.seal_event(
                 content,
                 input_id=input_id,
+                known_roles=known_roles_hint,
             )
             sealed.append(event)
+
+        # 关键修复：清空所有未被 continuation_of 命中的旧 UC——它们的内容已经作为 shadow
+        # 整段进入 boundary 模型；模型若仍认为它们未闭合，应通过 ``new_unclosed`` 重新声明，
+        # 否则被认定为已彻底失去叙事价值的"无主碎屑"，按 trace decay 丢弃。
+        # 不这样做就会"旧 UC + 新 UC 同时持有同一段文本"——长跑会单调膨胀。
+        for ue in unclosed:
+            if ue.id not in consumed_uc_ids:
+                self._repo.delete_unclosed_event(ue.id)
 
         # 白皮书 4.2 底线兜底：对单条未闭环片段逐项判定；若长度越过 ``len_msg × 1.2`` 红线，
         # 立即强制封存为事件，防止内存/计算爆炸。是否「可疑」交由 EventService 内部的
@@ -128,6 +166,7 @@ class MetabolismService:
                 event = self._event_svc.seal_event(
                     nu.content,
                     input_id=input_id,
+                    known_roles=known_roles_hint,
                 )
                 sealed.append(event)
                 continue
@@ -157,6 +196,7 @@ class MetabolismService:
         *,
         is_suspicious: bool = False,
         input_id: str | None = None,
+        known_roles_hint: list[Role] | None = None,
     ) -> list[Event]:
         """Manual trigger (/save, /mem) or length-based fallback: seal everything immediately.
 
@@ -167,12 +207,22 @@ class MetabolismService:
 
         combined = (shadow_content + "\n" + raw_input).strip()
         if combined:
-            event = self._event_svc.seal_event(combined, is_suspicious=is_suspicious, input_id=input_id)
+            event = self._event_svc.seal_event(
+                combined,
+                is_suspicious=is_suspicious,
+                input_id=input_id,
+                known_roles=known_roles_hint,
+            )
             sealed.append(event)
 
         for ue in unclosed:
             if ue.total_length > 0:
-                event = self._event_svc.seal_event(ue.merged_content, is_suspicious=is_suspicious, input_id=input_id)
+                event = self._event_svc.seal_event(
+                    ue.merged_content,
+                    is_suspicious=is_suspicious,
+                    input_id=input_id,
+                    known_roles=known_roles_hint,
+                )
                 sealed.append(event)
             self._repo.delete_unclosed_event(ue.id)
 

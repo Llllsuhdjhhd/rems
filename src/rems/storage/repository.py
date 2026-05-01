@@ -79,36 +79,49 @@ class EventRepository:
                 q = q.filter(EventRecord.is_tombstoned == False)  # noqa: E712
             return [self._to_model(r) for r in q.order_by(EventRecord.create_time).all()]
 
-    def count(self) -> int:
+    def count(
+        self,
+        *,
+        is_abstract: bool | None = None,
+        exclude_tombstoned: bool = True,
+    ) -> int:
+        """Count events with optional filters (used by 70/30 capacity logic and panels)."""
         with self._db.session() as s:
-            return s.query(EventRecord).count()
+            q = s.query(EventRecord)
+            if is_abstract is not None:
+                q = q.filter(EventRecord.is_abstract == is_abstract)
+            if exclude_tombstoned:
+                q = q.filter(EventRecord.is_tombstoned == False)  # noqa: E712
+            return q.count()
 
-    def resolve_basic_event_ids(self, event_id: str) -> list[str]:
-        """Flatten the abstraction chain rooted at *event_id* down to basic-event leaves.
+    def find_time_boundary(self, capacity: int, global_ratio: float) -> "datetime | None":
+        """Return the create_time that splits the active basic-event population into
+        最近 *global_ratio* (e.g. 70%) 与较早的 30% 两段。
 
-        抽象事件可被再次抽象（白皮书 §3.2），``source_events`` 允许嵌套其他抽象事件。
-        本方法对证据链做 BFS 展开，返回所有叶子基本事件的 id（按首次到达顺序去重）；
-        若 *event_id* 本身即为基本事件，则返回 ``[event_id]``；缺失 / 墓碑事件被跳过。
-        面向"从抽象事件方便地反查基本事件"的检索与审计场景。
+        70/30 分层检索（白皮书 §4.4 Lazy Index 容量分层）需要这条边界：
+            - 全库非墓碑、非抽象事件按 ``create_time`` 升序；
+            - 取末尾 ``ratio = global_ratio`` 段的起点 create_time 即为边界；
+            - 库容量低于 ``capacity`` 时返回 ``None``，调用方应回退到全局检索。
+
+        计算方式与 ``recall_max_capacity`` 解耦——边界总是按 *当前活跃总数* 与
+        *global_ratio* 计算，不被 ``capacity`` 截断；后者只决定"是否启用分层"。
         """
-        seen: set[str] = set()
-        result: list[str] = []
-        stack: list[str] = [event_id]
-        while stack:
-            current = stack.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            ev = self.get(current)
-            if ev is None or ev.is_tombstoned:
-                continue
-            if ev.is_abstract:
-                for sid in (ev.source_events or []):
-                    if sid not in seen:
-                        stack.append(sid)
-            else:
-                result.append(ev.event_id)
-        return result
+        if capacity <= 0:
+            return None
+        with self._db.session() as s:
+            q = (
+                s.query(EventRecord.create_time)
+                .filter(EventRecord.is_abstract == False)  # noqa: E712
+                .filter(EventRecord.is_tombstoned == False)  # noqa: E712
+                .order_by(EventRecord.create_time.asc())
+            )
+            total = q.count()
+            if total <= capacity:
+                return None
+            # 最近 global_ratio 段从索引 split_idx 开始
+            split_idx = max(0, int(total * (1.0 - global_ratio)))
+            row = q.offset(split_idx).limit(1).first()
+            return row[0] if row else None
 
     def resolve_basic_event_ids(self, event_id: str) -> list[str]:
         """Return the flat list of basic-event IDs reachable from *event_id*.
@@ -241,14 +254,27 @@ class RoleRepository:
             return result
 
     def find_by_name(self, name: str) -> Optional[Role]:
+        """Find a role by canonical name or alias.
+
+        Two-stage lookup:
+            1. SQL equality on ``name`` (indexed enough for typical scales).
+            2. Fallback alias scan with **lazy iteration** + early stop —
+               不再对每条候选 role 都触发一次 ``self.get`` 的额外查询，避免 O(N²)
+               的级联 round-trip（白描数据量大时影响显著）。
+        """
         with self._db.session() as s:
             record = s.query(RoleRecord).filter(RoleRecord.name == name).first()
             if record:
-                return self.get(record.role_id)
-            for r in s.query(RoleRecord).all():
-                if name in (r.aliases or []):
-                    return self.get(r.role_id)
-            return None
+                role_id = record.role_id
+            else:
+                role_id = None
+                for r in s.query(RoleRecord).yield_per(200):
+                    if name in (r.aliases or []):
+                        role_id = r.role_id
+                        break
+            if role_id is None:
+                return None
+        return self.get(role_id)
 
     def add_white_painting_entry(self, role_id: str, entry: WhitePaintingEntry) -> None:
         with self._db.session() as s:

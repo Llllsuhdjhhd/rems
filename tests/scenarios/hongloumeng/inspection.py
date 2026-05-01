@@ -50,10 +50,22 @@ def inspect_latest_sim():
             print(f"  - 事件ID: {eid}")
             print(f"    摘要 (L1): {l1_summary[:100]}...")
             if role_entries:
-                # 尝试从 role_list 提取第一个角色的情感状态
+                # 白皮书 §2.5 已用 8 维 BasicEmotionVector 取代旧 vedana(joy/suffering) 二维结构。
+                # 这里展示 anger/joy/sadness/trust 4 个最常用维度，以及合成后的 valence/arousal。
                 first_role = role_entries[0]
-                v = first_role.get('emotional_model', {}).get('vedana', {})
-                print(f"    情感状态 (首位角色): 喜={v.get('joy',0):.2f}, 苦={v.get('suffering',0):.2f}")
+                em = first_role.get('emotional_model', {}) or {}
+                emo = em.get('emotion', {}) or {}
+                anger = emo.get('anger', 0.0) or 0.0
+                joy = emo.get('joy', 0.0) or 0.0
+                sadness = emo.get('sadness', 0.0) or 0.0
+                trust = emo.get('trust', 0.0) or 0.0
+                valence = em.get('valence', 0.0) or 0.0
+                arousal = em.get('arousal', 0.0) or 0.0
+                print(
+                    "    情感状态 (首位角色): "
+                    f"怒={anger:.2f}, 喜={joy:.2f}, 哀={sadness:.2f}, 信={trust:.2f} | "
+                    f"valence={valence:+.2f}, arousal={arousal:.2f}"
+                )
             print("-" * 40)
     except Exception as e:
         print(f"查询事件失败: {e}")

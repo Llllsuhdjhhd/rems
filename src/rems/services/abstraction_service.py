@@ -8,8 +8,9 @@ import logging
 # 达到阈值的子集合成抽象事件；之后用抽象事件 id 在 recall_log 中替换该子集，保持统一命名空间。
 
 from ..config import REMSConfig
-from ..models.event import Event
+from ..models.event import CompressionBudget, Event
 from ..strategies.abstraction import AbstractionEvidencePolicy, LeafContentRawEvidencePolicy
+from ..skills.event_enrichment import EventEnrichmentSkill
 from ..skills.inductive_evolution import InductiveEvolutionSkill
 from ..skills.summary_generation import SummaryGenerationSkill
 from ..storage.repository import (
@@ -46,12 +47,16 @@ class AbstractionService:
         recall_log_repo: RecallLogRepository,
         abstracted_subset_repo: AbstractedSubsetRepository,
         evidence_policy: AbstractionEvidencePolicy | None = None,
+        enrichment_skill: EventEnrichmentSkill | None = None,
     ):
         self._config = config
         self._event_repo = event_repo
         self._vector = vector_store
         self._evolution = evolution_skill
+        # 优先走 EventEnrichmentSkill 一次性拿所有层级摘要；保留 summary_skill 作为兜底（旧路径）。
+        # P1-8 修复：原实现在 generate() 内部循环调用 N 次 LLM（每层一次），抽象事件成本高。
         self._summary = summary_skill
+        self._enrichment = enrichment_skill
         self._recall_log_repo = recall_log_repo
         self._fired_repo = abstracted_subset_repo
         self._evidence_policy = evidence_policy or LeafContentRawEvidencePolicy()
@@ -129,10 +134,23 @@ class AbstractionService:
         )
 
         # 抽象事件的摘要与基本事件同规则（白皮书 §1.1.3）。
-        sr = self._summary.generate(abstract_event.content_raw)
-        abstract_event.summaries = sr.summaries
-        abstract_event.summary_lengths = sr.summary_lengths
-        abstract_event.actual_max_level = sr.actual_max_level
+        # 优先一次 LLM 调用拿全部层级（EventEnrichmentSkill, skip_roles=True），与基本事件流共用 prompt 与解析；
+        # 没注入 enrichment 时退回 SummaryGenerationSkill 的递归实现（旧路径，多次 LLM 往返）。
+        if self._enrichment is not None:
+            budget = self._estimate_budget(abstract_event.content_raw)
+            er = self._enrichment.enrich(
+                abstract_event.content_raw,
+                budget=budget,
+                skip_roles=True,
+            )
+            abstract_event.summaries = er.summaries
+            abstract_event.summary_lengths = er.summary_lengths
+            abstract_event.actual_max_level = er.actual_max_level
+        else:
+            sr = self._summary.generate(abstract_event.content_raw)
+            abstract_event.summaries = sr.summaries
+            abstract_event.summary_lengths = sr.summary_lengths
+            abstract_event.actual_max_level = sr.actual_max_level
 
         self._event_repo.save(abstract_event)
         self._index_abstract(abstract_event)
@@ -142,6 +160,32 @@ class AbstractionService:
                 self._event_repo.update_status(evt.event_id, is_abstracted=True)
 
         return abstract_event
+
+    def _estimate_budget(self, content: str) -> CompressionBudget:
+        """Compute a coarse summary budget for abstract event content_raw.
+
+        抽象事件摘要复用基本事件 enrichment prompt，必须给出 ``summary_level_budgets``。
+        与 ``EventService._compute_budget`` 保持口径一致：L1 = ``raw_len * compression_target_ratio``，
+        L2..L10 按 ``summary_decay_factor`` 指数衰减，至 ``summary_fuse_min_chars`` 熔断。
+        抽象事件不需要 snapshot/wp/decoration 预算，留空字典。
+        """
+        cfg = self._config
+        raw_len = max(1, len(content))
+        l1 = max(int(raw_len * cfg.compression_target_ratio), cfg.summary_fuse_min_chars)
+        summary_budgets: dict[str, int] = {"L1": l1}
+        for i in range(2, 11):
+            prev = summary_budgets[f"L{i-1}"]
+            nxt = max(int(prev * cfg.summary_decay_factor), cfg.summary_fuse_min_chars)
+            summary_budgets[f"L{i}"] = nxt
+        return CompressionBudget(
+            raw_len=raw_len,
+            total_budget=l1,
+            summary_level_budgets=summary_budgets,
+            snapshot_level_budgets={},
+            wp_budget_per_role=0,
+            decoration_budget=0,
+            role_count_estimate=0,
+        )
 
     def _index_abstract(self, event: Event) -> None:
         # 与基本事件保持一致：向量索引使用默认档（mid）摘要，对齐回忆块展示档位（白皮书 §4.4）。
@@ -153,6 +197,8 @@ class AbstractionService:
                 "is_abstract": True,
                 "status": event.status.value,
                 "abstraction_level": event.abstraction_level or 1,
+                # 与基本事件统一：把 create_time 作为标量秒数写入，参与 70/30 分层（白皮书 §4.4）。
+                "create_time": event.create_time.timestamp(),
             },
         )
 

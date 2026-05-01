@@ -96,23 +96,51 @@ class VectorStore:
         )
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _sanitize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+        """Coerce metadata into Chroma-compatible primitives.
+
+        Chroma 元数据值仅支持标量（``str/int/float/bool/None``）。
+        我们对 list 做扁平化兜底：
+            - ``role_ids: ["A", "B"]`` 仍保留为逗号字符串（人类可读字段）；
+            - 对每个 role_id 同时写入 ``role_<id>: True`` 这种"白名单标志位"，
+              使 70/30 分层检索可以通过 ``$or`` 等值匹配高效过滤（白皮书 §4.4）。
+        其他 list / dict 值统一 ``str()`` 兜底，避免 upsert 抛 TypeError。
+        """
+        if not metadata:
+            return {}
+        out: dict[str, Any] = {}
+        for key, value in metadata.items():
+            if value is None or isinstance(value, (str, int, float, bool)):
+                out[key] = value
+            elif isinstance(value, list):
+                # role_ids 是常用列表字段：保留可读字符串
+                if key == "role_ids":
+                    out[key] = ",".join(str(v) for v in value)
+                else:
+                    out[key] = ",".join(str(v) for v in value)
+            else:
+                out[key] = str(value)
+        return out
+
     def add_event(
         self,
         event_id: str,
         text: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        meta = self._sanitize_metadata(metadata)
         if self._in_memory:
             self._memory_events[event_id] = {
                 "document": text,
-                "metadata": metadata or {},
+                "metadata": meta,
                 "embedding": self._ef.embed_query(text)[0],
             }
             return
         self._collection.upsert(
             ids=[event_id],
             documents=[text],
-            metadatas=[metadata or {}],
+            metadatas=[meta],
         )
 
     # ------------------------------------------------------------------
@@ -171,9 +199,10 @@ class VectorStore:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         wp_id = f"{role_id}::{event_id}"
-        meta = metadata or {}
+        meta = dict(metadata or {})
         meta["role_id"] = role_id
         meta["event_id"] = event_id
+        meta = self._sanitize_metadata(meta)
         if self._in_memory:
             self._memory_wp[wp_id] = {
                 "document": text,
@@ -266,11 +295,26 @@ class VectorStore:
             if key == "status" and expected == "active" and actual is None:
                 continue
             if isinstance(expected, dict):
+                if "$eq" in expected and not (actual == expected["$eq"]):
+                    return False
+                if "$ne" in expected and not (actual != expected["$ne"]):
+                    return False
+                if "$gt" in expected and not (actual is not None and actual > expected["$gt"]):
+                    return False
                 if "$gte" in expected and not (actual is not None and actual >= expected["$gte"]):
                     return False
                 if "$lt" in expected and not (actual is not None and actual < expected["$lt"]):
                     return False
+                if "$lte" in expected and not (actual is not None and actual <= expected["$lte"]):
+                    return False
+                if "$in" in expected:
+                    if actual not in expected["$in"]:
+                        return False
+                if "$nin" in expected:
+                    if actual in expected["$nin"]:
+                        return False
                 if "$contains" in expected:
+                    # Document-level operator in real Chroma; we approximate on metadata strings/lists.
                     needle = expected["$contains"]
                     if isinstance(actual, str):
                         if needle not in actual:
