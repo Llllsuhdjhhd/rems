@@ -12,7 +12,7 @@ from typing import Optional
 # 未闭环叙事产生噪声角色/摘要）。物理红线仍作为最后一道防线保留。
 
 from ..config import REMSConfig
-from ..models.event import Event
+from ..models.event import Event, EventRoleEntry
 from ..models.metabolism import Shadow, UnclosedEvent
 from ..models.role import Role
 from ..services.event_service import EventService
@@ -124,11 +124,17 @@ class MetabolismService:
         force_save: bool = False,
         input_id: str | None = None,
         known_roles_hint: list[Role] | None = None,
+        pre_role_entries: list[EventRoleEntry] | None = None,
     ) -> list[Event]:
         """Ingest *raw_input*, return list of newly sealed events (may be empty).
 
         摄入字符串 *raw_input*，返回本轮新封存的基本事件列表（可能为空列表）。
         ``force_save=True`` 时跳过边界模型，立即合并残影与未完成项并封存（手动 /save 类触发）。
+
+        ``pre_role_entries``：pipeline pre-recall 阶段在 ``shadow + raw_input`` 上抽到的
+        「全局富信息池」（每个 EventRoleEntry 含 snapshot + 8 维情绪）。下放给
+        ``EventService.seal_event``，让事件级 enrichment 走 names_only 分支并按 role_id
+        从池里回填 snapshot/情感（详见 ``EventService.seal_event`` 的 ``pre_role_entries``）。
 
         白皮书 4.2 说明：``msg_len × 1.2`` 的兜底阈值作用于**未闭环事件的累积长度**，
         而非整体输入。边界检测不会因「残影 + 当前输入」过长被跳过；超长输入在边界剥离
@@ -151,6 +157,7 @@ class MetabolismService:
                 shadow_content, raw_input, unclosed,
                 input_id=input_id,
                 known_roles_hint=known_roles_hint,
+                pre_role_entries=pre_role_entries,
             )
 
         # 边界检测仅负责事件切分；摘要/角色等衍生字段由 EventEnrichment 在 seal 时生成。
@@ -181,6 +188,7 @@ class MetabolismService:
             result, unclosed,
             input_id=input_id,
             known_roles_hint=known_roles_hint,
+            pre_role_entries=pre_role_entries,
         )
 
     # ------------------------------------------------------------------
@@ -193,6 +201,7 @@ class MetabolismService:
         unclosed: list[UnclosedEvent],
         input_id: str | None = None,
         known_roles_hint: list[Role] | None = None,
+        pre_role_entries: list[EventRoleEntry] | None = None,
     ) -> list[Event]:
         """Apply LLM boundary result and refresh shadow / unclosed library.
 
@@ -247,6 +256,7 @@ class MetabolismService:
                 content,
                 input_id=input_id,
                 known_roles=known_roles_hint,
+                pre_role_entries=pre_role_entries,
                 split_prefix_event_ids=inherited_prefix_chain or None,
             )
             sealed.append(event)
@@ -316,6 +326,7 @@ class MetabolismService:
         is_suspicious: bool = False,
         input_id: str | None = None,
         known_roles_hint: list[Role] | None = None,
+        pre_role_entries: list[EventRoleEntry] | None = None,
     ) -> list[Event]:
         """Manual trigger (/save, /mem) or length-based fallback: seal everything immediately.
 
@@ -331,6 +342,7 @@ class MetabolismService:
                 is_suspicious=is_suspicious,
                 input_id=input_id,
                 known_roles=known_roles_hint,
+                pre_role_entries=pre_role_entries,
             )
             sealed.append(event)
 
@@ -341,6 +353,7 @@ class MetabolismService:
                     is_suspicious=is_suspicious,
                     input_id=input_id,
                     known_roles=known_roles_hint,
+                    pre_role_entries=pre_role_entries,
                     split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
                 )
                 # 反向链：force_save 也要登记 successor。

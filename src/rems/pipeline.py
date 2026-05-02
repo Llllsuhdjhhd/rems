@@ -335,6 +335,9 @@ class REMSPipeline:
 
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
         # 把 pre-recall 已提取的角色作为 enrichment 去代词化 hint 透传，避免事件层面重复抽取。
+        # 同时把抽到的富信息 EventRoleEntry（含 snapshot + 8 维情绪）作为「全局池」下放：
+        # EventService.seal_event 会让 enrichment 走 names_only 分支，仅识别本事件登场的角色名，
+        # 然后按 role_id 从池中回填 snapshot/情感，避免事件级别重复 LLM 抽取（白皮书 2.1）。
         known_roles_hint: list[Role] = []
         if role_entries:
             for re_entry in role_entries:
@@ -346,6 +349,7 @@ class REMSPipeline:
             force_save=force_save,
             input_id=input_id,
             known_roles_hint=known_roles_hint or None,
+            pre_role_entries=role_entries or None,
         )
 
         # 角色：每个新事件更新白描时间线并刷新语义卡片（第 2.2–2.3）。

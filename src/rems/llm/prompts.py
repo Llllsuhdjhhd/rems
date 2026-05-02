@@ -197,47 +197,103 @@ ENRICHMENT_SUMMARY_ONLY_USER = """\
 ```"""
 
 
-# 真正"一次调用同时输出摘要 + 角色"的合并 prompt：
-ENRICHMENT_FULL_SYSTEM = """\
+# ---------------------------------------------------------------------
+# 「摘要 + 仅角色名」分支（pipeline pre-recall 已经抽过完整角色池时使用）
+# ---------------------------------------------------------------------
+# 设计目的（与 EventService.seal_event 的 names_only 路径配套）：
+#   pipeline 预先在 combined_text（残影 + 当前输入）上调用 RoleExtractionSkill 拿到一份
+#   "全局富信息池"：每个角色含 snapshot + 8 维情绪。事件级别 enrich 不需要再让 LLM 把
+#   snapshot/情感重做一遍——只要识别出当前事件 content_raw 中"实际登场"的角色名子集，
+#   后端按 role_id 从池中回填即可。
+# 字段裁剪（与 ENRICHMENT_FULL_USER 的 roles 数组对比）：
+#   - 移除：snapshot.{l1_mention,l2_interaction,l3_decision}、emotion 八维
+#   - 保留：role_id（命中已知角色时填）、name
+# 摘要规则与 ENRICHMENT_FULL_SUMMARY_SECTION 完全一致（含 fuse_min/fuse_compact 双熔断）。
+ENRICHMENT_SUMMARY_AND_NAMES_SYSTEM = """\
 你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，**单次输出**两类衍生数据：
 
 A. **summaries：L1…Ln 递归压缩**
-   - 遵守【摘要字数预算表】；L1 保真主干，L2+ 逐层约减半；
-   - **熔断**：当某级摘要字符数 **≤ {fuse_min_chars}** 时，**不得再生成**下一级（`summaries` 仅含已产出层级）。
+   - 遵守【摘要字数预算表】；L1 保真主干，必须是一段**通顺的完整叙事**，包含关键动作、因果转折与重要心理细节，不得写成事件清单。
+   - L2+ 逐层约减半；每一级应是对**上一级摘要**的语义压缩，而非对原文的重新概括。
+   - **熔断规则**：满足任一条件即停止生成下一级，`summaries` 仅含已产出层级：(1) 下一级 Ln 的**预算字数** ≤ {fuse_min_chars} 字；(2) 上一级 L(n-1) 摘要的**实际字数** × 0.5 < {fuse_compact_threshold} 字（阈值 = floor({fuse_min_chars} × 0.7)，至少 1）。
+   - **可读性底线**：任何一级摘要须为语法通顺的完整句子；若在该级预算内无法维持可读性，宁可不生成该级。
 
-B. **roles：参与角色识别 + 分级快照 + 8 维基础情绪**
-   1. **角色重要性**：评定为 S（核心主角）/ A / B / C / D；
-   2. **角色快照层级与预算（指数级递减）**：
-      - **L3：详细意图快照**，遵守【L3 预算】，描述深层意图、微观动作与因果；
-      - **L2：互动逻辑快照**，遵守【L2 预算】，侧重实时互动与行为反馈；
-      - **L1：骨架白描快照**，遵守【L1 预算】，仅说明最核心行为事实；
-   3. **层级分配策略**：
-      - **S 级**：必须同时生成 L1 + L2 + L3；
-      - **A 级**：必须生成 L1 + L2，L3 留空；
-      - **B/C/D 级**：仅生成 L1，L2/L3 留空；
-   4. **情感量化**：8 维基础情绪 anger / fear / joy / sadness / surprise / disgust / trust / anticipation，数值 0-1；后端自行合成 arousal / valence，**不要**输出这两个字段。
-   5. **去代词化对齐**：若已知角色列表非空，应优先重用其 `role_id`；遇到代词指代请尝试映射到最可能的已知角色。
+B. **roles：仅识别原文中确实出现 / 参与的角色，只输出角色名（外加可对齐的 role_id）**
+   - **不输出 snapshot、不输出 emotion**；这两类信息由后端从「全局预抽取池」按 role_id 回填，重复输出会被丢弃。
+   - 优先匹配【已知角色列表】中的现有 role_id（含别名 / 代词指代命中）：命中即填该 role_id；不要伪造新的 role_id。
+   - 仅当文本中确实出现【已知角色列表】之外的新角色时，才以 `role_id=null` + 新名字补充。
+   - 不要把仅被第三方提及但未在本事件原文出场（无任何动作 / 对白 / 心理描写）的角色补进列表。
 
 输出严格 JSON。"""
 
-ENRICHMENT_FULL_USER = """\
+ENRICHMENT_SUMMARY_AND_NAMES_USER = """\
 ## 事件原文
 {content_raw}
 
-## 已知角色列表（用于去代词化对齐）
+## 已知角色列表（来自全局预抽取池；优先在此对齐 role_id）
 {known_roles}
 
 ## 摘要字预算
 {summary_budget_table}
 
-## 角色快照预算表（硬约束）
+## 任务
+1. 生成 `summaries`（L1 起；递归压缩与熔断规则见系统提示 **A**）。
+2. 输出 `roles`：数组元素只含 `role_id`（能对齐已知列表则填，否则 null）与 `name`，**不输出** snapshot 与 emotion。
+
+## 输出 JSON
+```json
+{{
+  "summaries": {{
+    "L1": "…",
+    "L2": "…"
+  }},
+  "roles": [
+    {{ "role_id": "ROL-... 或 null", "name": "角色名" }}
+  ]
+}}
+```"""
+
+
+# Event enrichment「摘要」段（人物规则全文复用 ``ROLE_EXTRACTION_CORE_RULES``，定义见下文 §4）。
+ENRICHMENT_FULL_SUMMARY_SECTION = """\
+你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，**单次输出**两类衍生数据：
+
+A. **summaries：L1…Ln 递归压缩**
+   - 遵守【摘要字数预算表】；L1 保真主干，必须是一段**通顺的完整叙事**，包含关键动作、因果转折与重要心理细节，不得写成事件清单。
+   - L2+ 逐层约减半；每一级应是对**上一级摘要**的语义压缩，而非对原文的重新概括。
+   - **熔断规则**：满足任一条件即停止生成下一级，`summaries` 仅含已产出层级：（1）下一级 Ln 的**预算字数** ≤ {fuse_min_chars} 字；（2）上一级 L(n-1) 摘要的**实际字数** × 0.5 < {fuse_compact_threshold} 字（阈值 = floor({fuse_min_chars} × 0.7)，至少 1）。
+   - **可读性底线**：任何一级摘要须为语法通顺的完整句子；若在该级预算内无法维持可读性，宁可不生成该级。
+
+"""
+
+ENRICHMENT_FULL_ROLE_BRIDGE = """\
+B. **roles：** 下列内容与 REMS「角色提取」（第一步 ``RoleExtractionSkill``）的系统提示 **完全一致**（同一段 ``ROLE_EXTRACTION_CORE_RULES``）：
+
+"""
+
+ENRICHMENT_FULL_ROLE_FOOTER = """\
+
+单次响应须在同一个 JSON 对象中同时给出 `summaries`（递归摘要字典）与 `roles`（角色数组）。顶层形状与用户消息中的 JSON 示例一致。输出严格 JSON。"""
+
+ENRICHMENT_FULL_USER = """\
+## 事件原文
+{content_raw}
+
+## 已知角色列表
+{known_roles}
+
+## 摘要字预算
+{summary_budget_table}
+
+## 【角色快照预算表】（硬约束）
 {snapshot_budgets}
 
 ## 任务
-1. 生成 `summaries`（L1 起，熔断 {fuse_min_chars}）；
-2. 识别参与角色 + 快照 + 8 维情绪。
+1. 生成 `summaries`（L1 起；递归压缩与熔断规则见系统提示 **A**）。
+2. （角色任务）请严格遵守系统指令中的快照层级推导逻辑、字数控制与熔断规则，识别角色并生成快照。
 
 ## 输出 JSON
+顶层对象须同时包含 `summaries` 与 `roles`。`roles` 数组元素格式与第一步角色提取一致：
 ```json
 {{
   "summaries": {{
@@ -251,8 +307,8 @@ ENRICHMENT_FULL_USER = """\
       "importance": "S|A|B|C|D",
       "snapshot": {{
         "l1_mention": "L1 文本 (S/A/B/C/D 必填)",
-        "l2_interaction": "L2 文本 (仅 S/A 级填写)",
-        "l3_decision": "L3 文本 (仅 S 级填写)"
+        "l2_interaction": "L2 文本 (仅 S/A 级填写；B/C/D 必须为 \"\")",
+        "l3_decision": "L3 文本 (仅 S 级填写；A/B/C/D 必须为 \"\")"
       }},
       "emotion": {{
         "anger": 0.0,
@@ -267,24 +323,48 @@ ENRICHMENT_FULL_USER = """\
     }}
   ]
 }}
-```"""
+```
+"""
 
 
 def build_enrichment_system_message(
     config: "REMSConfig",
     *,
     fuse_min_chars: int,
-    full_mode: bool = True,
+    mode: str = "full",
 ) -> str:
     """System prompt for event enrichment: mode injection + 主规则。
 
-    ``full_mode=True`` 走"摘要 + 角色"单次合并调用；``False`` 退回纯摘要变体，
-    用于外部已经传入 ``role_entries`` 时（pipeline pre-recall 已完成角色提取）跳过角色字段。
+    ``mode`` 三态：
+      - ``"full"``        ：摘要 + 完整角色（snapshot + 8 维情绪），单次合并调用；
+      - ``"names_only"``  ：摘要 + 仅角色名（外加可对齐的 role_id）。配合 pipeline pre-recall
+                           的「全局富信息池」，事件级 enrich 不再让 LLM 重做 snapshot/情感；
+      - ``"summary_only"``：仅摘要，外部已经传入 ``role_entries`` 时使用。
+
+    ``fuse_compact_threshold`` 由 ``fuse_min_chars`` 派生（×0.7 取下整，至少为 1），写入摘要 A 节熔断条件（2）。
     """
     base = build_user_mode_block(config)
-    body = (
-        ENRICHMENT_FULL_SYSTEM if full_mode else ENRICHMENT_SUMMARY_ONLY_SYSTEM
-    ).format(fuse_min_chars=fuse_min_chars)
+    fuse_compact_threshold = max(1, int(fuse_min_chars * 0.7))
+    if mode == "full":
+        summary_part = ENRICHMENT_FULL_SUMMARY_SECTION.format(
+            fuse_min_chars=fuse_min_chars,
+            fuse_compact_threshold=fuse_compact_threshold,
+        )
+        body = (
+            summary_part
+            + ENRICHMENT_FULL_ROLE_BRIDGE
+            + ROLE_EXTRACTION_CORE_RULES
+            + ENRICHMENT_FULL_ROLE_FOOTER
+        )
+    elif mode == "names_only":
+        body = ENRICHMENT_SUMMARY_AND_NAMES_SYSTEM.format(
+            fuse_min_chars=fuse_min_chars,
+            fuse_compact_threshold=fuse_compact_threshold,
+        )
+    elif mode == "summary_only":
+        body = ENRICHMENT_SUMMARY_ONLY_SYSTEM.format(fuse_min_chars=fuse_min_chars)
+    else:
+        raise ValueError(f"Unknown enrichment mode: {mode!r} (expected full/names_only/summary_only)")
     return base + body
 
 
@@ -324,10 +404,11 @@ SUMMARY_USER = """\
 # 4. Role Extraction — 仍保留独立 skill，供需要单独抽取角色的场景
 # =====================================================================
 
-ROLE_EXTRACTION_SYSTEM = """\
-你是 REMS 角色提取组件。从事件原文中识别所有参与实体，并生成分级快照（Snapshot）和 8 维基础情绪。
+ROLE_EXTRACTION_SYSTEM_INTRO = """你是 REMS 角色提取组件。从事件原文中识别所有参与实体，并生成分级快照（Snapshot）和 8 维基础情绪。
 
-核心规则：
+"""
+
+ROLE_EXTRACTION_CORE_RULES = """核心规则：
 1. **角色识别与重要性评定**
    - **全叙事层覆盖**：必须穿透文本所有层级，识别显性与隐性实体。包括：
      * 直接出场的人物、动物、拟人化对象；
@@ -437,7 +518,9 @@ ROLE_EXTRACTION_SYSTEM = """\
 5. **快照字数控制与熔断规则**
    - **L3 (详细)**：最高信息密度，完整记录意图、动作与因果。
    - **L2 & L1 (指数压缩)**：每一级较前一级字数约减少 40%。
-   - **L1 保留与熔断**：若 L1 字数低于 20 字，则保留当前 L1 文字，不再进一步删减。若 L1 字数低于 10 字且已无实质内容，则将其置为空字符串。
+   - **L1 保留与熔断**：若 L1 字数低于 20 字，则保留当前 L1 文字，不再进一步删减。若 L1 字数低于 10 字且已无实质内容，则将其置为空字符串。"""
+
+ROLE_EXTRACTION_SYSTEM = ROLE_EXTRACTION_SYSTEM_INTRO + ROLE_EXTRACTION_CORE_RULES + """
 
 输出严格 JSON。"""
 

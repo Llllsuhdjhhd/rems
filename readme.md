@@ -11,6 +11,7 @@
   - 引入通用的 **Skill 评估 / 修复协议**（`SkillEvaluator` / `SkillRemediator`），评估只做一层，修复后的输出不再评估；首批落地于 BoundaryDetection，后续可扩展到 Enrichment / InductiveEvolution 等 skill（§4.2.5）。
   - 角色抽取 prompt 加强：**全叙事层角色覆盖**（含第一人称叙述者与关键缺席者）、**反应型角色 B 级上限**、**L3 → L2 → L1 的"父-子"推导铁律**（严禁同义改写）、**L1 熔断字数**（§1.1.4）；情感量化明确"仅据当前片段、禁引人物生平"（§2.5.1）。
   - 边界检测 prompt 对应新增：`force_threshold` 注入、`split_id` 配对声明、`new_unclosed` 对象格式（旧扁平 `new_unclosed_indices` 继续兼容）（§4.2.4）。
+  - **事件级 Enrichment 三种工作模式**（§4.2.3）：常规对话流默认走 **`names_only`**——pipeline 在 pre-recall 阶段已经基于 `shadow + raw_input` 抽出了「全局富信息池」（每个角色含 snapshot + 8 维情绪），事件级别的 `EventEnrichmentSkill` 只负责"摘要 + 该事件实际登场的角色名"，snapshot 与情感由后端按 `role_id` 从池里直接回填，不再让 LLM 重做。pre-recall 抽不到角色时自动回退 `full`（原行为）；外部已构造完整 `role_entries` 时走 `summary_only`。该路径同时把 `summary_fuse_min_chars` 从 20 调到 35，并把熔断从单条件升级为**双熔断**（下一级预算 ≤ 阈值 ‖ 上一级实际字数 × 0.5 < ⌊阈值×0.7⌋），减少"压到只剩四五个字"的不可读层级。
 
 ## 1. 基本事件定义
 
@@ -37,7 +38,8 @@
 
 - **summaries**：以字典形式存储各级摘要。遵循软性指数衰减原则。
   - 层级预算分配：L1 为最高保真压缩（默认上限为L0长度的1/3），后续层级 $L_n$ 的字数预算遵循 $Budget_n = Budget_{n-1} \times 0.5$ 的递归衰减。
-  - **弹性浮动机制**：上述预算为软上限。当摘要为了完成一个语义块的完整表达需要超出预算时，允许向上浮动不超过 30%（即 $Budget_n \times 1.3$）。若某级摘要完成后的实际字符数**小于 40 字符**，则判定该事件在此细节深度下已达到信息表达极限，停止生成后续更高级别摘要，Summaries 字典不再包含更高键值。
+  - **弹性浮动机制**：上述预算为软上限。当摘要为了完成一个语义块的完整表达需要超出预算时，允许向上浮动不超过 30%（即 $Budget_n \times 1.3$）。
+  - **双熔断条件（满足任一即停止生成更高一级，2026.05 修订）**：(1) 下一级 $L_n$ 的**预算字数** $\leq$ `summary_fuse_min_chars`（工程默认 35）；(2) 上一级 $L_{n-1}$ 的**实际字数** $\times 0.5$ 小于 $\lfloor \text{summary\_fuse\_min\_chars} \times 0.7 \rfloor$（默认即 < 24 字）。任一条件触发即把当前已产出层级作为最终 summaries 落库，不再继续压缩。第二条用于阻断"上一级本身已压得太短，再砍一半就只剩残句"的劣化场景。
 - **summary_lengths**：记录各级摘要的实际字符数，用于代谢评分。
 - **actual_max_level**：记录触发停止前的实际最高层级。
 
@@ -400,8 +402,22 @@ $$\text{base\_forgetting\_factor} = 100 \cdot a^{\gamma}, \quad \gamma = 2 \text
 架构层面允许「剥离 + 摘要 + 角色」在一次 LLM 调用中完成。本参考实现出于 prompt 噪声控制与角色抽取稳定性考虑，将其拆分为两步：
 
 - BoundaryDetectionSkill：执行序号剥离、校验语义闭包、执行"碎屑向上吸收"（将环境/心理等微小描述合并入选中的序号中）、判断残影与未完成事件、**执行 80/20 强制分裂（§4.2.4）**；
-- EventEnrichmentSkill：基于包含已吸收碎屑的完整 `content_raw`，同步产出摘要、角色快照，并将环境/心理描写结构化写入 `decoration` 字段。
+- EventEnrichmentSkill：基于包含已吸收碎屑的完整 `content_raw`，按以下三种工作模式之一产出摘要 / 角色，同时将环境/心理描写结构化写入 `decoration` 字段。
 - **超长未完成的三段式兜底（取代原有盲目 force-seal）**：当单条未闭环片段累计越过 `msg_len × unclosed_force_ratio` 红线时，系统**禁止**直接调用 `seal_event`。顺序为：(1) 认知层 80/20 分裂（§4.2.4）→ (2) 评估器 + 专用修复 skill（§4.2.5）→ (3) 物理红线 force-seal（仅作为缓冲区防溢出）。在第 (1)(2) 层失败但尚未击穿物理红线时，UC 以 `oversized=True` 审计标记原样保留在库中。
+
+##### 4.2.3.1 EventEnrichmentSkill 三种工作模式（2026.05 修订）
+
+`EventEnrichmentSkill.enrich(...)` 根据上游传入的角色信息形态在三种模式中路由（优先级 `skip_roles` > `names_only` > `full`）：
+
+| 模式 | 触发条件 | LLM 输出 | snapshot / 8 维情绪来源 |
+|---|---|---|---|
+| `full` | `pre_role_entries` 为空（pre-recall 未抽到角色）且未 `skip_roles` | 摘要 + **完整角色**（含 snapshot + 8 维情绪） | LLM 同次产出 |
+| **`names_only`（默认对话流）** | pipeline pre-recall 已经抽到角色，把 `role_entries`（含 snapshot + 8 维情绪）作为「全局富信息池」下放 | 摘要 + **仅识别本事件实际登场的角色名**（外加可对齐的 `role_id`） | 后端按 `role_id` / `name` / `alias` 从 pre-recall 池**回填**，事件级 LLM 不重做 |
+| `summary_only` | 外部已经显式构造了完整 `role_entries` 或显式 `skip_roles=True` | 仅摘要 | 由调用方提供 |
+
+`names_only` 路径的设计动机：pipeline pre-recall 阶段已经在 `shadow + raw_input` 完整上下文上调用 `RoleExtractionSkill` 抽出过一份"全局角色池"，每个角色的 snapshot 与 8 维情绪都基于完整上下文判定；事件级 enrichment 只需要回答"这条 sealed event 里**实际登场**了池中哪些角色"——一个轻量的"摘要 + 角色名子集"调用就够了，避免为每条事件让 LLM 把 snapshot/情感重做一遍。事件最终 `role_list` 仍只包含本事件真实出场的角色子集，富信息从池里直接复制；池外新角色（极少数 pre-recall 漏抽场景）走兜底路径自动注册并以空快照入库（带 `info` 日志）。
+
+数据下放路径：`REMSPipeline.ingest` → `MetabolismService.process_input(pre_role_entries=role_entries)` → `_apply_boundary_result` / `_force_save_all` → `EventService.seal_event(pre_role_entries=...)`，最终在 `seal_event` 里完成模式选择与池回填。
 
 #### 4.2.4 超长未完成事件的 80/20 强制分裂（Forced Split at Logical Closure）
 

@@ -137,8 +137,8 @@ class REMSConfig(BaseSettings):
     boundary_enable_llm_eval: bool = False
     # 回忆时前缀链展开的最大深度——防止"前缀的前缀的前缀……"把回忆块撑爆。
     recall_split_prefix_max_depth: int = 3
-    # 递归摘要熔断：某级摘要字符数 **低于** 该阈值则不再生成更高级（白皮书 1.1.3）；按产品约定为 20 字。
-    summary_fuse_min_chars: int = 20
+    # 递归摘要熔断：某级摘要字符数 **低于** 该阈值则不再生成更高级（白皮书 1.1.3）；按产品约定为 35 字。
+    summary_fuse_min_chars: int = 35
 
     # 情绪唤醒度映射遗忘因子的幂指数：base_forgetting_factor = 100 * arousal ** gamma。
     emotion_arousal_gamma: float = 2.0
