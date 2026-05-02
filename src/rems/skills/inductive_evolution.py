@@ -41,7 +41,7 @@ class InductiveEvolutionSkill:
         """
         evidence = evidence_events or events
         event_contents = self._build_content_raw_text(evidence)
-        target_content_len = self._target_content_len(evidence)
+        leaf_count, leaf_avg_len, target_content_len = self._leaf_evidence_stats(evidence)
         insight_enabled = self._config.enable_abstract_insight
         insight_instruction = (
             "- `insight`：开启。请提炼跨事件的认知/规律，强调角色行为模式或关系变化；不要复述事实本身。"
@@ -65,14 +65,22 @@ class InductiveEvolutionSkill:
             count=len(evidence),
             event_contents=event_contents,
             target_content_len=target_content_len,
+            leaf_count=leaf_count,
+            leaf_avg_len=leaf_avg_len,
             insight_instruction=insight_instruction,
             json_schema=json_schema,
+        )
+
+        system_msg = EVOLUTION_SYSTEM.format(
+            target_content_len=target_content_len,
+            leaf_count=leaf_count,
+            leaf_avg_len=leaf_avg_len,
         )
 
         data = self._llm.complete_json(
             "abstraction",
             [
-                {"role": "system", "content": EVOLUTION_SYSTEM},
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
         )
@@ -103,11 +111,20 @@ class InductiveEvolutionSkill:
         return "\n\n".join(lines)
 
     @staticmethod
-    def _target_content_len(events: list[Event]) -> int:
+    def _leaf_evidence_stats(events: list[Event]) -> tuple[int, int, int]:
+        """``(leaf_count, avg_content_raw_len_rounded, target_len)`` for prompts.
+
+        ``target_len`` = ``max(1, int(mean(len(content_raw)) * 1.2))``，与原先
+        ``_target_content_len`` 一致；``avg`` 取四舍五入整数便于模型读数。
+        """
         if not events:
-            return 0
-        avg = sum(len(e.content_raw) for e in events) / len(events)
-        return max(1, int(avg * 1.2))
+            return 0, 0, 0
+        n = len(events)
+        total = sum(len(e.content_raw) for e in events)
+        avg_f = total / n
+        target = max(1, int(avg_f * 1.2))
+        avg_rounded = int(round(avg_f))
+        return n, avg_rounded, target
 
     @staticmethod
     def _build_role_context(event: Event) -> str:

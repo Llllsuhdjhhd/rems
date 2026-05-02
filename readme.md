@@ -11,7 +11,7 @@
   - 引入通用的 **Skill 评估 / 修复协议**（`SkillEvaluator` / `SkillRemediator`），评估只做一层，修复后的输出不再评估；首批落地于 BoundaryDetection，后续可扩展到 Enrichment / InductiveEvolution 等 skill（§4.2.5）。
   - 角色抽取 prompt 加强：**全叙事层角色覆盖**（含第一人称叙述者与关键缺席者）、**反应型角色 B 级上限**、**L3 → L2 → L1 的"父-子"推导铁律**（严禁同义改写）、**L1 熔断字数**（§1.1.4）；情感量化明确"仅据当前片段、禁引人物生平"（§2.5.1）。
   - 边界检测 prompt 对应新增：`force_threshold` 注入、`split_id` 配对声明、`new_unclosed` 对象格式（旧扁平 `new_unclosed_indices` 继续兼容）（§4.2.4）。
-  - **事件级 Enrichment 三种工作模式**（§4.2.3）：常规对话流默认走 **`names_only`**——pipeline 在 pre-recall 阶段已经基于 `shadow + raw_input` 抽出了「全局富信息池」（每个角色含 snapshot + 8 维情绪），事件级别的 `EventEnrichmentSkill` 只负责"摘要 + 该事件实际登场的角色名"，snapshot 与情感由后端按 `role_id` 从池里直接回填，不再让 LLM 重做。pre-recall 抽不到角色时自动回退 `full`（原行为）；外部已构造完整 `role_entries` 时走 `summary_only`。该路径同时把 `summary_fuse_min_chars` 从 20 调到 35，并把熔断从单条件升级为**双熔断**（下一级预算 ≤ 阈值 ‖ 上一级实际字数 × 0.5 < ⌊阈值×0.7⌋），减少"压到只剩四五个字"的不可读层级。
+  - **事件级 Enrichment 三种工作模式**（§4.2.3）：常规对话流默认走 **`names_only`**——pipeline 在 pre-recall 阶段已经基于 `shadow + raw_input` 抽出了「全局富信息池」（每个角色含 snapshot + 8 维情绪），事件级别的 `EventEnrichmentSkill` 只负责"摘要 + 该事件实际登场的角色名字符串数组"，**`role_id` 由代码用 `known_roles`（含 aliases）做字符串匹配解析**，snapshot 与情感按 role_id 从池里直接回填，不再让 LLM 重做。pre-recall 抽不到角色时自动回退 `full`（原行为）；外部已构造完整 `role_entries` 时走 `summary_only`。该路径同时把 `summary_fuse_min_chars` 从 20 调到 35，并把熔断从单条件升级为**双熔断**（下一级预算 ≤ 阈值 ‖ 上一级实际字数 × 0.5 < ⌊阈值×0.7⌋），减少"压到只剩四五个字"的不可读层级。
 
 ## 1. 基本事件定义
 
@@ -412,10 +412,14 @@ $$\text{base\_forgetting\_factor} = 100 \cdot a^{\gamma}, \quad \gamma = 2 \text
 | 模式 | 触发条件 | LLM 输出 | snapshot / 8 维情绪来源 |
 |---|---|---|---|
 | `full` | `pre_role_entries` 为空（pre-recall 未抽到角色）且未 `skip_roles` | 摘要 + **完整角色**（含 snapshot + 8 维情绪） | LLM 同次产出 |
-| **`names_only`（默认对话流）** | pipeline pre-recall 已经抽到角色，把 `role_entries`（含 snapshot + 8 维情绪）作为「全局富信息池」下放 | 摘要 + **仅识别本事件实际登场的角色名**（外加可对齐的 `role_id`） | 后端按 `role_id` / `name` / `alias` 从 pre-recall 池**回填**，事件级 LLM 不重做 |
+| **`names_only`（默认对话流）** | pipeline pre-recall 已经抽到角色，把 `role_entries`（含 snapshot + 8 维情绪）作为「全局富信息池」下放 | 摘要 + **本事件实际登场的角色名字符串数组**（如 `["贾雨村", "娇杏"]`）；不出 `role_id` / snapshot / emotion | 后端用名字对 `known_roles`（含 aliases）做**字符串匹配**解析 `role_id`，再从 pre-recall 池回填 snapshot + 8 维情绪 |
 | `summary_only` | 外部已经显式构造了完整 `role_entries` 或显式 `skip_roles=True` | 仅摘要 | 由调用方提供 |
 
-`names_only` 路径的设计动机：pipeline pre-recall 阶段已经在 `shadow + raw_input` 完整上下文上调用 `RoleExtractionSkill` 抽出过一份"全局角色池"，每个角色的 snapshot 与 8 维情绪都基于完整上下文判定；事件级 enrichment 只需要回答"这条 sealed event 里**实际登场**了池中哪些角色"——一个轻量的"摘要 + 角色名子集"调用就够了，避免为每条事件让 LLM 把 snapshot/情感重做一遍。事件最终 `role_list` 仍只包含本事件真实出场的角色子集，富信息从池里直接复制；池外新角色（极少数 pre-recall 漏抽场景）走兜底路径自动注册并以空快照入库（带 `info` 日志）。
+`names_only` 路径的设计动机：pipeline pre-recall 阶段已经在 `shadow + raw_input` 完整上下文上调用 `RoleExtractionSkill` 抽出过一份"全局角色池"，每个角色的 snapshot 与 8 维情绪都基于完整上下文判定；事件级 enrichment 只需要回答"这条 sealed event 里**实际登场**了池中哪些角色"——一个轻量的"摘要 + 角色名字符串数组"调用就够了，避免为每条事件让 LLM 把 snapshot/情感重做一遍。
+
+`names_only` 的 LLM 契约（与 `full` 路径一同输出 role_id + 各级 snapshot + 8 维 emotion 的对比）有意只让模型出名字数组，**`role_id` 完全由代码用字符串匹配解析**：把 `known_roles.name` 与 `known_roles.aliases` 全量摊平成 `name → role_id` 字典，命中即取池中富信息条目；prompt 端要求 LLM 命中已知角色时**输出该角色在已知列表里的规范名**（"雨村" → "贾雨村"），降低匹配失败概率。
+
+事件最终 `role_list` 仍只包含本事件真实出场的角色子集，富信息从池里直接复制；池外新角色（极少数 pre-recall 漏抽场景）走兜底路径自动注册并以空快照入库（带 `info` 日志）。
 
 数据下放路径：`REMSPipeline.ingest` → `MetabolismService.process_input(pre_role_entries=role_entries)` → `_apply_boundary_result` / `_force_save_all` → `EventService.seal_event(pre_role_entries=...)`，最终在 `seal_event` 里完成模式选择与池回填。
 

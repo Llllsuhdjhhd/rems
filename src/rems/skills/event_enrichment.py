@@ -99,7 +99,6 @@ class EventEnrichmentSkill:
             user_msg = ENRICHMENT_SUMMARY_ONLY_USER.format(
                 content_raw=content_raw,
                 summary_budget_table=summary_budget_text,
-                fuse_min_chars=fuse_min,
             )
             mode = "summary_only"
         elif names_only:
@@ -180,21 +179,26 @@ class EventEnrichmentSkill:
         if not isinstance(raw, list):
             return []
         out: list[ExtractedRole] = []
+        seen_names: set[str] = set()
         for rd in raw:
+            if names_only:
+                # names_only 路径契约：模型直接输出名字字符串数组 ["角色名1", "角色名2"]。
+                # 兼容旧契约：若仍是 dict 形态，只取 name 字段，role_id 由代码后续用
+                # known_roles 做字符串匹配自行解析（详见 EventService.seal_event）。
+                if isinstance(rd, str):
+                    name = rd.strip()
+                elif isinstance(rd, dict):
+                    name = (rd.get("name") or "").strip()
+                else:
+                    continue
+                if not name or name in seen_names:
+                    continue
+                seen_names.add(name)
+                out.append(ExtractedRole(name=name))
+                continue
             if not isinstance(rd, dict):
                 continue
             name = rd.get("name", "") or ""
-            if names_only:
-                # names_only 路径：只信任 role_id + name，其余字段保持 ExtractedRole 默认值
-                # （空 RoleSnapshot + 默认 EmotionalModel）。snapshot/emotion 由
-                # EventService 从 pre_role_entries 池里按 role_id 回填，避免重复抽取。
-                if not name and not rd.get("role_id"):
-                    continue
-                out.append(ExtractedRole(
-                    role_id=rd.get("role_id"),
-                    name=name,
-                ))
-                continue
             snap = rd.get("snapshot") or {}
             emo = rd.get("emotion") or {}
             emotion_init: dict[str, float] = {}

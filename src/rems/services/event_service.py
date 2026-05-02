@@ -124,46 +124,58 @@ class EventService:
         if use_names_only:
             # 池：role_id → 富信息 EventRoleEntry（含 snapshot + 8 维情绪）。
             pool_by_id: dict[str, EventRoleEntry] = {pe.role_id: pe for pe in (pre_role_entries or [])}
-            # 名字 / 别名 → role_id 兜底映射，用于 LLM 漏填 role_id 的情况（按名字命中已知池）。
+            # 名字 / 别名 → role_id 字符串匹配表。names_only 路径下 LLM 只输出名字数组，
+            # role_id 完全由这里的字符串匹配解析（命中规范名或任一 alias 即认定为同一角色）。
+            # 同时建一份"去空白" 索引，吸收 LLM 偶尔多出的首尾空格。
             name_to_id: dict[str, str] = {}
             for kr in (known_roles or []):
                 if kr.name:
                     name_to_id.setdefault(kr.name, kr.role_id)
+                    name_to_id.setdefault(kr.name.strip(), kr.role_id)
                 for alias in (kr.aliases or []):
                     if alias:
                         name_to_id.setdefault(alias, kr.role_id)
+                        name_to_id.setdefault(alias.strip(), kr.role_id)
 
             seen_ids: set[str] = set()
             for er in enrichment.roles:
-                rid = er.role_id or name_to_id.get(er.name)
+                name = (er.name or "").strip()
+                if not name:
+                    continue
+                rid = name_to_id.get(name) or name_to_id.get(er.name or "")
                 if rid and rid in pool_by_id and rid not in seen_ids:
-                    # 直接复用 pre-recall 抽到的富信息 entry（snapshot + 情感来自全局上下文）。
+                    # 命中已知角色：直接复用 pre-recall 抽到的富信息 entry。
                     resolved_role_entries.append(pool_by_id[rid])
                     seen_ids.add(rid)
                     continue
-                # 池外新角色：注册到角色库并以默认（空快照 / 默认情绪）入库。
-                # 这是设计上的保留兜底——pre-recall 在 combined_text 上抽角色，
-                # 理论上能覆盖本事件的所有出场角色；极少数遗漏走这条路径。
-                if not er.name or self._role_service is None:
+                if rid and rid in seen_ids:
                     continue
+                # 池外新角色（极少见——pre-recall 漏抽场景）：注册到角色库并以默认快照入库。
+                if self._role_service is None:
+                    logger.warning(
+                        "names_only enrichment surfaced new role '%s' but role_service is unavailable; skipping",
+                        name,
+                    )
+                    continue
+                fresh = ExtractedRole(name=name)
                 id_mapping = self._role_service.resolve_and_register(
-                    [er], is_suspicious=is_suspicious,
+                    [fresh], is_suspicious=is_suspicious,
                 )
-                lookup_key = er.role_id or er.name
-                assigned_id = id_mapping.get(lookup_key, lookup_key)
+                assigned_id = id_mapping.get(name, name)
                 if assigned_id in seen_ids:
                     continue
                 if assigned_id in pool_by_id:
-                    # resolve_and_register 把名字解析回了池里某个已知角色：仍优先用池数据。
+                    # resolve_and_register 把新名字解析回了池里某个已知角色（典型：
+                    # 触发了语义/向量级别的实体合并）。仍优先用池数据。
                     resolved_role_entries.append(pool_by_id[assigned_id])
                 else:
                     logger.info(
                         "names_only enrichment surfaced new role '%s' (id=%s) outside pre-recall pool; "
                         "registering with empty snapshot",
-                        er.name, assigned_id,
+                        name, assigned_id,
                     )
                     resolved_role_entries.append(
-                        RoleExtractionSkill.to_event_role_entry(er, assigned_id)
+                        RoleExtractionSkill.to_event_role_entry(fresh, assigned_id)
                     )
                 seen_ids.add(assigned_id)
         elif not skip_roles and not resolved_role_entries and enrichment.roles:

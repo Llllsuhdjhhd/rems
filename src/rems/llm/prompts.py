@@ -167,14 +167,28 @@ OVERLONG_UC_SPLIT_USER = """\
 # =====================================================================
 # 以 boundary 剥离出的 content_raw 为输入，生成 L1…Ln 递归摘要（带熔断）。
 
-ENRICHMENT_SUMMARY_ONLY_SYSTEM = """\
-你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，交付事件摘要：
+# 三路 enrichment（full / names_only / summary_only）共享的同一段「摘要 A」规则；
+# ``fuse_compact_threshold`` 须由调用方设为 floor(fuse_min_chars × 0.7)，至少 1。
+ENRICHMENT_SUMMARY_A_RULES = """\
+A. **summaries：L1…Ln 递归压缩**
+   - 遵守【摘要字数预算表】；L1 保真主干，必须是一段**通顺的完整叙事**，包含关键动作、因果转折与重要心理细节，不得写成事件清单。
+   - L2+ 逐层约减半；每一级应是对**上一级摘要**的语义压缩，而非对原文的重新概括。
+   - **熔断规则**：满足任一条件即停止生成下一级，`summaries` 仅含已产出层级：（1）下一级 Ln 的**预算字数** ≤ {fuse_min_chars} 字；（2）上一级 L(n-1) 摘要的**实际字数** × 0.5 < {fuse_compact_threshold} 字（阈值 = floor({fuse_min_chars} × 0.7)，至少 1）。
+   - **可读性底线**：任何一级摘要须为语法通顺的完整句子；若在该级预算内无法维持可读性，宁可不生成该级。
+"""
 
-**summaries：L1…Ln 递归压缩**
-- 遵守【摘要字数预算表】；L1 保真主干，L2+ 逐层约减半。
-- **熔断**：当某级摘要字符数 **≤ {fuse_min_chars}** 时，**不得再生成**下一级更压缩摘要（`summaries` 只含已产出的各级）。
+ENRICHMENT_ENRICH_INTRO_TWO_OUTPUTS = """\
+你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，**单次输出**两类衍生数据：
 
-只输出一个 JSON 对象，包含 `summaries` 字典，勿附加说明。"""
+"""
+
+ENRICHMENT_SUMMARY_ONLY_INTRO = """\
+你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**事件原文（基本事件或抽象事件的压缩主干均可），本次**仅**输出摘要层级：
+
+"""
+
+ENRICHMENT_SUMMARY_ONLY_SYSTEM_SUFFIX = """\
+勿输出 `roles`、`role_list` 或其它字段。只输出一个 JSON 对象，包含 `summaries` 字典。输出严格 JSON。"""
 
 ENRICHMENT_SUMMARY_ONLY_USER = """\
 ## 事件原文
@@ -183,8 +197,8 @@ ENRICHMENT_SUMMARY_ONLY_USER = """\
 ## 摘要字预算
 {summary_budget_table}
 
-## 任务：摘要（L1 起，遵守熔断 {fuse_min_chars}）
-生成 `summaries` 各级，直至熔断或达预算上限。
+## 任务
+生成 `summaries`（L1 起；递归压缩与熔断规则见系统提示 **A**）。
 
 ## 输出 JSON
 ```json
@@ -208,29 +222,29 @@ ENRICHMENT_SUMMARY_ONLY_USER = """\
 # 字段裁剪（与 ENRICHMENT_FULL_USER 的 roles 数组对比）：
 #   - 移除：snapshot.{l1_mention,l2_interaction,l3_decision}、emotion 八维
 #   - 保留：role_id（命中已知角色时填）、name
-# 摘要规则与 ENRICHMENT_FULL_SUMMARY_SECTION 完全一致（含 fuse_min/fuse_compact 双熔断）。
-ENRICHMENT_SUMMARY_AND_NAMES_SYSTEM = """\
-你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，**单次输出**两类衍生数据：
-
-A. **summaries：L1…Ln 递归压缩**
-   - 遵守【摘要字数预算表】；L1 保真主干，必须是一段**通顺的完整叙事**，包含关键动作、因果转折与重要心理细节，不得写成事件清单。
-   - L2+ 逐层约减半；每一级应是对**上一级摘要**的语义压缩，而非对原文的重新概括。
-   - **熔断规则**：满足任一条件即停止生成下一级，`summaries` 仅含已产出层级：(1) 下一级 Ln 的**预算字数** ≤ {fuse_min_chars} 字；(2) 上一级 L(n-1) 摘要的**实际字数** × 0.5 < {fuse_compact_threshold} 字（阈值 = floor({fuse_min_chars} × 0.7)，至少 1）。
-   - **可读性底线**：任何一级摘要须为语法通顺的完整句子；若在该级预算内无法维持可读性，宁可不生成该级。
-
-B. **roles：仅识别原文中确实出现 / 参与的角色，只输出角色名（外加可对齐的 role_id）**
-   - **不输出 snapshot、不输出 emotion**；这两类信息由后端从「全局预抽取池」按 role_id 回填，重复输出会被丢弃。
-   - 优先匹配【已知角色列表】中的现有 role_id（含别名 / 代词指代命中）：命中即填该 role_id；不要伪造新的 role_id。
-   - 仅当文本中确实出现【已知角色列表】之外的新角色时，才以 `role_id=null` + 新名字补充。
+# 摘要规则与 ``ENRICHMENT_SUMMARY_A_RULES`` / full 分支完全一致。
+ENRICHMENT_SUMMARY_AND_NAMES_ROLES_B = """\
+B. **roles：仅识别原文中确实出现 / 参与的角色，只输出名字字符串数组**
+   - 输出形如 `["角色名1", "角色名2"]` 的字符串数组；**不要**输出 role_id、snapshot、emotion 等任何其它字段。后端会用名字对【已知角色列表】做字符串匹配（含别名 / 代词指代）以解析 role_id 并回填 snapshot 与情感。
+   - **命名规范化（重要）**：当原文中的指代命中【已知角色列表】中某条目时，**必须**输出该条目的**规范名 `name`**，而不是原文里的别名 / 代词 / 简称——例如已知角色为 `贾雨村`，原文出现的"雨村"、"贾老爷"、"他"应统一输出为 `"贾雨村"`，否则后端字符串匹配将无法命中。
+   - 仅当文本中确实出现【已知角色列表】之外的新角色（包括用别名也无法对应任何已知条目时），才直接输出该新角色的本名。
    - 不要把仅被第三方提及但未在本事件原文出场（无任何动作 / 对白 / 心理描写）的角色补进列表。
+   - 不要重复输出同一个角色名。
 
 输出严格 JSON。"""
+
+ENRICHMENT_SUMMARY_AND_NAMES_SYSTEM = (
+    ENRICHMENT_ENRICH_INTRO_TWO_OUTPUTS
+    + ENRICHMENT_SUMMARY_A_RULES
+    + "\n\n"
+    + ENRICHMENT_SUMMARY_AND_NAMES_ROLES_B
+)
 
 ENRICHMENT_SUMMARY_AND_NAMES_USER = """\
 ## 事件原文
 {content_raw}
 
-## 已知角色列表（来自全局预抽取池；优先在此对齐 role_id）
+## 已知角色列表（来自全局预抽取池；本事件中命中的角色请按此处的规范名输出）
 {known_roles}
 
 ## 摘要字预算
@@ -238,7 +252,7 @@ ENRICHMENT_SUMMARY_AND_NAMES_USER = """\
 
 ## 任务
 1. 生成 `summaries`（L1 起；递归压缩与熔断规则见系统提示 **A**）。
-2. 输出 `roles`：数组元素只含 `role_id`（能对齐已知列表则填，否则 null）与 `name`，**不输出** snapshot 与 emotion。
+2. 输出 `roles`：**仅角色名字符串数组**，命中已知角色时使用其规范名；不要输出 role_id / snapshot / emotion。
 
 ## 输出 JSON
 ```json
@@ -247,24 +261,14 @@ ENRICHMENT_SUMMARY_AND_NAMES_USER = """\
     "L1": "…",
     "L2": "…"
   }},
-  "roles": [
-    {{ "role_id": "ROL-... 或 null", "name": "角色名" }}
-  ]
+  "roles": ["角色名1", "角色名2"]
 }}
 ```"""
 
 
-# Event enrichment「摘要」段（人物规则全文复用 ``ROLE_EXTRACTION_CORE_RULES``，定义见下文 §4）。
-ENRICHMENT_FULL_SUMMARY_SECTION = """\
-你是 REMS 事件充实（Event Enrichment）组件。给定**已闭环**基本事件原文，**单次输出**两类衍生数据：
+# Event enrichment「摘要」段（与 names_only / summary_only 共用 ``ENRICHMENT_SUMMARY_A_RULES``）。
+ENRICHMENT_FULL_SUMMARY_SECTION = ENRICHMENT_ENRICH_INTRO_TWO_OUTPUTS + ENRICHMENT_SUMMARY_A_RULES
 
-A. **summaries：L1…Ln 递归压缩**
-   - 遵守【摘要字数预算表】；L1 保真主干，必须是一段**通顺的完整叙事**，包含关键动作、因果转折与重要心理细节，不得写成事件清单。
-   - L2+ 逐层约减半；每一级应是对**上一级摘要**的语义压缩，而非对原文的重新概括。
-   - **熔断规则**：满足任一条件即停止生成下一级，`summaries` 仅含已产出层级：（1）下一级 Ln 的**预算字数** ≤ {fuse_min_chars} 字；（2）上一级 L(n-1) 摘要的**实际字数** × 0.5 < {fuse_compact_threshold} 字（阈值 = floor({fuse_min_chars} × 0.7)，至少 1）。
-   - **可读性底线**：任何一级摘要须为语法通顺的完整句子；若在该级预算内无法维持可读性，宁可不生成该级。
-
-"""
 
 ENRICHMENT_FULL_ROLE_BRIDGE = """\
 B. **roles：** 下列内容与 REMS「角色提取」（第一步 ``RoleExtractionSkill``）的系统提示 **完全一致**（同一段 ``ROLE_EXTRACTION_CORE_RULES``）：
@@ -339,7 +343,8 @@ def build_enrichment_system_message(
       - ``"full"``        ：摘要 + 完整角色（snapshot + 8 维情绪），单次合并调用；
       - ``"names_only"``  ：摘要 + 仅角色名（外加可对齐的 role_id）。配合 pipeline pre-recall
                            的「全局富信息池」，事件级 enrich 不再让 LLM 重做 snapshot/情感；
-      - ``"summary_only"``：仅摘要，外部已经传入 ``role_entries`` 时使用。
+      - ``"summary_only"``：仅摘要（抽象事件封存、`skip_roles=True`、或外部已传入 ``role_entries``）。
+                           系统提示中的摘要 **A** 节与 full / names_only **同源**（``ENRICHMENT_SUMMARY_A_RULES``）。
 
     ``fuse_compact_threshold`` 由 ``fuse_min_chars`` 派生（×0.7 取下整，至少为 1），写入摘要 A 节熔断条件（2）。
     """
@@ -362,13 +367,34 @@ def build_enrichment_system_message(
             fuse_compact_threshold=fuse_compact_threshold,
         )
     elif mode == "summary_only":
-        body = ENRICHMENT_SUMMARY_ONLY_SYSTEM.format(fuse_min_chars=fuse_min_chars)
+        body = (
+            ENRICHMENT_SUMMARY_ONLY_INTRO
+            + ENRICHMENT_SUMMARY_A_RULES.format(
+                fuse_min_chars=fuse_min_chars,
+                fuse_compact_threshold=fuse_compact_threshold,
+            )
+            + "\n\n"
+            + ENRICHMENT_SUMMARY_ONLY_SYSTEM_SUFFIX
+        )
     else:
         raise ValueError(f"Unknown enrichment mode: {mode!r} (expected full/names_only/summary_only)")
     return base + body
 
 
-# 旧符号保留（兼容外部 import）：
+_LEGACY_ENRICHMENT_SUMMARY_ONLY_DEFAULT_FUSE = 12
+
+# 旧符号保留（兼容外部 import）：与 summary_only 运行时规则一致，熔断取代表性默认值。
+ENRICHMENT_SUMMARY_ONLY_SYSTEM = (
+    ENRICHMENT_SUMMARY_ONLY_INTRO
+    + ENRICHMENT_SUMMARY_A_RULES.format(
+        fuse_min_chars=_LEGACY_ENRICHMENT_SUMMARY_ONLY_DEFAULT_FUSE,
+        fuse_compact_threshold=max(
+            1, int(_LEGACY_ENRICHMENT_SUMMARY_ONLY_DEFAULT_FUSE * 0.7)
+        ),
+    )
+    + "\n\n"
+    + ENRICHMENT_SUMMARY_ONLY_SYSTEM_SUFFIX
+)
 ENRICHMENT_SYSTEM = ENRICHMENT_SUMMARY_ONLY_SYSTEM
 ENRICHMENT_USER = ENRICHMENT_SUMMARY_ONLY_USER
 
@@ -569,25 +595,23 @@ ROLE_EXTRACTION_USER = """\
 # =====================================================================
 
 EVOLUTION_SYSTEM = """\
-你是 REMS 抽象事件压缩组件。输入是若干叶子基本事件的 `content_raw` 及其角色线索。
+你是 REMS 抽象事件压缩组件。输入是若干基本事件的 content_raw 及其角色线索（仅用于辅助保留主体）。
 
 硬性约束：
-- 抽象事件**不登记任何角色**，不生成角色快照、角色级摘要、情感量化，也不触发语义卡片；
-- 但压缩 `content_raw` 时**不能漏掉关键角色/实体**：角色线索只用于帮助保留主体、行为与关系，不作为 `role_list` 输出；
-- `content_raw` 不是高阶泛化口号，也不是罗列所有原文；它应像基本事件一样抓住重点做事实压缩，保留共现事件中的主干人物、动作、对象与结果；
-- `content_raw` 的目标长度约等于输入叶子基本事件 `content_raw` 平均长度的 1.2 倍；
-- L1-L10 摘要不在此处生成，外层会按基本事件同规则继续递归摘要；
-- 仅当用户消息明确要求 `insight` 字段时才输出 insight；insight 是跨事件提炼出的认知/规律，不是对事实文本的再摘要；
-- **禁止**在输出中加入 `roles`、`role_list`、`emotion_trend`、`summaries` 等字段。
+- 输出 JSON 仅包含用户消息末尾 schema 所列字段（勿自行添加其它键）。
+- `content_raw` 是若干基本事件融合后的事实性压缩，保留核心人物、动作、对象与因果线；不是口号式的泛化摘要，也不是事件清单。
+- **`content_raw` 字数目标：约 {target_content_len} 字**（当前证据共 **{leaf_count}** 条叶子事件，各条 `content_raw` 长度均值约 **{leaf_avg_len} 字**，由后端按「均值 × 1.2」取整得到前一数字；可略浮动，勿显著缩水以致因果残缺，勿堆砌冗余）。
+- 角色线索只用于帮助保持主体清晰，不要将线索中的角色快照、情感等带进 content_raw。
 
-输出严格 JSON。"""
+输出严格 JSON。
+"""
 
 EVOLUTION_USER = """\
 ## 基本事件 content_raw 证据集合（共 {count} 个事件）
 {event_contents}
 
 ## 输出控制
-- `content_raw`：抓住重点压缩，目标约 {target_content_len} 字（叶子基本事件均值的 1.2 倍）；保留关键角色/实体，不做角色对象输出。
+- `content_raw`：抓住重点压缩，**目标约 {target_content_len} 字**（证据 **{leaf_count}** 条、均值约 **{leaf_avg_len}** 字）；保留关键角色/实体，不做角色对象输出。
 {insight_instruction}
 
 返回 JSON：
