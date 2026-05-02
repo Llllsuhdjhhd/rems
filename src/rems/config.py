@@ -37,6 +37,10 @@ class TaskModelMapping(BaseModel):
 
     summary: str = "deepseek-v4-flash"
     boundary_detection: str = "deepseek-v4-flash"
+    # 超长未完成事件的分裂修复；通常可直接复用 boundary_detection 的模型，也可指定更强模型。
+    overlong_uc_split: str = "deepseek-v4-flash"
+    # 可选：对 boundary_detection 输出的二级 LLM 评估器；默认同主模型。
+    boundary_evaluation: str = "deepseek-v4-flash"
     role_extraction: str = "deepseek-v4-flash"
     # 事件充实：一次调用产出摘要 + 角色；与 summary 同主模型时便于在 DashScope 侧统一配额。
     event_enrichment: str = "deepseek-v4-flash"
@@ -113,9 +117,26 @@ class REMSConfig(BaseSettings):
     abstract_subset_min_size: int = 6
     abstract_subset_min_support: int = 5
 
-    # 未闭合事件总长超过 len_msg * 该比例则强制封存（白皮书 4.2：兜底 1.2×len_msg）。
-    # 同时作为物理红线触发时的强制封存阈值；是否「可疑」由角色抽取与 RoleService 仲裁判断。
+    # 未闭合事件总长超过 len_msg * 该比例则触发 80/20 强制分裂（详见 boundary_split_* 设置）。
+    # 白皮书 4.2 的物理红线（physical_redline）仍在 ``_check_physical_redline`` 兜底，
+    # 但"认知层"的默认路径不再做盲目强制封存——只做评估 → 修复 → 保留 oversized UC。
+    # 是否「可疑」由角色抽取与 RoleService 仲裁判断。
     unclosed_force_ratio: float = 1.2
+    # ---- 80/20 Forced Split (2026-05, 白皮书 4.2 升级) ----
+    # 评估到 oversized_uc 后，OverlongUCSplitSkill 的目标切分比例与可接受区间。
+    # 切点仍由模型基于"逻辑闭环"选择，此处只给数量级指引。
+    boundary_split_ratio_target: float = 0.8
+    boundary_split_ratio_min: float = 0.7
+    boundary_split_ratio_max: float = 0.9
+    # 是否启用 OverlongUCSplitRemediator（修复器）。关闭时 oversized UC 将保留为 oversized=True
+    # 但不再 force-seal，直接让物理红线层在极端情况下兜底。
+    boundary_remediation_enabled: bool = True
+    # 硬编码 1：评估只做一层，修复后的输出不再评估。
+    boundary_max_remediation_passes: int = 1
+    # 是否启用 LLM 评估器（对切分质量做二级评估，成本敏感）。默认关闭。
+    boundary_enable_llm_eval: bool = False
+    # 回忆时前缀链展开的最大深度——防止"前缀的前缀的前缀……"把回忆块撑爆。
+    recall_split_prefix_max_depth: int = 3
     # 递归摘要熔断：某级摘要字符数 **低于** 该阈值则不再生成更高级（白皮书 1.1.3）；按产品约定为 20 字。
     summary_fuse_min_chars: int = 20
 

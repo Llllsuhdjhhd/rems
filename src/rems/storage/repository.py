@@ -50,8 +50,28 @@ class EventRepository:
                 is_tombstoned=event.is_tombstoned,
                 activation_energy=event.activation_energy,
                 compression_ratio=event.compression_ratio,
+                split_successor_event_ids=list(event.split_successor_event_ids or []),
+                split_prefix_event_ids=list(event.split_prefix_event_ids or []),
             )
             s.merge(record)
+            s.commit()
+
+    def append_split_successor(self, event_id: str, successor_event_id: str) -> None:
+        """Append *successor_event_id* to ``events.split_successor_event_ids`` (dedup).
+
+        在 tail UC 闭环封存为事件后，反向把该 event_id 记到其**每一个**前缀事件上，
+        以便审计 / 观测侧能从 "前缀"出发查到 "后继"。去重 + 保持顺序；目标记录
+        不存在时静默返回。
+        """
+        with self._db.session() as s:
+            r = s.get(EventRecord, event_id)
+            if r is None:
+                return
+            current = list(r.split_successor_event_ids or [])
+            if successor_event_id in current:
+                return
+            current.append(successor_event_id)
+            r.split_successor_event_ids = current
             s.commit()
 
     def get(self, event_id: str) -> Optional[Event]:
@@ -202,6 +222,8 @@ class EventRepository:
             is_tombstoned=bool(r.is_tombstoned),
             activation_energy=float(r.activation_energy or 0.0),
             compression_ratio=float(r.compression_ratio or 0.0),
+            split_successor_event_ids=list(getattr(r, "split_successor_event_ids", None) or []),
+            split_prefix_event_ids=list(getattr(r, "split_prefix_event_ids", None) or []),
         )
 
 
@@ -424,6 +446,8 @@ class MetabolismRepository:
                 created_at=event.created_at,
                 updated_at=event.updated_at,
                 last_hit_time=event.last_hit_time,
+                split_prefix_event_ids=list(event.split_prefix_event_ids or []),
+                oversized=bool(event.oversized),
             )
             s.merge(record)
             s.commit()
@@ -452,6 +476,8 @@ class MetabolismRepository:
             created_at=r.created_at,
             updated_at=r.updated_at,
             last_hit_time=r.last_hit_time,
+            split_prefix_event_ids=list(getattr(r, "split_prefix_event_ids", None) or []),
+            oversized=bool(getattr(r, "oversized", False) or False),
         )
 
 

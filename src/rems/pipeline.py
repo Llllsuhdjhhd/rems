@@ -209,7 +209,14 @@ class REMSPipeline:
             emotion_evolver=emotion_evolver,
         )
         
-        metabolism_service = MetabolismService(config, meta_repo, boundary_skill, event_service)
+        metabolism_service = MetabolismService.with_default_boundary_repair(
+            config,
+            meta_repo,
+            boundary_skill,
+            event_service,
+            event_repo=event_repo,
+            llm=llm,
+        )
         recall_service = RecallService(config, event_repo, role_repo, vector_store)
         abstraction_service = AbstractionService(
             config,

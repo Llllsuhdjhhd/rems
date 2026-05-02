@@ -60,12 +60,17 @@ class EventService:
         role_entries: list[EventRoleEntry] | None = None,
         skip_roles: bool = False,
         known_roles: list[Role] | None = None,
+        split_prefix_event_ids: list[str] | None = None,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
         创建、丰富字段、持久化并索引一条新的基本事件（``is_abstract`` 默认为 False）。
         可选传入已构造好的 ``role_entries`` 或 ``skip_roles`` 跳过角色抽取；
         ``known_roles`` 供 Enrichment 技能做去代词化对齐。超长 ``content_raw`` 会在 ``len_msg`` 处截断。
+
+        ``split_prefix_event_ids``：当本事件是某条 tail UC 闭环而来时，传入该 UC 继承的
+        分裂前缀链（自远而近）；本事件会把它写入 ``Event.split_prefix_event_ids``，
+        以便回忆阶段自动拉入前缀事件（白皮书 4.2 的 80/20 强制分裂补丁）。
 
         实现上：一次 ``EventEnrichmentSkill.enrich`` 调用同时产出多级摘要与角色列表，
         取代原来分两次调用摘要与角色技能的做法，减少 LLM 往返与上下文重复。
@@ -129,6 +134,7 @@ class EventService:
             decoration=decoration,
             input_id=input_id,
             compression_ratio=compression_ratio,
+            split_prefix_event_ids=list(split_prefix_event_ids or []),
         )
 
         # EMA 动态演化 + activation_energy 计算（白皮书 2.5）。

@@ -51,6 +51,9 @@ class EventRecord(Base):
     is_tombstoned = Column(Boolean, default=False)
     activation_energy = Column(Float, default=0.0)  # 白皮书 2.5 记忆初始值硬绑定
     compression_ratio = Column(Float, default=0.0)  # 白皮书 1.2 封存后实际 sum_len/raw_len
+    # 80/20 强制分裂链路（2026-05）：前后向指针，回忆时用来把前缀事件拉进回忆块。
+    split_successor_event_ids = Column(JSON, default=list)
+    split_prefix_event_ids = Column(JSON, default=list)
 
 
 class RoleRecord(Base):
@@ -105,6 +108,10 @@ class UnclosedEventRecord(Base):
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
     last_hit_time = Column(DateTime, nullable=False)
+    # 80/20 强制分裂：前缀事件链（自远而近）。UC 闭环为事件时由 MetabolismService 继承给目标事件。
+    split_prefix_event_ids = Column(JSON, default=list)
+    # 审计：评估器判定 oversized 但修复失败时置为 True；不触发强制封存。
+    oversized = Column(Boolean, default=False)
 
 
 # ------------------------------------------------------------------
@@ -161,6 +168,46 @@ class Database:
 
     def create_tables(self) -> None:
         Base.metadata.create_all(self.engine)
+        self._migrate_missing_columns()
+
+    def _migrate_missing_columns(self) -> None:
+        """Lightweight in-place migration for new columns introduced after initial schema.
+
+        ``SQLAlchemy.create_all`` 只建新表，不会向已有表补列；dev 数据库在本地长期
+        运行，新字段（如 80/20 分裂的链路字段）需要手动补列。此处只处理**追加列**
+        这一种极窄的 migration 场景：
+            - 逐字段 ``PRAGMA table_info`` 检查；
+            - 缺失就 ``ALTER TABLE ... ADD COLUMN``；
+            - 忽略除 SQLite 以外的后端（生产建议走正规 migration 工具）。
+        """
+        from sqlalchemy import inspect, text
+
+        if not self.engine.url.get_backend_name().startswith("sqlite"):
+            return
+
+        expected: dict[str, list[tuple[str, str]]] = {
+            "events": [
+                ("split_successor_event_ids", "TEXT DEFAULT '[]'"),
+                ("split_prefix_event_ids", "TEXT DEFAULT '[]'"),
+            ],
+            "unclosed_events": [
+                ("split_prefix_event_ids", "TEXT DEFAULT '[]'"),
+                ("oversized", "BOOLEAN DEFAULT 0"),
+            ],
+        }
+
+        inspector = inspect(self.engine)
+        with self.engine.begin() as conn:
+            for table_name, cols in expected.items():
+                if not inspector.has_table(table_name):
+                    continue
+                existing = {c["name"] for c in inspector.get_columns(table_name)}
+                for name, ddl in cols:
+                    if name in existing:
+                        continue
+                    conn.execute(text(
+                        f'ALTER TABLE {table_name} ADD COLUMN {name} {ddl}'
+                    ))
 
     @contextmanager
     def session(self) -> Iterator[Session]:

@@ -185,6 +185,15 @@ class Event(BaseModel):
     # 动态压缩率（白皮书 1.2）：封存后实际的 sum_len / raw_len，用于审计与追踪。
     compression_ratio: float = 0.0
 
+    # ---- 80/20 强制分裂链路（2026-05 新增） ----
+    # 若本事件是某次强制分裂的"前缀"（边界模型把过长未完成切成 prefix_completed + tail_uc），
+    # 则 ``split_successor_event_ids`` 在其对应 tail UC 闭环为事件时追加该事件 id。
+    # 允许 len>1：一条超长叙事可能跨多轮被切多次，前缀的后继可能再被切。
+    split_successor_event_ids: list[str] = Field(default_factory=list)
+    # 若本事件是 tail UC 闭环而来，这里继承 UC 的 ``split_prefix_event_ids`` 链。
+    # 回忆时 RecallService 会在命中本事件后自动把这些前缀事件拉进回忆块（允许降档压缩，但不丢弃）。
+    split_prefix_event_ids: list[str] = Field(default_factory=list)
+
     def model_post_init(self, __context: object) -> None:
         if not self.event_length:
             self.event_length = len(self.content_raw)

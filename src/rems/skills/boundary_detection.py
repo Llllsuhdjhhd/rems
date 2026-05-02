@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 # 边界检测技能：残影 + 当前输入 + 未完成库 → 已闭环片段、剩余残影、新未完成条目。
 # Prompt 内嵌白皮书 1.1.7 防碎片化聚合原则（同一段落内琐碎动作合并为一条基本事件）。
+# 新增（2026-05）：80/20 强制分裂 —— 过长未完成事件必须在逻辑闭环点切成
+#   一条 ``completed_events`` 前缀 + 一条 ``new_unclosed`` 尾部，二者用 ``split_id`` 配对。
 
 from pydantic import BaseModel, Field
 
@@ -20,11 +22,18 @@ logger = logging.getLogger(__name__)
 class CompletedFragment(BaseModel):
     content_raw: str
     continuation_of: Optional[str] = None
+    # 分裂标记：True 表示该已闭环片段是对某条过长未完成事件的 80% 前缀。
+    # ``split_id`` 与同一 BoundaryResult 中某条 NewUnclosed.split_id 配对。
+    is_split_prefix: bool = False
+    split_id: Optional[str] = None
 
 
 class NewUnclosed(BaseModel):
     content: str
     logical_gaps: Optional[str] = None
+    # 分裂尾段标记：若非 None，则指向同一 ``BoundaryResult`` 中
+    # 某条 ``is_split_prefix=True`` 的 ``CompletedFragment``。
+    split_id: Optional[str] = None
 
 
 class BoundaryResult(BaseModel):
@@ -35,19 +44,22 @@ class BoundaryResult(BaseModel):
 class BoundaryDetectionSkill:
     """LLM-driven boundary detector producing structured JSON for metabolism.
 
-    输入当前残影文本、本轮用户输入与未完成事件摘要，调用 ``boundary_detection`` 模型输出
-    ``completed_events`` / ``remaining_shadow`` / ``new_unclosed``，供 ``MetabolismService``
+    输入当前残影文本、本轮用户输入与未完成事件摘要（残影与本轮内容已合并入分句编码表，不重复贴全文），调用 ``boundary_detection`` 模型输出
+    ``completed_events`` / ``new_unclosed`` / 可选的分裂配对 ``split_id``，供 ``MetabolismService``
     封存或挂起（白皮书 4.1、1.1.7 防碎片化条款体现在系统/用户 prompt 中）。
     """
 
     @staticmethod
     def _decode_new_unclosed_list(raw: list, sentences: list[str]) -> list[NewUnclosed]:
-        """Map ``new_unclosed_indices`` JSON to ``NewUnclosed`` list.
+        """Map legacy ``new_unclosed_indices`` JSON to ``NewUnclosed`` list.
 
         - **扁平数字列表** ``[1,2,3]``：视为**同一条**未完成叙事内连续句子（只落库一行）。
         - **嵌套列表** ``[[1,2],[8,9]]``：多线程时多条未完成，每组一行。
         若对扁平表逐项解码，会误将 ``[1,2,3]`` 拆成 3 条只含一句的未完成（DB 里「一条叙事多行」）
         —— 这是此前异常膨胀的主要原因。
+
+        注意：该路径**无法**声明 ``split_id``，即旧格式不支持分裂配对。若需要分裂
+        配对，应走 ``_decode_new_unclosed_objects``（新格式 ``new_unclosed: [{{ indices, split_id }}]``）。
         """
         if not raw:
             return []
@@ -72,6 +84,49 @@ class BoundaryDetectionSkill:
                 new_unc.append(NewUnclosed(content=content, logical_gaps=None))
         return new_unc
 
+    @staticmethod
+    def _decode_new_unclosed_objects(
+        raw: list,
+        sentences: list[str],
+    ) -> list[NewUnclosed]:
+        """New-format decoder: ``[{ "indices": [...], "split_id": "SP-1"? }, ...]``.
+
+        每个对象独立落成一条 ``NewUnclosed``；其 ``split_id`` 在本批 ``BoundaryResult`` 内
+        必须与某条 ``completed_events`` 的 ``split_id`` 配对（配对校验交由 ``BoundaryForceThresholdEvaluator``）。
+        """
+        if not raw:
+            return []
+        new_unc: list[NewUnclosed] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            indices = item.get("indices")
+            if not isinstance(indices, list):
+                continue
+            norm_idx: list[int] = []
+            for v in indices:
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)):
+                    norm_idx.append(int(v))
+            if not norm_idx:
+                continue
+            content = decode_indices(sentences, norm_idx)
+            if not content:
+                continue
+            split_id = item.get("split_id")
+            if split_id is not None and not isinstance(split_id, str):
+                split_id = None
+            logical_gaps = item.get("logical_gaps")
+            if logical_gaps is not None and not isinstance(logical_gaps, str):
+                logical_gaps = None
+            new_unc.append(NewUnclosed(
+                content=content,
+                logical_gaps=logical_gaps,
+                split_id=split_id,
+            ))
+        return new_unc
+
     def __init__(self, llm: LLMProvider, config: REMSConfig):
         self._llm = llm
         self._config = config
@@ -93,7 +148,6 @@ class BoundaryDetectionSkill:
         current_sentences = segment_sentences(current_input) if current_input else []
         sentences = shadow_sentences + current_sentences
         shadow_count = len(shadow_sentences)
-        # 区间提示：让模型知道 [1..shadow_count] 是已存在残影，剩余是新输入。
         if shadow_count > 0 and current_sentences:
             range_hint = (
                 f"（【1..{shadow_count}】=既有残影；"
@@ -109,11 +163,12 @@ class BoundaryDetectionSkill:
         indexed_input = format_indexed_text(sentences)
 
         # 2. 构造 prompt：纯事件切分，不涉及摘要/角色等衍生字段
+        force_threshold = int(self._config.len_msg * self._config.unclosed_force_ratio)
         user_msg = BOUNDARY_USER.format(
-            shadow=shadow_content or "（空）",
             unclosed_summary=unclosed_summary,
             indexed_input=indexed_input,
             range_hint=range_hint,
+            force_threshold=force_threshold,
         )
 
         system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM
@@ -126,23 +181,42 @@ class BoundaryDetectionSkill:
             ],
         )
 
-        completed = []
+        completed: list[CompletedFragment] = []
         for item in data.get("completed_events", []):
+            if not isinstance(item, dict):
+                continue
             indices = item.get("content_raw_indices", [])
-            # 解码: 根据序号还原 content_raw
             extracted_raw = decode_indices(sentences, indices)
             if not extracted_raw:
                 continue
 
+            split_id = item.get("split_id")
+            if split_id is not None and not isinstance(split_id, str):
+                split_id = None
+            is_split_prefix = bool(item.get("is_split_prefix", False))
+            # 两个字段互相一致性约束：is_split_prefix=True 必须带 split_id；
+            # 只填 split_id 不填 is_split_prefix 也视作前缀（为 LLM 容错）。
+            if split_id and not is_split_prefix:
+                is_split_prefix = True
+            if is_split_prefix and not split_id:
+                is_split_prefix = False
+
             completed.append(CompletedFragment(
                 content_raw=extracted_raw,
                 continuation_of=item.get("continuation_of"),
+                is_split_prefix=is_split_prefix,
+                split_id=split_id,
             ))
 
-        new_unc = self._decode_new_unclosed_list(
-            data.get("new_unclosed_indices", []),
-            sentences,
-        )
+        # 3. 解析 new_unclosed —— 新旧两种格式二选一（优先新格式）。
+        new_unc: list[NewUnclosed] = []
+        new_obj = data.get("new_unclosed")
+        if isinstance(new_obj, list) and new_obj and all(isinstance(x, dict) for x in new_obj):
+            new_unc = self._decode_new_unclosed_objects(new_obj, sentences)
+        else:
+            legacy_raw = data.get("new_unclosed_indices") or data.get("new_unclosed") or []
+            if isinstance(legacy_raw, list):
+                new_unc = self._decode_new_unclosed_list(legacy_raw, sentences)
 
         return BoundaryResult(
             completed_events=completed,

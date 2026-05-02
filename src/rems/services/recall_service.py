@@ -164,7 +164,11 @@ class RecallService:
             current_len += len(text)
 
         block = self._assemble_block(filtered_events, focus_role_ids=focus_role_ids or set())
-        
+
+        # 80/20 分裂前缀展开（2026-05）：硬性把命中事件的前缀链拉进回忆块。
+        # 允许降档压缩，但不允许丢弃；超长时兜底走 ultra-concise fallback 也保留 event_id。
+        block = self._expand_split_prefixes(block, focus_role_ids=focus_role_ids or set())
+
         # 恢复逻辑（Recovery Logic）: 当事件被实际回忆（即包含在 block 中），
         # 加强该事件包含的所有角色白描的遗忘因子，实现回忆后记忆加强。
         for item in block.items:
@@ -551,6 +555,162 @@ class RecallService:
                 return text, level_key
 
         return "", ""
+
+    # ------------------------------------------------------------------
+    # 80/20 split-prefix expansion (2026-05)
+    # ------------------------------------------------------------------
+
+    def _expand_split_prefixes(
+        self,
+        block: RecallBlock,
+        focus_role_ids: set[str],
+    ) -> RecallBlock:
+        """Ensure every prefix in the split chain of a recalled event is co-recalled.
+
+        语义约束：
+            1. **硬性拉入**：只要某条被召回事件有 ``split_prefix_event_ids``，
+               其前缀事件（含多跳）都必须出现在回忆块中；
+            2. **允许降档**：前缀事件初始以"比默认档再压一级"的摘要落块；
+            3. **越顶兜底**：总长度越过 ``physical_redline`` 时，对前缀事件走
+               ``_ultra_concise_fallback`` 把长度截成 ``[EVT-xxx] <stub>…`` 也要保留；
+            4. **防链路爆炸**：前缀链展开深度不超过 ``recall_split_prefix_max_depth``，
+               并去重；同一条前缀只入一次；
+            5. **严格时间语序**：前缀事件在**对应后继条目之前**出现——若前缀已在 block
+               但排在后继之后（RRF 分数偶尔反转），把它**重排**到后继之前。
+        """
+        if not block.items:
+            return block
+
+        max_depth = max(1, int(self._config.recall_split_prefix_max_depth))
+
+        # 1. 扫描 block，收集每条命中事件的完整前缀链（去重、控深度）。
+        chains: list[tuple[str, list[Event]]] = []  # (successor_event_id, far-to-near prefixes)
+        all_required_prefix_ids: set[str] = set()
+        for item in block.items:
+            event = self._event_repo.get(item.event_id)
+            if event is None or not event.split_prefix_event_ids:
+                continue
+            prefixes = self._walk_prefix_chain(
+                event,
+                depth_cap=max_depth,
+                visited=set(),
+            )
+            if prefixes:
+                chains.append((item.event_id, prefixes))
+                for p in prefixes:
+                    all_required_prefix_ids.add(p.event_id)
+
+        if not chains:
+            return block
+
+        # 2. 以 event_id → RecallItem 的 map 持有当前 block 状态，
+        #    并记录原始 block items 的顺序。新插入的前缀按 chains 顺序排定位置。
+        existing_by_id: dict[str, RecallItem] = {it.event_id: it for it in block.items}
+
+        # 3. 为"尚未在 block 中"的前缀事件构造 RecallItem（稍压一档的摘要）。
+        for successor_id, prefixes in chains:
+            successor_item = existing_by_id.get(successor_id)
+            successor_score = successor_item.score if successor_item else 0.0
+            for p in prefixes:
+                if p.event_id in existing_by_id:
+                    continue
+                text, level_key = self._role_aware_pick_summary(p, 9999, 1)
+                if not text:
+                    text = p.content_raw
+                    level_key = "L0"
+                existing_by_id[p.event_id] = RecallItem(
+                    event_id=p.event_id,
+                    content=text,
+                    score=successor_score * 0.9,
+                    summary_level=level_key,
+                )
+
+        # 4. 重建 block items，使得每条 chain 的 prefix 按自远而近排在 successor 之前；
+        #    其它命中（非 prefix / 非 successor）按原始顺序保留。
+        original_ids = [it.event_id for it in block.items]
+        emitted: set[str] = set()
+        final_items: list[RecallItem] = []
+
+        # 先构建每个事件的"必须出现在它之前"的前缀列表（去重、最后出现的 chain 胜出）。
+        prefixes_before: dict[str, list[str]] = {}
+        for successor_id, prefixes in chains:
+            prefixes_before[successor_id] = [p.event_id for p in prefixes]
+
+        def _emit(eid: str) -> None:
+            if eid in emitted:
+                return
+            # 若有前缀依赖，先递归 emit 它们。
+            for pid in prefixes_before.get(eid, []):
+                _emit(pid)
+            emitted.add(eid)
+            item = existing_by_id.get(eid)
+            if item is not None:
+                final_items.append(item)
+
+        # 先 emit 原始 items 顺序中的每一条；_emit 内部会把前缀事件先入队。
+        for eid in original_ids:
+            _emit(eid)
+
+        # 5. 超顶兜底：只对新加入 / 非锚定的前缀事件做 ultra-concise 截断。
+        ceiling = self._config.physical_redline
+        total = sum(len(it.content) for it in final_items)
+        if total > ceiling:
+            # "锚定"指原始 block items；它们不参与降级。前缀事件允许降到 ultra。
+            anchor_ids = set(original_ids)
+            for i, it in enumerate(final_items):
+                if total <= ceiling:
+                    break
+                if it.event_id in anchor_ids:
+                    continue
+                if it.summary_level == "ultra":
+                    continue
+                stub = it.content[:40] + "…"
+                concise = f"[{it.event_id}] {stub}"
+                if len(concise) < len(it.content):
+                    total -= (len(it.content) - len(concise))
+                    final_items[i] = RecallItem(
+                        event_id=it.event_id,
+                        content=concise,
+                        score=it.score,
+                        summary_level="ultra",
+                    )
+
+        out = RecallBlock(items=final_items)
+        out.recompute_length()
+        return out
+
+    def _walk_prefix_chain(
+        self,
+        event: Event,
+        *,
+        depth_cap: int,
+        visited: set[str],
+    ) -> list[Event]:
+        """Return prefix events in far-to-near order, dedup & cycle-safe.
+
+        ``event.split_prefix_event_ids`` 本身就是"自远而近"顺序；如果某个前缀自己
+        还有前缀链（多跳），在它自己位置之前先展开自己的前缀，保持时间语序稳定。
+        """
+
+        out: list[Event] = []
+
+        def _recurse(pid: str, depth: int) -> None:
+            if depth > depth_cap or pid in visited:
+                return
+            visited.add(pid)
+            prefix_evt = self._event_repo.get(pid)
+            if prefix_evt is None or prefix_evt.is_tombstoned:
+                return
+            if prefix_evt.status.value == "silent":
+                return
+            # 先递归展开该前缀**自己**的链（自远而近），再把它自己追加。
+            for grand_pid in prefix_evt.split_prefix_event_ids or []:
+                _recurse(grand_pid, depth + 1)
+            out.append(prefix_evt)
+
+        for pid in event.split_prefix_event_ids or []:
+            _recurse(pid, 1)
+        return out
 
     @staticmethod
     def _ultra_concise_fallback(items: list[RecallItem], ceiling: int) -> list[RecallItem]:

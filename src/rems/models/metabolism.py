@@ -30,6 +30,15 @@ class UnclosedEvent(BaseModel):
     未完成事件：叙事上已启动但缺关键结果或上下文的事实对象（白皮书 4.1）。
     所有的未完成事件拼接在一起构成了系统的“残影”。当边界模型识别到逻辑闭环时，
     对应的未完成事件将被封存为基本事件，并从残影中移除。
+
+    分裂链路字段（2026-05 新增）：
+        ``split_prefix_event_ids`` —— 若本 UC 是边界模型执行 80/20 强制分裂的"尾段"，
+        则这里按分裂顺序列出它前面的前缀事件 id（可以跨多轮累积，故允许 len>=1）。
+        在 UC 最终闭环为事件时，由 ``MetabolismService`` 把该列表继承到目标事件的
+        ``split_prefix_event_ids`` 上；在回忆时由 ``RecallService`` 硬性把这些前缀事件
+        拉进回忆块（允许降档压缩但不丢弃）。
+        ``oversized`` —— 评估器判定该 UC 超过 force_threshold 且修复失败时置为 True，
+        只作为审计标记；不会触发强制封存（封存的兜底仅保留在物理红线一层）。
     """
 
     id: str
@@ -39,6 +48,11 @@ class UnclosedEvent(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     last_hit_time: datetime = Field(default_factory=datetime.now)
+
+    # 分裂链路：前缀事件 id（按从远到近的顺序）。
+    split_prefix_event_ids: list[str] = Field(default_factory=list)
+    # 审计标记：模型失败切分后残留的超长未完成条目。
+    oversized: bool = False
 
     @property
     def total_length(self) -> int:

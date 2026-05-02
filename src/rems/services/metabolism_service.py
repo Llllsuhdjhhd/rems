@@ -7,6 +7,9 @@ from typing import Optional
 
 # 事件代谢：残影合并、边界检测、封存、未完成库维护、物理红线强制整理。
 # 对照《REMS 记忆系统规范解析》4.1–4.2。
+# 2026-05 升级：引入"评估 → 修复 → 保留 oversized UC"三段式处理，
+# 取代旧的"越阈值就 force-seal"盲目兜底（盲目封存会让 enrichment 对
+# 未闭环叙事产生噪声角色/摘要）。物理红线仍作为最后一道防线保留。
 
 from ..config import REMSConfig
 from ..models.event import Event
@@ -14,7 +17,14 @@ from ..models.metabolism import Shadow, UnclosedEvent
 from ..models.role import Role
 from ..services.event_service import EventService
 from ..skills.boundary_detection import BoundaryDetectionSkill, BoundaryResult
-from ..storage.repository import MetabolismRepository
+from ..skills.boundary_split import (
+    BoundaryForceThresholdEvaluator,
+    BoundarySkillContext,
+    OverlongUCSplitRemediator,
+    OverlongUCSplitSkill,
+)
+from ..skills.evaluation import SkillEvaluator, SkillRemediator, run_skill_with_eval
+from ..storage.repository import EventRepository, MetabolismRepository
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +36,13 @@ class MetabolismService:
         1. Accept raw input.
         2. Merge with shadow.
         3. Run boundary detection.
-        4. Seal completed events; update unclosed library.
-        5. Enforce physical-redline compaction when needed.
+        4. Evaluate boundary output; if oversized UC detected, remediate via
+           ``OverlongUCSplitSkill`` (one pass only — evaluator does NOT re-run
+           on remediation output, by design).
+        5. Seal completed events (including split prefixes); update unclosed
+           library; when a tail UC later closes, inherit its ``split_prefix_event_ids``
+           chain to the sealed event and append the successor id to each prefix event.
+        6. Enforce physical-redline compaction when needed (last-resort defence).
 
     管理残影（Shadow）、未完成事件库及封存触发逻辑。典型生命周期为：接收原始输入并与残影合并；
     调用边界检测技能划分已闭环片段与剩余残影；对已闭环内容调用 ``EventService.seal_event``；
@@ -40,11 +55,63 @@ class MetabolismService:
         meta_repo: MetabolismRepository,
         boundary_skill: BoundaryDetectionSkill,
         event_service: EventService,
+        *,
+        event_repo: EventRepository | None = None,
+        boundary_evaluators: list[SkillEvaluator] | None = None,
+        boundary_remediator: SkillRemediator | None = None,
     ):
         self._config = config
         self._repo = meta_repo
         self._boundary = boundary_skill
         self._event_svc = event_service
+        self._event_repo = event_repo
+        # 默认评估链：仅规则型评估器（零 LLM 成本，始终开）。LLM 二级评估默认关。
+        self._boundary_evaluators: list[SkillEvaluator] = (
+            boundary_evaluators
+            if boundary_evaluators is not None
+            else [BoundaryForceThresholdEvaluator(config)]
+        )
+        # 默认修复链：调用 OverlongUCSplitSkill，仅在 ``boundary_remediation_enabled`` 打开时装配。
+        self._boundary_remediator: SkillRemediator | None = boundary_remediator
+
+    # ------------------------------------------------------------------
+    # Factory helpers (便于 pipeline / tests 复用默认装配)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def with_default_boundary_repair(
+        cls,
+        config: REMSConfig,
+        meta_repo: MetabolismRepository,
+        boundary_skill: BoundaryDetectionSkill,
+        event_service: EventService,
+        *,
+        event_repo: EventRepository | None = None,
+        llm=None,
+    ) -> "MetabolismService":
+        """Construct a service wired with the default evaluator + split remediator.
+
+        调用侧若希望拿"开箱即用"的 80/20 分裂修复链，用这个工厂方法即可；
+        ``llm`` 若未显式传入，则从 ``boundary_skill`` 上读取（两者共享同一 provider）。
+        ``boundary_remediation_enabled=False`` 时不装配 remediator，评估只做记录。
+        """
+        evaluators: list[SkillEvaluator] = [BoundaryForceThresholdEvaluator(config)]
+        remediator: SkillRemediator | None = None
+        if config.boundary_remediation_enabled:
+            # BoundaryDetectionSkill 的 _llm 是其唯一公共/半公共属性；为了不产生新的
+            # 公开 getter，优先使用外部显式传入的 llm，否则回退到 skill 内嵌的那个。
+            llm_for_split = llm if llm is not None else getattr(boundary_skill, "_llm")
+            split_skill = OverlongUCSplitSkill(llm_for_split, config)
+            remediator = OverlongUCSplitRemediator(split_skill)
+        return cls(
+            config,
+            meta_repo,
+            boundary_skill,
+            event_service,
+            event_repo=event_repo,
+            boundary_evaluators=evaluators,
+            boundary_remediator=remediator,
+        )
 
     # ------------------------------------------------------------------
     # Main entry: process a raw input string
@@ -64,8 +131,9 @@ class MetabolismService:
         ``force_save=True`` 时跳过边界模型，立即合并残影与未完成项并封存（手动 /save 类触发）。
 
         白皮书 4.2 说明：``msg_len × 1.2`` 的兜底阈值作用于**未闭环事件的累积长度**，
-        而非整体输入。边界检测不会因「残影 + 当前输入」过长被跳过；超长输入仅在边界剥离
-        得到的单条未闭环片段越过该红线时，才会按「可疑事件」强制封存（见 ``_apply_boundary_result``）。
+        而非整体输入。边界检测不会因「残影 + 当前输入」过长被跳过；超长输入在边界剥离
+        得到的单条未闭环片段越过红线时，会由 80/20 分裂修复器尝试切成前缀 + 尾部；
+        修复失败时仅标记 ``oversized=True`` 并保留，物理红线层作为最后兜底。
         """
         if len(raw_input) > self._config.len_msg:
             logger.warning(
@@ -86,7 +154,29 @@ class MetabolismService:
             )
 
         # 边界检测仅负责事件切分；摘要/角色等衍生字段由 EventEnrichment 在 seal 时生成。
-        result = self._boundary.detect(shadow_content, raw_input, unclosed)
+        # 评估 → 修复 → 采用 三段式：评估器失败时，若配置了修复器则调用一次；
+        # 修复后的输出**不再评估**（评估只做一层）。
+        ctx = BoundarySkillContext(
+            force_threshold=int(self._config.len_msg * self._config.unclosed_force_ratio),
+            split_ratio_target=self._config.boundary_split_ratio_target,
+            split_ratio_min=self._config.boundary_split_ratio_min,
+            split_ratio_max=self._config.boundary_split_ratio_max,
+            unclosed_events=tuple(unclosed),
+        )
+        result, report = run_skill_with_eval(
+            lambda: self._boundary.detect(shadow_content, raw_input, unclosed),
+            evaluators=self._boundary_evaluators,
+            remediator=self._boundary_remediator,
+            skill_input=ctx,
+        )
+        if not report.ok:
+            logger.info(
+                "Boundary evaluator flagged %d issue(s): %s (remediator=%s)",
+                len(report.issues),
+                [i.code for i in report.issues],
+                type(self._boundary_remediator).__name__ if self._boundary_remediator else None,
+            )
+
         return self._apply_boundary_result(
             result, unclosed,
             input_id=input_id,
@@ -120,28 +210,61 @@ class MetabolismService:
         ``known_roles_hint`` 由 pipeline 在 pre-recall 阶段抽取得到，向下传给
         ``EventEnrichmentSkill``，仅作为代词消解的提示——不直接覆盖事件 role_list，
         因为单条 sealed event 的真实参与角色应由 enrichment 在该事件原文上重新精确判定。
+
+        80/20 分裂链路处理（2026-05 新增）：
+            - ``completed_events`` 中 ``is_split_prefix=True`` 的片段按常规封存，
+              同时记录 ``split_id → event_id`` 映射；
+            - ``new_unclosed`` 中若声明 ``split_id``，则落库的 UC 带上
+              ``split_prefix_event_ids=[mapped_event_id]``（可跨多轮累积，故为 list）；
+            - ``continuation_of`` 命中旧 UC 时，新封存事件从该 UC 继承
+              ``split_prefix_event_ids``；并反向把新事件 id 追加到每个前缀事件的
+              ``split_successor_event_ids``（供审计与未来的前缀链多跳展开）；
+            - **不再**对越阈值的 ``new_unclosed`` 做 force-seal；评估失败且修复亦失败
+              的 oversized 条目标记为 ``oversized=True`` 保留在未完成库，物理红线层兜底。
         """
         sealed: list[Event] = []
         consumed_uc_ids: set[str] = set()
+        # split_id → prefix event_id，便于 tail UC 落库时回写 split_prefix_event_ids。
+        split_id_to_prefix_event_id: dict[str, str] = {}
 
         for frag in result.completed_events:
             if frag.continuation_of:
                 ue = self._find_unclosed(unclosed, frag.continuation_of)
                 if ue:
                     content = ue.merged_content + "\n" + frag.content_raw
+                    # 继承该 UC 持有的前缀链（若它本身是 tail UC）。
+                    inherited_prefix_chain = list(ue.split_prefix_event_ids or [])
                     self._repo.delete_unclosed_event(ue.id)
                     consumed_uc_ids.add(ue.id)
                 else:
                     content = frag.content_raw
+                    inherited_prefix_chain = []
             else:
                 content = frag.content_raw
+                inherited_prefix_chain = []
 
             event = self._event_svc.seal_event(
                 content,
                 input_id=input_id,
                 known_roles=known_roles_hint,
+                split_prefix_event_ids=inherited_prefix_chain or None,
             )
             sealed.append(event)
+
+            # 如果该 completed 是一条分裂前缀，把它登记起来供 tail UC 关联。
+            if frag.is_split_prefix and frag.split_id:
+                split_id_to_prefix_event_id[frag.split_id] = event.event_id
+
+            # 反向链：若本事件继承到前缀链，则把它作为 successor 登记回每个前缀事件。
+            if inherited_prefix_chain and self._event_repo is not None:
+                for prefix_id in inherited_prefix_chain:
+                    try:
+                        self._event_repo.append_split_successor(prefix_id, event.event_id)
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "append_split_successor(%s, %s) failed; skipping",
+                            prefix_id, event.event_id, exc_info=True,
+                        )
 
         # 关键修复：清空所有未被 continuation_of 命中的旧 UC——它们的内容已经作为 shadow
         # 整段进入 boundary 模型；模型若仍认为它们未闭合，应通过 ``new_unclosed`` 重新声明，
@@ -151,30 +274,26 @@ class MetabolismService:
             if ue.id not in consumed_uc_ids:
                 self._repo.delete_unclosed_event(ue.id)
 
-        # 白皮书 4.2 底线兜底：对单条未闭环片段逐项判定；若长度越过 ``len_msg × 1.2`` 红线，
-        # 立即强制封存为事件，防止内存/计算爆炸。是否「可疑」交由 EventService 内部的
-        # 角色抽取与 RoleService 仲裁判断（角色清晰时不应被盲目标脏）。
+        # 新建未完成事件：不再盲目 force-seal；越阈值条目仅标记 oversized=True。
         force_threshold = int(self._config.len_msg * self._config.unclosed_force_ratio)
         for nu in result.new_unclosed:
-            if len(nu.content) > force_threshold:
+            is_oversized = len(nu.content) > force_threshold
+            if is_oversized:
                 logger.warning(
-                    "Unclosed fragment length %d exceeds %.2f×len_msg (%d), force-sealing",
+                    "Unclosed fragment length %d exceeds %.2f×len_msg (%d); "
+                    "keeping as oversized UC (split remediation already attempted)",
                     len(nu.content),
                     self._config.unclosed_force_ratio,
                     force_threshold,
                 )
-                event = self._event_svc.seal_event(
-                    nu.content,
-                    input_id=input_id,
-                    known_roles=known_roles_hint,
-                )
-                sealed.append(event)
-                continue
 
+            prefix_event_id = split_id_to_prefix_event_id.get(nu.split_id) if nu.split_id else None
             ue = UnclosedEvent(
                 id=f"UC-{secrets.token_hex(4)}",
                 content_fragments=[nu.content],
                 logical_gaps=nu.logical_gaps,
+                split_prefix_event_ids=[prefix_event_id] if prefix_event_id else [],
+                oversized=is_oversized,
             )
             self._repo.save_unclosed_event(ue)
 
@@ -222,7 +341,18 @@ class MetabolismService:
                     is_suspicious=is_suspicious,
                     input_id=input_id,
                     known_roles=known_roles_hint,
+                    split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
                 )
+                # 反向链：force_save 也要登记 successor。
+                if ue.split_prefix_event_ids and self._event_repo is not None:
+                    for prefix_id in ue.split_prefix_event_ids:
+                        try:
+                            self._event_repo.append_split_successor(prefix_id, event.event_id)
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "append_split_successor(%s, %s) failed; skipping",
+                                prefix_id, event.event_id, exc_info=True,
+                            )
                 sealed.append(event)
             self._repo.delete_unclosed_event(ue.id)
 
@@ -236,6 +366,9 @@ class MetabolismService:
         当残影长度与所有未完成事件片段长度之和超过 ``physical_redline`` 时触发：
         对超过 ``len_msg * unclosed_force_ratio`` 的未完成条目强制封存；按策略遗忘陈旧未完成项；
         若残影仍高于 ``safe_watermark`` 则截断保留尾部，防止缓冲区无限增长（白皮书 4.2 工程化防溢出）。
+
+        注意：这是"最后一道物理防线"——即便认知层（评估 → 修复）失败，也不允许
+        残影无上限膨胀。此处 force-seal 仍保留，并在封存时继承 ``split_prefix_event_ids``。
         """
         shadow = self._repo.get_shadow()
         unclosed = self._repo.get_unclosed_events()
@@ -249,9 +382,21 @@ class MetabolismService:
         for ue in unclosed:
             force_threshold = self._config.len_msg * self._config.unclosed_force_ratio
             if ue.total_length >= force_threshold:
-                event = self._event_svc.seal_event(ue.merged_content)
+                event = self._event_svc.seal_event(
+                    ue.merged_content,
+                    split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
+                )
+                if ue.split_prefix_event_ids and self._event_repo is not None:
+                    for prefix_id in ue.split_prefix_event_ids:
+                        try:
+                            self._event_repo.append_split_successor(prefix_id, event.event_id)
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "append_split_successor(%s, %s) failed; skipping",
+                                prefix_id, event.event_id, exc_info=True,
+                            )
                 self._repo.delete_unclosed_event(ue.id)
-                logger.info("Force-sealed unclosed %s as event %s", ue.id, event.event_id)
+                logger.info("Force-sealed unclosed %s as event %s (physical-redline tier)", ue.id, event.event_id)
 
         self._forget_stale_unclosed(unclosed)
 
