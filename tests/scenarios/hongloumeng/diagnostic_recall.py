@@ -5,12 +5,16 @@ from pathlib import Path
 
 # Force unbuffered output
 sys.path.insert(0, str(Path(__file__).parents[3] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from recall_trace_util import (
+    install_recall_hooks,
+    latest_recall_log_row,
+    recall_block_to_json,
+    write_recall_trace_json,
+)
 from rems.config import REMSConfig, StorageConfig, UserMode
 from rems.pipeline import REMSPipeline, ProcessingMode
-from rems.models.metabolism import Shadow
-
-from rems.llm.provider import LLMProvider
 
 def log(msg):
     # 同时打印到终端（供我观察）和报告文件（供你阅读）
@@ -96,18 +100,28 @@ def run_diagnostic_recall():
         log("")
     log("-" * 40)
 
-    # 我们需要通过 Hook 捕获 Stream B 的 Top 10
-    captured_hits_b = []
-    original_get_stream_b = pipeline.recall_service._get_stream_b_hits
-    
-    def hooked_get_stream_b(search_text):
-        hits = original_get_stream_b(search_text)
-        nonlocal captured_hits_b
-        captured_hits_b = hits[:10]  # 只取前 10 个
-        return hits
+    # 3. Recall trace hooks (Stream A / B / RRF) — single ingest, then export JSON
+    trace, uninstall_recall = install_recall_hooks(pipeline.recall_service)
+    try:
+        result = pipeline.ingest(content, mode=ProcessingMode.DIALOGUE)
+    finally:
+        uninstall_recall()
 
-    pipeline.recall_service._get_stream_b_hits = hooked_get_stream_b
-    result = pipeline.ingest(content, mode=ProcessingMode.DIALOGUE)
+    trace_path = base_dir / "recall_trace.json"
+    rb_model = result.context_package.recall_block if result.context_package else None
+    write_recall_trace_json(
+        trace_path,
+        {
+            "kind": "diagnostic_recall",
+            "chunk_idx": current_chunk_idx + 1,
+            "stream_a": trace["stream_a"],
+            "stream_b": trace["stream_b"],
+            "rrf": trace["rrf"],
+            "recall_block": recall_block_to_json(rb_model) if rb_model else [],
+            "recall_log_last": latest_recall_log_row(pipeline.recall_log_repo),
+        },
+    )
+    log(f"\n[Recall trace JSON] {trace_path}")
 
     if result.context_package:
         rb = result.context_package.recall_block

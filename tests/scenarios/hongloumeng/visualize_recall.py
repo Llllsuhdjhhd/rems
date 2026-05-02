@@ -3,13 +3,18 @@ import json
 import time
 from pathlib import Path
 
-# Ensure we can import rems
+# Ensure we can import rems and local scenario helpers
 sys.path.insert(0, str(Path(__file__).parents[3] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from rems.config import REMSConfig, StorageConfig, UserMode
 from rems.pipeline import REMSPipeline, ProcessingMode
-from rems.models.metabolism import Shadow
-from rems.llm.provider import LLMProvider
+
+from recall_trace_util import (
+    install_recall_hooks,
+    recall_block_to_json,
+    write_recall_trace_json,
+)
 
 def create_visual_report(chunk_idx, input_text, shadow_text, roles_info, stream_a, stream_b, merged_items):
     report_file = Path("tests/scenarios/hongloumeng/outputs/continuous_run/recall_visual_explanation.md")
@@ -40,7 +45,8 @@ def create_visual_report(chunk_idx, input_text, shadow_text, roles_info, stream_
         f.write("| :--- | :--- | :--- | :--- |\n")
         for i, h in enumerate(stream_a[:10]):
             dist = h.get('distance', 0)
-            f.write(f"| {i+1} | `{h['event_id'][:8]}...` | {h['document'][:50]}... | {dist:.4f} |\n")
+            doc = h.get('document') or h.get('document_preview') or ''
+            f.write(f"| {i+1} | `{h['event_id'][:8]}...` | {doc[:50]}... | {dist:.4f} |\n")
         f.write("\n")
         
         f.write("### B 流：角色白描流 (Stream B: Role-Aware)\n")
@@ -50,10 +56,11 @@ def create_visual_report(chunk_idx, input_text, shadow_text, roles_info, stream_
         f.write("| :--- | :--- | :--- | :--- | :--- |\n")
         for i, h in enumerate(stream_b[:10]):
             dist = h.get('distance', 0)
+            doc = h.get('document') or h.get('document_preview') or ''
             parts = h['wp_id'].split("::")
             if len(parts) == 2:
                 role_id, event_id = parts
-                f.write(f"| {i+1} | {role_id} | `{event_id[:8]}...` | {h['document'][:50]}... | {dist:.4f} |\n")
+                f.write(f"| {i+1} | {role_id} | `{event_id[:8]}...` | {doc[:50]}... | {dist:.4f} |\n")
         f.write("\n")
         
         f.write("## 4. 记忆融合与竞争 (Merge & Competition)\n")
@@ -126,34 +133,60 @@ def run_visual_diagnostic():
         focus_role_ids.add(rid)
         focus_role_entries.append(pipeline.role_skill.to_event_role_entry(er, rid))
 
-    # 2. Capture Streams
+    # 2. B-Query reconstruction (for JSON + parity with RecallService)
     search_text = shadow.content + "\n" + input_text
-    stream_a = pipeline.recall_service._get_stream_a_hits(search_text, focus_role_ids)
-    
-    # B-Query reconstruction
     b_query = search_text
-    snapshot_texts = [r['snapshot'] for r in roles_info]
+    snapshot_texts = [r["snapshot"] for r in roles_info]
     if snapshot_texts:
         b_query += "\n" + "\n".join(snapshot_texts)
-    stream_b = pipeline.recall_service._get_stream_b_hits(b_query)
-    
-    # 3. Get final result
-    recall_block = pipeline.recall_service.build_recall_block(
-        input_text, shadow, focus_role_ids=focus_role_ids, focus_role_entries=focus_role_entries
-    )
-    
-    # 4. Generate Report
+
+    # 3. Single build_recall_block with hooks (Stream A/B + RRF captured once)
+    trace, uninstall = install_recall_hooks(pipeline.recall_service)
+    try:
+        recall_block = pipeline.recall_service.build_recall_block(
+            input_text, shadow, focus_role_ids=focus_role_ids, focus_role_entries=focus_role_entries
+        )
+    finally:
+        uninstall()
+
+    stream_a = trace["stream_a"][-1]["hits"]
+    stream_b = trace["stream_b"][-1]["hits"]
+    for h in stream_a:
+        if "document" not in h and "document_preview" in h:
+            h["document"] = h["document_preview"]
+    for h in stream_b:
+        if "document" not in h and "document_preview" in h:
+            h["document"] = h["document_preview"]
+
+    # 4. Generate Report + machine-readable trace
     create_visual_report(
-        current_chunk_idx + 1, 
-        input_text, 
-        shadow.content, 
-        roles_info, 
-        stream_a, 
-        stream_b, 
-        recall_block.items
+        current_chunk_idx + 1,
+        input_text,
+        shadow.content,
+        roles_info,
+        stream_a,
+        stream_b,
+        recall_block.items,
     )
-    
+
+    trace_path = base_dir / "recall_trace.json"
+    write_recall_trace_json(
+        trace_path,
+        {
+            "kind": "visualize_recall",
+            "chunk_idx": current_chunk_idx + 1,
+            "input_excerpt": input_text[:800],
+            "shadow_excerpt": (shadow.content or "")[:800],
+            "b_query_excerpt": b_query[:1200],
+            "stream_a": trace["stream_a"],
+            "stream_b": trace["stream_b"],
+            "rrf": trace["rrf"],
+            "recall_block": recall_block_to_json(recall_block),
+        },
+    )
+
     print(f"Visual report generated at: tests/scenarios/hongloumeng/outputs/continuous_run/recall_visual_explanation.md")
+    print(f"Recall trace JSON at: {trace_path}")
 
 if __name__ == "__main__":
     run_visual_diagnostic()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import pytest
+
 from rems.config import REMSConfig
 from rems.llm.prompt_registry import PromptRegistry, PromptTemplate
 from rems.models.event import Event, EventRoleEntry, Importance
@@ -38,6 +40,44 @@ def test_default_summary_tier_policy_is_role_aware():
     unfocused = policy.tier_offset(event, {"ROL-other"})
 
     assert focused < unfocused
+
+
+@pytest.mark.parametrize(
+    "importance,focus,expected_key",
+    [
+        (Importance.S, {"ROL-x"}, "sa"),
+        (Importance.A, {"ROL-x"}, "sa"),
+        (Importance.B, {"ROL-x"}, "b"),
+        (Importance.C, {"ROL-x"}, "cd"),
+        (Importance.D, {"ROL-x"}, "cd"),
+        (Importance.A, set(), "empty_focus"),
+        (Importance.A, {"ROL-other"}, "no_focus_match"),
+    ],
+)
+def test_summary_tier_offset_matrix(importance, focus, expected_key):
+    """Relative tier offsets: S/A < B < C/D / absent when focus applies (recall Lazy Index)."""
+    cfg = REMSConfig()
+    policy = DefaultSummaryTierPolicy(cfg)
+    ev = Event(
+        content_raw="x",
+        role_list=[EventRoleEntry(role_id="ROL-x", importance=importance)],
+    )
+    off = policy.tier_offset(ev, focus)
+
+    mid_default = cfg.recall_default_tier_offset
+    shift_p = cfg.recall_primary_role_detail_shift
+    shift_m = cfg.recall_minor_role_compress_shift
+
+    if expected_key == "sa":
+        assert off == mid_default - shift_p
+    elif expected_key == "b":
+        assert off == mid_default
+    elif expected_key == "cd":
+        assert off == mid_default + shift_m
+    elif expected_key == "empty_focus":
+        assert off == mid_default
+    elif expected_key == "no_focus_match":
+        assert off == mid_default + shift_m
 
 
 def test_default_forgetting_strategy_penalizes_old_entries():
