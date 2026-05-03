@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # REMS 全局配置（对照《REMS 记忆系统规范解析》白皮书）。
 # - len_msg / physical_redline / safe_watermark：1.1.7 事件长度与物理防御、4.2 触发与截断；
-# - abstract_subset_min_size / abstract_subset_min_support / enable_narrative_dedup：3.2 频繁子集挖掘与叙事判重；
+# - abstract_subset_*, abstract_coverage_*：3.2 频繁子集与覆盖度检索降权；
 # - ae_*、wp_*：1.1.4、2.2 情感能量（AE）与白描动态遗忘；
 # - hallucination_anchor_prob：兼容旧配置；当前抽象合成始终使用叶子基本事件 content_raw；
 # - tombstone_prefix：4.3 墓碑化时在 insight 中的审计标记前缀；
@@ -116,6 +116,12 @@ class REMSConfig(BaseSettings):
     # 中该子集替换为抽象事件 id，以便后续更高阶抽象继续在同一命名空间演进。
     abstract_subset_min_size: int = 6
     abstract_subset_min_support: int = 12
+    # ---- 抽象覆盖度 → 回忆 RRF 降权（多次被更高阶抽象覆盖则分更低，恒 >0）----
+    # 单次新抽象对覆盖集内事件的增量：abstract_coverage_strength / (1 + ln(|C|))，再封顶 abstract_coverage_max。
+    abstract_coverage_strength: float = 1.0
+    abstract_coverage_max: float = 3.0
+    # RRF 融合分乘以 exp(-abstract_coverage_decay_rate * abstract_coverage)；≤0 表示关闭降权。
+    abstract_coverage_decay_rate: float = 2.0
 
     # 未闭合事件总长超过 len_msg * 该比例则触发 80/20 强制分裂（详见 boundary_split_* 设置）。
     # 白皮书 4.2 的物理红线（physical_redline）仍在 ``_check_physical_redline`` 兜底，

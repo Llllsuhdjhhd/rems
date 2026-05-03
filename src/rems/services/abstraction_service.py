@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 # 抽象事件：唯一触发路径 = 回忆块 event_id 集合中的频繁子集挖掘（白皮书 §3.2）。
 # - 子集大小 >= abstract_subset_min_size（默认 6，可配置）
@@ -273,7 +274,34 @@ class AbstractionService:
             if not evt.is_abstract:
                 self._event_repo.update_status(evt.event_id, is_abstracted=True)
 
+        self._apply_abstract_coverage_for_subset(frozenset(e.event_id for e in events))
+
         return abstract_event
+
+    def _apply_abstract_coverage_for_subset(self, member_ids: frozenset[str]) -> None:
+        """对已Persist的新抽象的成员集：基本事件 + 子抽象节点及其叶子一次性累加 abstract_coverage。"""
+        cfg = self._config
+        if cfg.abstract_coverage_strength <= 0:
+            return
+        coverage_ids: set[str] = set()
+        for eid in member_ids:
+            e = self._event_repo.get(eid)
+            if e is None or e.is_tombstoned:
+                continue
+            if e.is_abstract:
+                coverage_ids.add(eid)
+                for lid in self._event_repo.resolve_basic_event_ids(eid):
+                    coverage_ids.add(lid)
+            else:
+                coverage_ids.add(eid)
+        if not coverage_ids:
+            return
+        unit = cfg.abstract_coverage_strength / (1.0 + math.log(len(coverage_ids)))
+        self._event_repo.apply_abstract_coverage_increment(
+            coverage_ids,
+            unit,
+            cfg.abstract_coverage_max,
+        )
 
     def _estimate_budget(self, content: str) -> CompressionBudget:
         """Compute a coarse summary budget for abstract event content_raw.

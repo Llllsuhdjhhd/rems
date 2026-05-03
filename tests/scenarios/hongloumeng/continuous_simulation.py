@@ -22,7 +22,7 @@ def run_continuous_simulation(num_chunks_to_process=3):
     """
     base_dir = Path(__file__).parent / "outputs" / "continuous_run"
     base_dir.mkdir(parents=True, exist_ok=True)
-    
+
     state_file = base_dir / "simulation_state.json"
     db_path = base_dir / "rems_sim.db"
     chroma_path = base_dir / "chroma_sim"
@@ -48,7 +48,7 @@ def run_continuous_simulation(num_chunks_to_process=3):
         embedding={"provider": "hash"},
         user_mode=UserMode.MULTI
     )
-    
+
     # Setup LLM logging (similar to simulation.py)
     orig_complete = LLMProvider.complete
     call_counter = 0
@@ -58,12 +58,12 @@ def run_continuous_simulation(num_chunks_to_process=3):
         call_counter += 1
         model = self._get_model(task_type)
         print(f"  [LLM] #{call_counter:03} {task_type:.<18} | {model:.<20}", end="", flush=True)
-        
+
         t_start = time.perf_counter()
         content = orig_complete(self, task_type, messages, **kwargs)
         duration_ms = (time.perf_counter() - t_start) * 1000
         metrics = self._invocations[-1]
-        
+
         # Log detail
         log_file = log_dir / f"chunk_{last_chunk_idx + 1}_{call_counter:03}_{task_type}.json"
         from dataclasses import asdict
@@ -77,14 +77,14 @@ def run_continuous_simulation(num_chunks_to_process=3):
         }
         with open(log_file, "w", encoding="utf-8") as f:
             json.dump(log_data, f, ensure_ascii=False, indent=2)
-            
+
         print(f" DONE ({duration_ms:4.0f}ms)")
         return content
 
     LLMProvider.complete = complete_with_logging
-    
+
     pipeline = REMSPipeline.from_config(config)
-    
+
     # Load dataset
     dataset_path = Path(__file__).parents[3] / "data" / "hongloumeng_dataset.json"
     with open(dataset_path, "r", encoding="utf-8") as f:
@@ -97,7 +97,7 @@ def run_continuous_simulation(num_chunks_to_process=3):
     print(f" REMS CONTINUOUS SIMULATION: CHUNKS {start_idx + 1} TO {end_idx} ")
     print(f"{'='*60}")
     print(f"DB Path: {db_path}")
-    
+
     # Get current shadow for display
     current_shadow = pipeline.meta_repo.get_shadow()
     print(f"Initial Shadow Length: {len(current_shadow.content)} chars")
@@ -107,14 +107,14 @@ def run_continuous_simulation(num_chunks_to_process=3):
         content = chunk['content']
         print(f"\n--- PROCESSING CHUNK {i+1} (Length: {len(content)}) ---")
         print(f"  [DEBUG] Pipeline file: {pipeline.__class__.ingest.__code__.co_filename}")
-        
+
         t_chunk_start = time.perf_counter()
         result = pipeline.ingest(content, mode=ProcessingMode.DIALOGUE)
         duration = time.perf_counter() - t_chunk_start
-        
+
         print(f"  [OK] Duration: {duration:.2f}s")
         print(f"  [Events] Sealed: {len(result.sealed_events)}, Abstracted: {len(result.abstract_events)}")
-        
+
         # Update and save state
         last_chunk_idx = i + 1
         with open(state_file, "w", encoding="utf-8") as f:
@@ -122,7 +122,7 @@ def run_continuous_simulation(num_chunks_to_process=3):
 
     total_events = pipeline.event_repo.count()
     final_shadow = pipeline.meta_repo.get_shadow()
-    
+
     print(f"\n{'='*60}")
     print(f" RUN SUMMARY ")
     print(f"{'='*60}")

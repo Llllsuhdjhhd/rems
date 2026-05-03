@@ -166,6 +166,8 @@ class Event(BaseModel):
 
     is_abstract: bool = False  # 架构级区分基本/抽象事件（1.1.5、3.1）。
     is_abstracted: bool = False  # 是否已被更高阶认知吸收（1.1.5）。
+    # 被更高层抽象「覆盖吸收」的累计强度（非负）；用于回忆 RRF 分上乘以 exp(-decay*coverage)。
+    abstract_coverage: float = 0.0
     status: EventStatus = EventStatus.ACTIVE # unclosed/active/silent（1.1.5）。
 
     decoration: Optional[str] = None  # 非事实装饰，支撑「梦见」等（1.1.6）。

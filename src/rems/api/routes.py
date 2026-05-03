@@ -57,6 +57,7 @@ class EventOut(BaseModel):
     insight: str | None = None
     affective_energy: float = 0.0
     activation_energy: float = 0.0
+    abstract_coverage: float = 0.0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -184,4 +185,5 @@ def _event_out(e) -> EventOut:
         insight=e.insight,
         affective_energy=round(e.affective_energy, 4),
         activation_energy=round(e.activation_energy, 4),
+        abstract_coverage=round(float(getattr(e, "abstract_coverage", 0.0) or 0.0), 4),
     )

@@ -50,6 +50,7 @@ class EventRepository:
                 is_tombstoned=event.is_tombstoned,
                 activation_energy=event.activation_energy,
                 compression_ratio=event.compression_ratio,
+                abstract_coverage=float(getattr(event, "abstract_coverage", 0.0) or 0.0),
                 split_successor_event_ids=list(event.split_successor_event_ids or []),
                 split_prefix_event_ids=list(event.split_prefix_event_ids or []),
             )
@@ -179,6 +180,28 @@ class EventRepository:
                     result.append(r.event_id)
         return result
 
+    def apply_abstract_coverage_increment(
+        self,
+        event_ids: set[str],
+        delta: float,
+        cap: float,
+    ) -> None:
+        """Add *delta* to ``abstract_coverage`` for each id in *event_ids*, hard-capped at *cap*.
+
+        新抽象 A 合成后对覆盖集内所有基本事件及被取代的中间抽象节点一次性累加；
+        多次抽象路径上会反复递增直至封顶。
+        """
+        if not event_ids or delta <= 0:
+            return
+        with self._db.session() as s:
+            for eid in event_ids:
+                r = s.get(EventRecord, eid)
+                if r is None or getattr(r, "is_tombstoned", False):
+                    continue
+                cur = float(getattr(r, "abstract_coverage", 0.0) or 0.0)
+                r.abstract_coverage = min(float(cap), cur + float(delta))
+            s.commit()
+
     def update_status(
         self,
         event_id: str,
@@ -222,6 +245,7 @@ class EventRepository:
             is_tombstoned=bool(r.is_tombstoned),
             activation_energy=float(r.activation_energy or 0.0),
             compression_ratio=float(r.compression_ratio or 0.0),
+            abstract_coverage=float(getattr(r, "abstract_coverage", 0.0) or 0.0),
             split_successor_event_ids=list(getattr(r, "split_successor_event_ids", None) or []),
             split_prefix_event_ids=list(getattr(r, "split_prefix_event_ids", None) or []),
         )

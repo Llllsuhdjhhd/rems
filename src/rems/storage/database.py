@@ -42,6 +42,8 @@ class EventRecord(Base):
     role_list = Column(JSON, default=list)
     is_abstract = Column(Boolean, default=False)
     is_abstracted = Column(Boolean, default=False)
+    # 抽象覆盖累加量；合成更高阶抽象时对成员基本事件及中间抽象节点递增，检索时指数降权。
+    abstract_coverage = Column(Float, default=0.0)
     status = Column(String, default="active")
     decoration = Column(Text, nullable=True)
     insight = Column(Text, nullable=True)
@@ -189,6 +191,7 @@ class Database:
             "events": [
                 ("split_successor_event_ids", "TEXT DEFAULT '[]'"),
                 ("split_prefix_event_ids", "TEXT DEFAULT '[]'"),
+                ("abstract_coverage", "FLOAT DEFAULT 0.0"),
             ],
             "unclosed_events": [
                 ("split_prefix_event_ids", "TEXT DEFAULT '[]'"),

@@ -147,6 +147,13 @@ class RecallService:
                 stream_b[event_id] = (event, effective_distance, f_score.effective_forgetting)
 
         scored_events = self._rrf_merge(stream_a, stream_b, focus_role_entries or [])
+        decay = self._config.abstract_coverage_decay_rate
+        if decay > 0:
+            scored_events = [
+                (ev, sc * self._recall_coverage_weight(ev, decay))
+                for ev, sc in scored_events
+            ]
+            scored_events.sort(key=lambda x: x[1], reverse=True)
 
         # Apply intermediate filter target (1.2/6.6)
         redline = self._config.physical_redline
@@ -236,6 +243,14 @@ class RecallService:
             merged.append((event, rrf * factor_modifier * mood_modifier))
 
         return sorted(merged, key=lambda x: x[1], reverse=True)[:60]
+
+    @staticmethod
+    def _recall_coverage_weight(event: Event, decay_rate: float) -> float:
+        """RRF 分乘子：coverage 越大权重越小，恒为正。"""
+        c = float(getattr(event, "abstract_coverage", 0.0) or 0.0)
+        if c <= 0:
+            return 1.0
+        return math.exp(-decay_rate * c)
 
     def _current_query_valence(self, focus_role_entries: list["EventRoleEntry"]) -> float:
         if not focus_role_entries:
