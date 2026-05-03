@@ -13,7 +13,7 @@ import pytest
 from rems.config import REMSConfig
 from rems.models.event import Event
 from rems.observability import PerfMonitor
-from rems.services.abstraction_service import AbstractionService
+from rems.services.abstraction_service import AbstractionService, _find_all_frequent_subsets
 from rems.skills.inductive_evolution import InductiveEvolutionSkill
 from rems.skills.summary_generation import SummaryGenerationSkill
 from rems.storage.database import Database
@@ -36,6 +36,7 @@ def env(config: REMSConfig, db: Database, fake_llm: FakeLLM):
     config.narrative_dup_novelty_min_abs = 2
     config.abstract_subset_min_size = 3
     config.abstract_subset_min_support = 3
+    config.enable_narrative_dedup = True
 
     event_repo = EventRepository(db)
     vector_store = VectorStore(config)
@@ -218,6 +219,22 @@ class TestIsNarrativeDuplicate:
         assert result[0] == a_old.event_id
 
 
+class TestAllFrequentSubsets:
+    """非极大：若大小子集同时满足支持度，应全部进入候选列表。"""
+
+    def test_returns_superset_and_subset_when_both_frequent(self):
+        big = frozenset({"e1", "e2", "e3", "e4", "e5", "e6"})
+        small = frozenset({"e1", "e2", "e3", "e4"})
+        transactions = [big] * 4 + [small] * 2
+        out = _find_all_frequent_subsets(transactions, min_size=3, min_support=4)
+        subsets = {s for s, _ in out}
+        assert big in subsets
+        assert small in subsets
+        by_id = {s: sup for s, sup in out}
+        assert by_id[big] == 4
+        assert by_id[small] == 6
+
+
 class TestMineWithDedupe:
     """End-to-end: 已有抽象时，相同子集再次被挖出应被叙事线判重拦截。"""
 
@@ -239,3 +256,25 @@ class TestMineWithDedupe:
         # 不应产生新抽象（被叙事线判重拦截）
         created = svc.mine_and_synthesize()
         assert created == []
+
+    def test_mine_with_dedup_off_synthesizes_despite_similar_abstract(self, env):
+        """默认产品语义下 narrative dedup 关闭；显式关闭时不应拦近似叙事线。"""
+        svc, event_repo, vector_store, recall_log_repo, fake_llm, config = env
+        config.enable_narrative_dedup = False
+
+        events = [_save_basic(event_repo, f"e{i}") for i in range(3)]
+        leaf_ids = [e.event_id for e in events]
+        for eid in leaf_ids:
+            vector_store.add_event(eid, "x", {"is_abstract": False})
+
+        _save_abstract(event_repo, leaf_ids)
+
+        for k in range(3):
+            recall_log_repo.append(recall_id=f"RCL-{k}", event_ids=leaf_ids)
+
+        fake_llm.push_response({"content_raw": "new abstract", "decoration": None})
+        fake_llm.push_response({"summary": "s", "char_count": 10})
+
+        created = svc.mine_and_synthesize()
+        assert len(created) >= 1
+        assert all(e.is_abstract for e in created)

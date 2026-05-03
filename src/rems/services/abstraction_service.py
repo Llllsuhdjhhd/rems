@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 
-# 抽象事件：唯一触发路径 = 回忆块 event_id 集合中的「极大频繁子集」挖掘（白皮书 §3.2）。
+# 抽象事件：唯一触发路径 = 回忆块 event_id 集合中的频繁子集挖掘（白皮书 §3.2）。
 # - 子集大小 >= abstract_subset_min_size（默认 6，可配置）
 # - 支持度（被多少条回忆块整体覆盖） >= abstract_subset_min_support（默认 12）
-# 达到阈值的子集合成抽象事件；之后用抽象事件 id 在 recall_log 中替换该子集，保持统一命名空间。
+# 满足两条件的**所有**频繁项集（非仅极大）进入候选队列；之后用抽象事件 id 在 recall_log 中替换该子集。
 
 from ..config import REMSConfig
 from ..models.event import CompressionBudget, Event
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class AbstractionService:
-    """Synthesize abstract events from maximal frequent subsets of recall logs (白皮书 §3.2).
+    """Synthesize abstract events from frequent subsets of recall logs (白皮书 §3.2).
 
     抽象事件特点（白皮书 §3.1/§3.2）：
         - ``role_list=[]``：抽象事件不登记角色，不写入任何角色白描，也不触发语义卡片；
@@ -33,9 +33,11 @@ class AbstractionService:
         - 合成输入：始终展开到叶子基本事件，拼接其 ``content_raw`` 与角色线索作为证据；
         - ``insight``：由 ``enable_abstract_insight`` 开关控制，关闭时抽象事件不生成 insight。
 
-    触发是「唯一路径」——不再经向量近邻锚点或回忆压力区重组；由 ``mine_and_synthesize``
-    扫描 ``recall_log`` 全量历史，找支持度 ≥ ``abstract_subset_min_support`` 且大小
-    ≥ ``abstract_subset_min_size`` 的极大子集，逐个合成并登记替换。
+    触发是「唯一路径」——由 ``mine_and_synthesize`` 扫描 ``recall_log`` 全量历史，找支持度
+    ≥ ``abstract_subset_min_support`` 且大小 ≥ ``abstract_subset_min_size`` 的**全部**频繁子集
+    （按规模与支持度排序，优先处理较大子集），逐个经护栏后合成并 ``replace_subset`` 登记替换。
+
+    叙事线近似判重（``enable_narrative_dedup``）默认关闭；开启时与 ``is_fired``、``replace_subset`` 互补。
     """
 
     def __init__(
@@ -71,18 +73,16 @@ class AbstractionService:
     # ------------------------------------------------------------------
 
     def mine_and_synthesize(self) -> list[Event]:
-        """Scan ``recall_log``; synthesize one abstract event per maximal frequent subset.
+        """Scan ``recall_log``; synthesize one abstract event per qualifying frequent subset.
 
         每次回忆结束后调用一次即可。返回新合成的抽象事件列表（可能为空）。
 
-        三道去重护栏（按调用顺序）：
-            1. ``is_fired(subset)``       — 字面完全相同的子集直接拦截（旧机制）。
-            2. ``replace_subset(...)``    — 在新抽象事件登记后，把所有"完全包含 S"的 recall_log
-               行原子级改写：把 S 的成员替换为新抽象 id。叶子在那些行里被抽象 id 取代，
-               下一轮 mining 时同一叙事线不会再以同样的子集形态被挖出。
-            3. ``_is_narrative_duplicate`` — **新增**：拦截 1、2 之间的灰区——subset 与某条
-               已有抽象事件的叶子集合在叙事线层面高度重合（overlap ≥ θ_overlap），且新增信息
-               不显著（|S\\A| 同时低于比例阈值与绝对量阈值）。详见配置项 narrative_dup_*。
+        护栏与收敛（按调用顺序）：
+            1. ``is_fired(subset)`` — 字面子集已处理过则跳过。
+            2. ``enable_narrative_dedup`` 为真时 ``_is_narrative_duplicate`` — 叙事线近似去重
+               （overlap / novelty 双护栏，含叶子展开；比对窗口 K 随 ``PerfMonitor`` 负载收紧）。
+            3. 合成成功后 ``replace_subset`` — 把所有**完全包含** S 的 recall_log 行中的 S
+               替换为新抽象 id（行级「完全包含」去重，多叙事线共享叶子仍由各自行决定）。
         """
         if self._perf is not None:
             with self._perf.timer("abstraction_mining"):
@@ -99,15 +99,18 @@ class AbstractionService:
         if len(transactions) < min_support:
             return []
 
-        maximal = _find_maximal_frequent_subsets(transactions, min_size, min_support)
-        if not maximal:
+        candidates = _find_all_frequent_subsets(transactions, min_size, min_support)
+        if not candidates:
             return []
 
         created: list[Event] = []
-        for subset, support in maximal:
+        for subset, support in candidates:
             if self._fired_repo.is_fired(subset):
                 continue
-            dup_info = self._is_narrative_duplicate(subset)
+            if cfg.enable_narrative_dedup:
+                dup_info = self._is_narrative_duplicate(subset)
+            else:
+                dup_info = None
             if dup_info is not None:
                 matched_id, overlap, novelty_abs = dup_info
                 logger.info(
@@ -334,16 +337,16 @@ def _resolve_leaves(event_repo: EventRepository, ids: "frozenset[str] | set[str]
 
 
 # =====================================================================
-# Maximal frequent subset mining (pragmatic, closure-style)
+# Frequent subset mining (pragmatic, closure-style; all frequent, not only maximal)
 # =====================================================================
 
 
-def _find_maximal_frequent_subsets(
+def _find_all_frequent_subsets(
     transactions: list[frozenset[str]],
     min_size: int,
     min_support: int,
 ) -> list[tuple[frozenset[str], int]]:
-    """Return ``[(subset, support)]`` for every maximal frequent itemset.
+    """Return ``[(subset, support)]`` for every frequent itemset meeting thresholds.
 
     Pragmatic closure enumeration:
         1. Seed candidates with pairwise intersections of size >= min_size.
@@ -351,7 +354,8 @@ def _find_maximal_frequent_subsets(
            smaller closures (also ``>= min_size``).
         3. For each discovered closure C compute support = |{T : C ⊆ T}|;
            keep C if support >= min_support.
-        4. Filter maximal: drop any C ⊊ C' still in the frequent set.
+        4. Return **all** such C sorted by (-|C|, -support, sorted ids) so larger
+           supersets tend to be synthesized before their subsets in one pass.
 
     The algorithm is **closure-complete** for the common case and O(n²·|avg|)
     per iteration; adequate for the scales we expect (<~1k recalls).
@@ -402,11 +406,11 @@ def _find_maximal_frequent_subsets(
     if not frequent:
         return []
 
-    # Maximal filter: drop any subset that has a strict superset in ``frequent``.
-    items = sorted(frequent.keys(), key=lambda s: -len(s))
-    maximal: list[frozenset[str]] = []
-    for C in items:
-        if any(C < M for M in maximal):
-            continue
-        maximal.append(C)
-    return [(C, frequent[C]) for C in maximal]
+    pairs: list[tuple[frozenset[str], int]] = [(C, frequent[C]) for C in frequent]
+
+    def _sort_key(item: tuple[frozenset[str], int]) -> tuple[int, int, tuple[str, ...]]:
+        subset, sup = item
+        return (-len(subset), -sup, tuple(sorted(subset)))
+
+    pairs.sort(key=_sort_key)
+    return pairs

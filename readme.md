@@ -12,7 +12,7 @@
   - 角色抽取 prompt 加强：**全叙事层角色覆盖**（含第一人称叙述者与关键缺席者）、**反应型角色 B 级上限**、**L3 → L2 → L1 的"父-子"推导铁律**（严禁同义改写）、**L1 熔断字数**（§1.1.4）；情感量化明确"仅据当前片段、禁引人物生平"（§2.5.1）。
   - 边界检测 prompt 对应新增：`force_threshold` 注入、`split_id` 配对声明、`new_unclosed` 对象格式（旧扁平 `new_unclosed_indices` 继续兼容）（§4.2.4）。
   - **事件级 Enrichment 三种工作模式**（§4.2.3）：常规对话流默认走 **`names_only`**——pipeline 在 pre-recall 阶段已经基于 `shadow + raw_input` 抽出了「全局富信息池」（每个角色含 snapshot + 8 维情绪），事件级别的 `EventEnrichmentSkill` 只负责"摘要 + 该事件实际登场的角色名字符串数组"，**`role_id` 由代码用 `known_roles`（含 aliases）做字符串匹配解析**，snapshot 与情感按 role_id 从池里直接回填，不再让 LLM 重做。pre-recall 抽不到角色时自动回退 `full`（原行为）；外部已构造完整 `role_entries` 时走 `summary_only`。该路径同时把 `summary_fuse_min_chars` 从 20 调到 35，并把熔断从单条件升级为**双熔断**（下一级预算 ≤ 阈值 ‖ 上一级实际字数 × 0.5 < ⌊阈值×0.7⌋），减少"压到只剩四五个字"的不可读层级。
-  - **抽象事件叙事线判重**（§3.2）：在已有的"`is_fired` 字面去重 + `replace_subset` 完全包含去重"之间补一道**叙事线相似度去重**。挖出的子集 S 若与某条已存在抽象事件 A 在叶子层面 overlap ≥ `narrative_dup_overlap_threshold`（默认 0.9），且新增事件量同时低于比例阈值与绝对量阈值（默认 `0.1` / `2`），则视作"同一叙事线再次浮现"直接跳过；含嵌套抽象的 subset 先用 `EventRepository.resolve_basic_event_ids` 展开到叶子再比对。
+  - **抽象事件叙事线判重**（§3.2，可选）：配置项 `enable_narrative_dedup` **默认关闭**。开启时，在已有的 "`is_fired` 字面去重 + `replace_subset` 完全包含去重" 之间补一道**叙事线相似度去重**。挖出的子集 S 若与某条已存在抽象事件 A 在叶子层面 overlap ≥ `narrative_dup_overlap_threshold`（默认 0.9），且新增事件量同时低于比例阈值与绝对量阈值（默认 `0.1` / `2`），则视作"同一叙事线再次浮现"直接跳过；含嵌套抽象的 subset 先用 `EventRepository.resolve_basic_event_ids` 展开到叶子再比对。
   - **非 LLM 算法耗时监控 + 高负载自我保护**（§2.3 工程化落地）：新增 `rems.observability.PerfMonitor`，对 `rag_search` / `recall_assembly` / `abstraction_mining` / `narrative_dedupe` 等主算法滚动收集均耗时，按"phase 均值 / 容忍上限"算 `load_factor ∈ [1.0, perf_load_factor_max]`。负载越高：(a) **白描静默阈值**按 `forgetting_overload_silence_boost` 抬高（更多老条目跌进 SILENT，遗忘加速）；(b) **抽象判重比对窗口 K** 从 `narrative_dup_compare_recent_k`（默认 200）线性收紧到 `narrative_dup_min_compare_recent_k`（默认 20），避免在已经卡的算法上再花算力。容忍上限越大 = 系统对长耗时容忍度越高 = 越晚进入自我保护。
 
 ## 1. 基本事件定义
@@ -102,7 +102,7 @@
 #### 1.1.8 抽象事件专用扩展属性
 
 - **abstraction_level**：记录该事件在递归演化树中的深度（首层抽象 = 1；以抽象事件为成员再次被纳入更高阶抽象时递增）。
-- **source_events**：存储触发本次抽象合成的频繁极大子集中的全部事件 ID 列表。该列表的元素可以是基本事件 ID，也可以是已有的抽象事件 ID——抽象事件生成后会以其自身 ID 替换 recall_log 中的原子集，使更高阶抽象在同一命名空间继续演进（详见 §3.2 触发机制）。
+- **source_events**：存储触发本次抽象合成的**频繁子集**中的全部事件 ID 列表。该列表的元素可以是基本事件 ID，也可以是已有的抽象事件 ID——抽象事件生成后会以其自身 ID 替换 recall_log 中的原子集，使更高阶抽象在同一命名空间继续演进（详见 §3.2 触发机制）。
 - **抽象链反查基本事件**：出于审计、向量检索结果溯源或对话生成时"从规律回到事实"的需要，仓储层提供 EventRepository.resolve_basic_event_ids(event_id)：对 source_events 做 BFS 递归展开（每遇抽象事件就继续下钻），返回该抽象事件传递依赖的全部叶子基本事件 ID 去重列表；若传入的本就是基本事件，则原样返回。因此从任意抽象事件都能在一次调用内拿到其全部事实支撑，包括角色信息。
 - **字段缺省**：抽象事件不登记 role_list（恒为空）、不登记 role_snapshot / emotional_model；其 summaries（L1…Ln）由 §1.1.3 递归摘要体系基于 content_raw 正常生成，与基本事件同规则。
 
@@ -340,36 +340,39 @@ $$\text{base\_forgetting\_factor} = 100 \cdot a^{\gamma}, \quad \gamma = 2 \text
 - **role_list 恒为空**；抽象事件不登记角色、不生成角色快照、不生成情感量化、不触发任何角色白描追加。合成输入必须带入基本事件的角色线索，压缩 content_raw 时不能漏掉关键角色/实体；当需要角色信息时，可通过 source_events BFS 展开至叶子基本事件获取（见 §1.1.8）；
 - **abstraction_level**：记录在递归演化树中的深度，支持抽象事件再作为其他抽象事件的子集成员参与更高阶合成。
 
-### 3.2 抽象事件的触发机制（唯一路径：频繁极大子集挖掘）
+### 3.2 抽象事件的触发机制（唯一路径：频繁子集挖掘）
 
-抽象事件的合成不再依赖任何向量近邻聚类或定期扫描。其唯一触发路径为：回忆块事件集合中的频繁极大子集挖掘。
+抽象事件的合成不再依赖任何向量近邻聚类或定期扫描。其唯一触发路径为：回忆块事件集合上的**频繁子集**挖掘（**不**限制为「仅极大」项集）。
 
 - **登记阶段**：每次 RecallService.build_recall_block 成功产出回忆块后，将块内所有真实事件 ID（即 basic 与 abstract，过滤 CARD:* 等伪条目）的有序去重集合，作为一条记录写入 recall_log 表。
-- **挖掘阶段**：对 recall_log 的历史记录族 $T_1, T_2, \dots$（每个 $T_i$ 为一次回忆的事件 ID 集合），寻找极大频繁子集 $S$ 满足：
-  - $|S| \geq abstract\_subset\_min\_size$（默认 6，可配置，硬门槛防止两三个事件就合成抽象，稀释语义）；
-  - 存在 $\mathrm{support}(S) = |\{T_i : S \subseteq T_i\}| \geq abstract\_subset\_min\_support$（默认 5，可配置）；
-  - 不存在另一个频繁子集 $S'$ 同时满足 $S \subsetneq S'$（即 $S$ 在频繁集合族内极大，避免同构的小子集重复合成抽象）。
-- **合成阶段**：对每个通过阈值的 $S$，以其成员作为 source_events；调用归纳演化技能（InductiveEvolutionSkill）时先将成员递归展开到叶子基本事件，拼接这些基本事件的 content_raw 与角色线索作为输入，合成压缩后的抽象事件 content_raw；持久化后调用 §1.1.3 的 SummaryGenerationSkill 为其 content_raw 生成多级摘要与 actual_max_level，再索引入向量库。
+- **挖掘阶段**：对 recall_log 的历史记录族 $T_1, T_2, \dots$（每个 $T_i$ 为一次回忆的事件 ID 集合），枚举闭包式候选，保留**所有**同时满足下述条件的频繁子集 $S$：
+  - $|S| \geq abstract\_subset\_min\_size$（默认 6，可配置）；
+  - $\mathrm{support}(S) = |\{T_i : S \subseteq T_i\}| \geq abstract\_subset\_min\_support$（默认 12，可配置）。
+  - 候选按 $|S|$ 与支持度排序，单轮内倾向**先处理较大子集**，以减轻与 `replace_subset` 的交互扭结。
+- **合成阶段**：对每个通过护栏的 $S$，以其成员作为 source_events；调用归纳演化技能（InductiveEvolutionSkill）时先将成员递归展开到叶子基本事件，拼接这些基本事件的 content_raw 与角色线索作为输入，合成压缩后的抽象事件 content_raw；持久化后调用 §1.1.3 的 SummaryGenerationSkill 为其 content_raw 生成多级摘要与 actual_max_level，再索引入向量库。
 - **幂等 & 同名空间迭代（抽象事件可再次抽象）**：
   - 每条抽象事件生成后会把其指纹（$S$ 成员排序后拼接）登记到 abstracted_subsets 表，同一 $S$ 不会被重复合成；
   - 生成后会遍历所有满足 $S \subseteq T_i$ 的历史 recall_log 行，将其中的 $S$ 成员移除，插入新抽象事件 ID。“用抽象事件 ID 代替原来的子集”使得挖掘逻辑在单一命名空间内统一：后续回忆块若仍然整体命中该抽象事件，会与历史记录在同一空间里累积支持度；若多个已合成的抽象事件再度频繁共现，即触发更高阶抽象（source_events 可直接嵌套抽象事件 ID，abstraction_level 递增），自然形成多阶演化树；
   - source_events 内的基本事件会被标记 is_abstracted = True（仅基本事件；嵌套的抽象事件不做此标记，因为它们本身也是高阶演化的中间节点）；
 - **从抽象反查基本事件**：需要溯源到事实层时，调用 EventRepository.resolve_basic_event_ids(event_id) 即可沿整条 source_events 链路 BFS 展开到叶子基本事件，无论抽象有多少层（见 §1.1.8）。这使得“规律 → 事实”的检索在任意阶抽象上都保持 O(1) API。
 
-#### 3.2.1 抽象事件叙事线判重（2026.05 新增）
+#### 3.2.1 抽象事件叙事线判重（2026.05 新增，可选）
 
-`mine_and_synthesize` 内部按以下顺序串接三道去重护栏，覆盖从"字面相同"到"叙事相似"的全谱系：
+`mine_and_synthesize` 内部按以下顺序处理：
 
 1. **`is_fired(subset)`**：字面完全相同的子集直接拦截（旧机制）。
-2. **`replace_subset(...)`**：新抽象事件登记后，把所有"完全包含 $S$"的 recall_log 行原子级改写——把 $S$ 的成员替换为新抽象 ID，下一轮 mining 时同一叙事线不再以同样的子集形态被挖出（旧机制）。
-3. **`_is_narrative_duplicate(subset)`**（**新增**）：拦截 1、2 之间的灰区——subset 与某条已有抽象事件 $A$ 的**叶子**集合（含嵌套抽象的 BFS 展开）在叙事线层面高度重合：
+2. **`enable_narrative_dedup` 为真时** **`_is_narrative_duplicate(subset)`**：拦截「字面不重复、但 `replace_subset` 也够不着」的灰区——subset 与某条已有抽象事件 $A$ 的**叶子**集合（含嵌套抽象的 BFS 展开）在叙事线层面高度重合：
    - $\mathrm{overlap} = |S \cap A.\mathrm{leaves}| / |S| \geq$ `narrative_dup_overlap_threshold`（默认 0.9）；
    - 同时新增信息**不显著**：$\mathrm{novelty\_ratio} = |S \setminus A.\mathrm{leaves}| / |S| <$ `narrative_dup_novelty_min_ratio`（默认 0.1） **或** $\mathrm{novelty\_abs} <$ `narrative_dup_novelty_min_abs`（默认 2）；
    - 任一条件成立则跳过新合成，并把这条 subset 以 `matched_id`（被命中的 A）登记到 `fired_repo`，避免下一轮反复挖到再走一次判重。
 
-**护栏意义**：单独看 overlap 比例会被"短子集差 1 个"骗过（5/6=0.83 ≈ 边界），单独看绝对量会让"长 subset 加 1 个新事件"被误放过；两者**同时**满足才视作"老素材新叙事"（白皮书 §3 关于"同一基础事件可在多条叙事线上独立抽象"的语义）。
+3. **合成成功后的 `replace_subset(...)`**：把所有"完全包含 $S$"的 recall_log 行原子级改写——把 $S$ 的成员替换为新抽象 ID；多叙事线共享同一叶子时，仅**完全包含** $S$ 的行被改写（见 §3.2 幂等段）。
 
-**性能护栏**：候选 × 已有抽象的全比成本随抽象规模线性增长。判重默认只与最近 K = `narrative_dup_compare_recent_k`（默认 200）条已合成抽象比对。当 §2.3 `PerfMonitor` 检测到 `narrative_dedupe` / `abstraction_mining` 等 phase 越线时，K 按 `load_factor` 线性收紧到 `narrative_dup_min_compare_recent_k`（默认 20），保证至少 1 条比对、避免在已经卡的算法上再花算力。
+**默认**：`enable_narrative_dedup=False`，不跑第 2 步；`is_fired` 与 `replace_subset` 仍为互补的硬收敛手段。
+
+**护栏意义**（判重开启时）：单独看 overlap 比例会被"短子集差 1 个"骗过（5/6=0.83 ≈ 边界），单独看绝对量会让"长 subset 加 1 个新事件"被误放过；**显著新增**须 novelty 比例与绝对量**同时**达到阈值才视作"老素材新叙事"（白皮书 §3 关于"同一基础事件可在多条叙事线上独立抽象"的语义）。
+
+**性能护栏**（判重开启时）：候选 × 已有抽象的全比成本随抽象规模线性增长。判重通常只与最近 K = `narrative_dup_compare_recent_k`（默认 200）条已合成抽象比对。当 §2.3 `PerfMonitor` 检测到 `narrative_dedupe` / `abstraction_mining` 等 phase 越线时，K 按 `load_factor` 线性收紧到 `narrative_dup_min_compare_recent_k`（默认 20），保证至少 1 条比对、避免在已经卡的算法上再花算力。
 
 ### 3.3 幻觉控制与防强化循环
 
@@ -548,7 +551,7 @@ $$\text{base\_forgetting\_factor} = 100 \cdot a^{\gamma}, \quad \gamma = 2 \text
 1. **必现**：E 的 `split_prefix_event_ids` 中的每一条前缀事件，**必须**出现在最终回忆块中——无论它们自己是否直接命中语义/白描检索。
 2. **时间语序**：前缀事件按"自远而近"顺序排在 E 之前；若某条前缀本身也有前缀链（多跳），其祖先前缀先于它出现。即便某条前缀恰好已被 RRF 排在 E 之后进入 block，系统也会把它**重排**到 E 之前，保留叙事可读性。
 3. **允许降档，禁止丢弃**：新追加的前缀事件初始以"比默认档再压一级"的摘要落块；若累加后越过 `physical_redline`，系统只会把**前缀事件**降级到 ultra-concise（`[EVT-xxx] <stub>…`）形态，**锚定事件**（E 本身及其它正常命中事件）保持原档。任何情况下前缀事件都带 `event_id`，可追溯。
-4. **链深度上限**：沿 `split_prefix_event_ids` 向上展开的最大跳数由 `recall_split_prefix_max_depth`（默认 3）控制。超深度的早期前缀按"已被抽象合成承载"的语义交由 §3.2 频繁极大子集挖掘去覆盖，不再逐跳回拉。
+4. **链深度上限**：沿 `split_prefix_event_ids` 向上展开的最大跳数由 `recall_split_prefix_max_depth`（默认 3）控制。超深度的早期前缀按"已被抽象合成承载"的语义交由 §3.2 频繁子集挖掘去覆盖，不再逐跳回拉。
 5. **去重**：同一前缀事件在多条命中事件间共享时，只入一次。
 
 语义目标：用户的原始长叙事即便被 80/20 切成多段，也能在单次回忆中被完整再现——不会出现"只看到收尾、前面的铺垫全丢"的认知断层。
@@ -574,7 +577,7 @@ REMS 作为一个底层代谢架构，不强制绑定单一的响应模式。系
 1. 组装 ContextPackage（回忆块 + 残影 + 当前输入）；
 2. 把真实 event_id 追加到 recall_log；
 3. 运行代谢（边界检测、封存、残影维护）、角色更新；
-4. 扫全量 recall_log 做极大频繁子集挖掘合成抽象事件（§3.2）。
+4. 扫全量 recall_log 做频繁子集挖掘合成抽象事件（§3.2）。
 
 模式差异只在最后一步——要不要把 ContextPackage 对外暴露、以及是否额外派生指令。这样设计的刚性理由：
 

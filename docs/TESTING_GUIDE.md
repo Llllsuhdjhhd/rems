@@ -383,12 +383,12 @@ python -m pytest tests/unit -q     # 最快回归，10 秒级
 
 ---
 
-### Step 7｜抽象合成（频繁极大子集挖掘）
+### Step 7｜抽象合成（频繁子集挖掘）
 
 **做了什么** — `AbstractionService.mine_and_synthesize()`（白皮书 §3.2 唯一触发路径）：
 
 1. 拉所有 recall_log，把每行 event_ids 视作一条交易；
-2. 用 closure-style 极大频繁子集挖掘（`_find_maximal_frequent_subsets`），筛 size ≥ `abstract_subset_min_size` 且 support ≥ `abstract_subset_min_support` 的极大子集；
+2. 用 closure-style 频繁子集挖掘（`_find_all_frequent_subsets`），筛 size ≥ `abstract_subset_min_size` 且 support ≥ `abstract_subset_min_support` 的全部频繁子集（非仅极大）；
 3. 跳过已经合成过的（`AbstractedSubsetRepository.is_fired`）；
 4. 每个候选子集：
    - `evidence_policy.collect`（默认 `LeafContentRawEvidencePolicy`：递归展开抽象链到叶子，拼接 `content_raw` 做证据）；
@@ -506,7 +506,7 @@ python -m pytest tests/integration/test_wp_live_single_mode_narrative.py -v
 **潜在但还未实现的优化方向**（非本次清单内）：
 
 1. **embedding 入库批量化** — `event_service._index_event` 现在每条事件单独 upsert；批量处理可显著降低 ChromaDB write IO。
-2. **recall_log 大表的极大子集挖掘**优化 — `_find_maximal_frequent_subsets` 是 O(n²·|avg|)，实际数据 < ~1k recalls 还够用；规模上去之后建议引入 FP-Growth 或 LCM。
+2. **recall_log 大表的频繁子集挖掘**优化 — `_find_all_frequent_subsets` 是 O(n²·|avg|)，实际数据 < ~1k recalls 还够用；规模上去之后建议引入 FP-Growth 或 LCM。
 3. **白描容量超限后的"软遗忘 + 主动凋亡"二阶段** — 当前只在 Recall 打分中用遗忘因子；真正彻底淘汰旧条目需要在 `RoleService` 层加周期性 garbage collection。
 4. **角色合并 / 别名归并** — 长跑会出现"张三 / 三哥 / 老张"分别存为 3 个 role_id；可以加一个角色合并 service 用 LLM 仲裁 + 更新 white_painting 与 event 的 role_id。
 5. **InsightService** — 当 `enable_abstract_insight=True` 时，把 insight 单独抽出来做"跨抽象事件元规律"的二阶聚合（白皮书 §3.3）。

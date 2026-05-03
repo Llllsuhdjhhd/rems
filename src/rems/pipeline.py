@@ -290,7 +290,7 @@ class REMSPipeline:
                因此即使被动日志模式"不对用户说话"，也必须完成回忆与登记，否则系统永远不会演化出抽象规律；
             4. 代谢：边界检测、封存基本事件、维护残影与未完成库（§4.1–§4.2）；
             5. 角色更新：对每个新基本事件追加白描时间线、必要时刷新语义卡片（§2.2–§2.3，抽象事件自动跳过）；
-            6. 抽象合成：扫 ``recall_log`` 全量历史做极大频繁子集挖掘（§3.2）。
+            6. 抽象合成：扫 ``recall_log`` 全量历史做频繁子集挖掘（§3.2）。
 
         **外部输出形态（由 ``mode`` 决定）**：
             - ``returns_context_package == True``：对外返回 ContextPackage 供上游 LLM 生成回复；
@@ -377,7 +377,7 @@ class REMSPipeline:
         for event in sealed:
             self.role_service.update_from_event(event)
 
-        # 抽象事件触发 —— 唯一路径：``recall_log`` 中的极大频繁子集（白皮书 §3.2）。
+        # 抽象事件触发 —— 唯一路径：``recall_log`` 中的频繁子集挖掘（白皮书 §3.2）。
         # 所有模式都跑：被动日志场景下仍然需要持续演化出抽象规律供未来检索或审计。
         abstract_events: list[Event] = self.abstraction_service.mine_and_synthesize()
 

@@ -1,6 +1,6 @@
 """Tests for AbstractionService.
 
-白皮书 §3.2：抽象事件**唯一**触发路径 = recall_log 上的极大频繁子集挖掘
+白皮书 §3.2：抽象事件**唯一**触发路径 = recall_log 上的频繁子集挖掘
 （``mine_and_synthesize``）。旧测试还在调用早期"向量聚类"接口
 ``check_and_abstract``，已经在架构升级时移除——本文件按新接口重写。
 """
@@ -78,7 +78,7 @@ class TestMineAndSynthesize:
             _save_event(event_repo, vector_store, f"张三在第{i+1}次会议讨论项目进度")
             for i in range(4)
         ]
-        # 同一组三事件被反复回忆 3 次 → 极大频繁子集 = {e0, e1, e2}, support=3
+        # 同一组三事件被反复回忆 3 次 → 频繁子集 {e0, e1, e2}, support=3
         common = [events[0].event_id, events[1].event_id, events[2].event_id]
         for k in range(3):
             recall_log_repo.append(

@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # REMS 全局配置（对照《REMS 记忆系统规范解析》白皮书）。
 # - len_msg / physical_redline / safe_watermark：1.1.7 事件长度与物理防御、4.2 触发与截断；
-# - abstract_subset_min_size / abstract_subset_min_support：3.2 频繁极大子集挖掘触发抽象；
+# - abstract_subset_min_size / abstract_subset_min_support / enable_narrative_dedup：3.2 频繁子集挖掘与叙事判重；
 # - ae_*、wp_*：1.1.4、2.2 情感能量（AE）与白描动态遗忘；
 # - hallucination_anchor_prob：兼容旧配置；当前抽象合成始终使用叶子基本事件 content_raw；
 # - tombstone_prefix：4.3 墓碑化时在 insight 中的审计标记前缀；
@@ -108,12 +108,12 @@ class REMSConfig(BaseSettings):
     # 分层比例：最近 N% 的条目对全局可见，剩余部分仅焦点角色关联可见。
     recall_global_ratio: float = 0.7
 
-    # ---- Abstraction: Frequent Maximal Subset Mining (白皮书 §3.2 唯一触发) ----
+    # ---- Abstraction: Frequent Subset Mining (白皮书 §3.2 唯一触发) ----
     # 每次回忆产生的回忆块 event_id 集合被登记到 ``recall_log``；在集合族中找满足：
     #   - 子集大小 >= abstract_subset_min_size（默认 6；可配置）
     #   - 支持度（跨多少条回忆块被整体覆盖） >= abstract_subset_min_support（默认 12）
-    # 的 **极大子集**，对其合成抽象事件。合成后把 ``recall_log`` 中该子集替换为抽象事件 id，
-    # 以便后续更高阶抽象继续在同一命名空间演进（"用抽象事件 id 代替原来的子集，逻辑保持统一"）。
+    # 的 **全部**频繁子集（非仅极大），对其逐个经护栏后合成抽象事件。合成后把 ``recall_log``
+    # 中该子集替换为抽象事件 id，以便后续更高阶抽象继续在同一命名空间演进。
     abstract_subset_min_size: int = 6
     abstract_subset_min_support: int = 12
 
@@ -232,7 +232,7 @@ class REMSConfig(BaseSettings):
     # 当前监控的非 LLM phase（按需扩展，不在表里的 phase 第一次 record 时按默认 200ms 注册）：
     #   - rag_search          ：向量库语义检索
     #   - recall_assembly     ：回忆块组装
-    #   - abstraction_mining  ：极大频繁子集挖掘
+    #   - abstraction_mining  ：频繁子集挖掘
     #   - narrative_dedupe    ：抽象事件叙事线判重
     perf_phase_tolerance_ms: dict[str, float] = Field(
         default_factory=lambda: {
@@ -249,8 +249,10 @@ class REMSConfig(BaseSettings):
     forgetting_overload_silence_boost: float = 4.0
 
     # ---- Narrative-line dedupe for abstract events (覆盖 is_fired / replace_subset 之间的灰区) ----
-    # 已存在的"完全包含"去重在 replace_subset 里完成；下面的"近似去重"专门拦
+    # 默认关闭。开启后：已存在的"完全包含"去重仍在 replace_subset 里完成；本项专门拦
     # "几乎相同的叙事线再次浮现"——overlap 高 + novelty 不足时跳过新合成。
+    enable_narrative_dedup: bool = False
+
     # 阈值含义：overlap = |S ∩ A.leaves| / |S|；novelty = |S \ A.leaves| / |S|
     narrative_dup_overlap_threshold: float = 0.9
     narrative_dup_novelty_min_ratio: float = 0.1
