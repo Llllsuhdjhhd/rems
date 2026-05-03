@@ -45,6 +45,49 @@ def _write_failed_llm_json(text: str) -> Path:
     return path
 
 
+def _write_empty_assistant_record(
+    *,
+    task_type: str,
+    model: str,
+    latency_ms: float,
+    usage: Any,
+    response_id: str | None,
+    message_payload: dict[str, Any],
+) -> Path:
+    """Persist diagnostics when the assistant ``content`` is empty (locate API / routing bugs).
+
+    Typical failure mode: ``completion_tokens`` large while ``message.content`` is blank
+    (reasoning in a separate field on some providers). Writes JSON next to other LLM failure logs.
+    """
+    base_dir = Path(os.environ.get("REMS_LOG_DIR", "logs/llm_failures"))
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Cannot create empty-assistant log dir %s: %s", base_dir, exc)
+        return Path("")
+    fname = f"empty_assistant_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:6]}.json"
+    path = base_dir / fname
+    record = {
+        "logged_at_utc": datetime.utcnow().isoformat() + "Z",
+        "task_type": task_type,
+        "model": model,
+        "latency_ms": round(latency_ms, 3),
+        "response_id": response_id,
+        "usage": {
+            "prompt_tokens": LLMProvider._usage_int(usage, "prompt_tokens"),
+            "completion_tokens": LLMProvider._usage_int(usage, "completion_tokens"),
+            "total_tokens": LLMProvider._usage_int(usage, "total_tokens"),
+        },
+        "message": message_payload,
+    }
+    try:
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Cannot write empty-assistant log %s: %s", path, exc)
+        return Path("")
+    return path
+
+
 class LLMProvider:
     """Thin wrapper around the OpenAI-compatible chat API.
 
@@ -103,18 +146,44 @@ class LLMProvider:
             timeout=300.0,
         )
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        content = response.choices[0].message.content or ""
+        msg = response.choices[0].message
+        content = msg.content or ""
         usage = getattr(response, "usage", None)
+        ct = self._usage_int(usage, "completion_tokens")
         self._invocations.append(
             LLMInvocationMetrics(
                 task_type=task_type,
                 model=model,
                 latency_ms=round(latency_ms, 3),
                 prompt_tokens=self._usage_int(usage, "prompt_tokens"),
-                completion_tokens=self._usage_int(usage, "completion_tokens"),
+                completion_tokens=ct,
                 total_tokens=self._usage_int(usage, "total_tokens"),
             ),
         )
+        if not content.strip():
+            try:
+                msg_dump: dict[str, Any] = msg.model_dump(mode="json")  # type: ignore[union-attr]
+            except Exception:
+                msg_dump = {"content": getattr(msg, "content", None)}
+            resp_id = getattr(response, "id", None)
+            logger.warning(
+                "LLM empty assistant content [%s] model=%s completion_tokens=%s response_id=%s — "
+                "downstream JSON parse may fail; see logs/llm_failures empty_assistant_*.json",
+                task_type,
+                model,
+                ct,
+                resp_id,
+            )
+            saved = _write_empty_assistant_record(
+                task_type=task_type,
+                model=model,
+                latency_ms=latency_ms,
+                usage=usage,
+                response_id=resp_id,
+                message_payload=msg_dump,
+            )
+            if saved:
+                logger.warning("Empty-assistant diagnostics written to %s", saved)
         logger.debug(
             "LLM [%s/%s] latency_ms=%.2f usage=%s",
             task_type,
