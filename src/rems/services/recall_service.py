@@ -9,6 +9,7 @@ import math
 from ..config import REMSConfig
 from ..models.event import Event, EventStatus
 from ..models.metabolism import ContextPackage, RecallBlock, RecallItem, Shadow
+from ..observability import PerfMonitor
 from ..strategies.recall import (
     DefaultRecallScoringStrategy,
     DefaultSummaryTierPolicy,
@@ -47,6 +48,7 @@ class RecallService:
         vector_store: VectorStore,
         scoring_strategy: RecallScoringStrategy | None = None,
         summary_tier_policy: SummaryTierPolicy | None = None,
+        perf_monitor: PerfMonitor | None = None,
     ):
         self._config = config
         self._event_repo = event_repo
@@ -54,7 +56,9 @@ class RecallService:
         self._vector = vector_store
         self._scoring_strategy = scoring_strategy or DefaultRecallScoringStrategy(config)
         self._summary_tier_policy = summary_tier_policy or DefaultSummaryTierPolicy(config)
-        self._forgetting_strategy = DefaultWhitePaintingRetentionStrategy(config)
+        # 把 perf_monitor 同时透给 forgetting strategy，让"白描静默阈值"也按系统负载动态收紧。
+        self._perf = perf_monitor
+        self._forgetting_strategy = DefaultWhitePaintingRetentionStrategy(config, perf_monitor=perf_monitor)
 
     # ------------------------------------------------------------------
     def build_recall_block(
@@ -253,9 +257,17 @@ class RecallService:
         focus_role_ids: set[str] | None = None,
         focus_role_entries: list["EventRoleEntry"] | None = None,
     ) -> ContextPackage:
-        recall = self.build_recall_block(
-            raw_input, shadow, focus_role_ids=focus_role_ids, focus_role_entries=focus_role_entries
-        )
+        # 整段回忆块组装（含双流检索 + RRF + 修饰 + 懒索引降级）的耗时由 PerfMonitor 监控；
+        # 越线即抬高 load_factor，进而让 forgetting silence 阈值收紧、抽象判重 K 收窄。
+        if self._perf is not None:
+            with self._perf.timer("recall_assembly"):
+                recall = self.build_recall_block(
+                    raw_input, shadow, focus_role_ids=focus_role_ids, focus_role_entries=focus_role_entries,
+                )
+        else:
+            recall = self.build_recall_block(
+                raw_input, shadow, focus_role_ids=focus_role_ids, focus_role_entries=focus_role_entries,
+            )
         return ContextPackage(
             recall_block=recall,
             shadow=shadow,

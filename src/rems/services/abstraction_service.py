@@ -4,11 +4,12 @@ import logging
 
 # 抽象事件：唯一触发路径 = 回忆块 event_id 集合中的「极大频繁子集」挖掘（白皮书 §3.2）。
 # - 子集大小 >= abstract_subset_min_size（默认 6，可配置）
-# - 支持度（被多少条回忆块整体覆盖） >= abstract_subset_min_support（默认 5）
+# - 支持度（被多少条回忆块整体覆盖） >= abstract_subset_min_support（默认 12）
 # 达到阈值的子集合成抽象事件；之后用抽象事件 id 在 recall_log 中替换该子集，保持统一命名空间。
 
 from ..config import REMSConfig
 from ..models.event import CompressionBudget, Event
+from ..observability import PerfMonitor
 from ..strategies.abstraction import AbstractionEvidencePolicy, LeafContentRawEvidencePolicy
 from ..skills.event_enrichment import EventEnrichmentSkill
 from ..skills.inductive_evolution import InductiveEvolutionSkill
@@ -48,6 +49,7 @@ class AbstractionService:
         abstracted_subset_repo: AbstractedSubsetRepository,
         evidence_policy: AbstractionEvidencePolicy | None = None,
         enrichment_skill: EventEnrichmentSkill | None = None,
+        perf_monitor: PerfMonitor | None = None,
     ):
         self._config = config
         self._event_repo = event_repo
@@ -60,6 +62,9 @@ class AbstractionService:
         self._recall_log_repo = recall_log_repo
         self._fired_repo = abstracted_subset_repo
         self._evidence_policy = evidence_policy or LeafContentRawEvidencePolicy()
+        # 可选 PerfMonitor：mining / 叙事线判重各包一层 timer，
+        # 同时让叙事线判重的"比对窗口 K"按系统负载动态收紧（白皮书 §2.3）。
+        self._perf = perf_monitor
 
     # ------------------------------------------------------------------
     # Public entry
@@ -69,7 +74,22 @@ class AbstractionService:
         """Scan ``recall_log``; synthesize one abstract event per maximal frequent subset.
 
         每次回忆结束后调用一次即可。返回新合成的抽象事件列表（可能为空）。
+
+        三道去重护栏（按调用顺序）：
+            1. ``is_fired(subset)``       — 字面完全相同的子集直接拦截（旧机制）。
+            2. ``replace_subset(...)``    — 在新抽象事件登记后，把所有"完全包含 S"的 recall_log
+               行原子级改写：把 S 的成员替换为新抽象 id。叶子在那些行里被抽象 id 取代，
+               下一轮 mining 时同一叙事线不会再以同样的子集形态被挖出。
+            3. ``_is_narrative_duplicate`` — **新增**：拦截 1、2 之间的灰区——subset 与某条
+               已有抽象事件的叶子集合在叙事线层面高度重合（overlap ≥ θ_overlap），且新增信息
+               不显著（|S\\A| 同时低于比例阈值与绝对量阈值）。详见配置项 narrative_dup_*。
         """
+        if self._perf is not None:
+            with self._perf.timer("abstraction_mining"):
+                return self._mine_and_synthesize_inner()
+        return self._mine_and_synthesize_inner()
+
+    def _mine_and_synthesize_inner(self) -> list[Event]:
         cfg = self._config
         min_size = max(2, cfg.abstract_subset_min_size)
         min_support = max(2, cfg.abstract_subset_min_support)
@@ -87,6 +107,18 @@ class AbstractionService:
         for subset, support in maximal:
             if self._fired_repo.is_fired(subset):
                 continue
+            dup_info = self._is_narrative_duplicate(subset)
+            if dup_info is not None:
+                matched_id, overlap, novelty_abs = dup_info
+                logger.info(
+                    "narrative-dup-skip: subset_size=%d support=%d matched=%s overlap=%.2f novelty=%d",
+                    len(subset), support, matched_id, overlap, novelty_abs,
+                )
+                # 仍然登记为 fired，避免下一轮 mining 反复挖到同一组合再走一遍叙事线判重。
+                # 这里用一个占位 abstract_id（matched_id 本身）登记，语义上"该 subset 已由
+                # matched_id 在叙事线层面承载"。
+                self._fired_repo.mark_fired(subset, matched_id)
+                continue
             evt = self._synthesize_from_subset(subset, support)
             if evt is not None:
                 created.append(evt)
@@ -98,6 +130,85 @@ class AbstractionService:
                     evt.event_id, len(subset), support, replaced,
                 )
         return created
+
+    # ------------------------------------------------------------------
+    # Narrative-line dedupe (灰区拦截)
+    # ------------------------------------------------------------------
+
+    def _is_narrative_duplicate(
+        self, subset: frozenset[str],
+    ) -> tuple[str, float, int] | None:
+        """Return ``(matched_abstract_id, overlap, novelty_abs)`` if subset is dup; else ``None``.
+
+        叙事线相似度判断：
+            - 把 ``subset`` 全部展开到叶子（含嵌套抽象事件），得 ``leaves_S``。
+            - 对最近 ``K`` 条已有抽象事件 A，把 ``A`` 也展开到叶子 ``leaves_A``，比 overlap/novelty。
+            - 命中"高重合 + 新增不显著"则返回；否则 None。
+
+        ``K`` 默认为 ``narrative_dup_compare_recent_k``，PerfMonitor 检测到过载时收紧到
+        ``narrative_dup_min_compare_recent_k``，避免在已经卡的算法上再花算力（白皮书 §2.3）。
+        """
+        if self._perf is not None:
+            with self._perf.timer("narrative_dedupe"):
+                return self._is_narrative_duplicate_inner(subset)
+        return self._is_narrative_duplicate_inner(subset)
+
+    def _is_narrative_duplicate_inner(
+        self, subset: frozenset[str],
+    ) -> tuple[str, float, int] | None:
+        cfg = self._config
+        overlap_th = cfg.narrative_dup_overlap_threshold
+        novelty_ratio_th = cfg.narrative_dup_novelty_min_ratio
+        novelty_abs_th = cfg.narrative_dup_novelty_min_abs
+
+        # 叙事线判重的"比对窗口 K"：默认 narrative_dup_compare_recent_k；过载时按 load_factor 收紧。
+        if self._perf is not None:
+            recent_k = self._perf.adjusted_recent_k(
+                cfg.narrative_dup_compare_recent_k,
+                cfg.narrative_dup_min_compare_recent_k,
+            )
+        else:
+            recent_k = cfg.narrative_dup_compare_recent_k
+
+        # 把 subset 展开到叶子（subset 里可能含嵌套抽象事件）。
+        leaves_s = _resolve_leaves(self._event_repo, subset)
+        if not leaves_s:
+            return None
+
+        # 取最近 K 条已合成抽象事件做比对；空库 → 直接返回 None。
+        recent_abstracts = self._list_recent_abstracts(recent_k)
+        if not recent_abstracts:
+            return None
+
+        # 比对：找第一个满足"高重合 + 新增不显著"的抽象。
+        # 选第一个就够了——若 subset 跟多条抽象都高度相似，按时间倒序优先匹配最近的，
+        # 这样调用方能在 fired_repo 里把这条 subset 归到最相关的抽象名下。
+        for abs_evt in recent_abstracts:
+            leaves_a = set(self._event_repo.resolve_basic_event_ids(abs_evt.event_id))
+            if not leaves_a:
+                continue
+            inter = leaves_s & leaves_a
+            if not inter:
+                continue
+            overlap = len(inter) / len(leaves_s)
+            novelty_abs = len(leaves_s - leaves_a)
+            if overlap < overlap_th:
+                continue
+            # 双护栏：novelty 必须 **既** 低于比例阈值 **又** 低于绝对量阈值，才视为"几乎重复"。
+            novelty_ratio = novelty_abs / len(leaves_s)
+            if novelty_ratio >= novelty_ratio_th and novelty_abs >= novelty_abs_th:
+                # 新增信息显著，放过——这是"老素材上的新叙事"。
+                continue
+            return (abs_evt.event_id, overlap, novelty_abs)
+        return None
+
+    def _list_recent_abstracts(self, k: int) -> list[Event]:
+        """Return up to ``k`` most recently created abstract events (newest first)."""
+        if k <= 0:
+            return []
+        all_abs = self._event_repo.list_all(is_abstract=True)
+        all_abs.sort(key=lambda e: e.create_time, reverse=True)
+        return all_abs[:k]
 
     # ------------------------------------------------------------------
     # Synthesis
@@ -201,6 +312,25 @@ class AbstractionService:
                 "create_time": event.create_time.timestamp(),
             },
         )
+
+
+# =====================================================================
+# Helpers
+# =====================================================================
+
+
+def _resolve_leaves(event_repo: EventRepository, ids: "frozenset[str] | set[str]") -> set[str]:
+    """Expand any abstract events in ``ids`` to their basic-event leaves; basic events pass through.
+
+    抽象事件可作为更高阶抽象的成员；判重时必须先把"含抽象 id 的 subset"统一展开到叶子层
+    再比对，否则同一条叙事的高阶抽象 vs 低阶抽象会被误判成"无交集"。复用
+    ``EventRepository.resolve_basic_event_ids``（白皮书 §1.1.8 已有 BFS 实现）。
+    """
+    leaves: set[str] = set()
+    for eid in ids:
+        for leaf_id in event_repo.resolve_basic_event_ids(eid):
+            leaves.add(leaf_id)
+    return leaves
 
 
 # =====================================================================

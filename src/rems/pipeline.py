@@ -11,6 +11,7 @@ from .llm.provider import LLMProvider
 from .models.event import Event, EventRoleEntry
 from .models.metabolism import ContextPackage
 from .models.role import Role
+from .observability import PerfMonitor
 from .services.abstraction_service import AbstractionService
 from .services.belief_revision_service import BeliefRevisionService
 from .services.emotion_service import EMAEvolver
@@ -151,6 +152,7 @@ class REMSPipeline:
         abstraction_service: AbstractionService,
         belief_revision_service: BeliefRevisionService,
         role_skill: RoleExtractionSkill | None = None,
+        perf_monitor: PerfMonitor | None = None,
     ):
         self.config = config
         self.llm = llm
@@ -167,6 +169,8 @@ class REMSPipeline:
         self.abstraction_service = abstraction_service
         self.belief_revision_service = belief_revision_service
         self.role_skill = role_skill
+        # 暴露 perf_monitor，便于上层脚本读取耗时指标 / 当前 load_factor 做诊断。
+        self.perf_monitor = perf_monitor
 
     # ------------------------------------------------------------------
     @classmethod
@@ -179,7 +183,19 @@ class REMSPipeline:
         llm = LLMProvider(config)
         db = Database(config.storage.database_url)
         db.create_tables()
-        vector_store = VectorStore(config)
+
+        # 性能监控（白皮书 §2.3 高负载自我保护）：
+        # 监听 RAG / 回忆组装 / 抽象挖掘 / 叙事判重 等非 LLM 主算法的滚动均耗时，
+        # load_factor 上升时驱动 (1) 白描静默阈值收紧 (2) 抽象判重 K 收窄。
+        perf_monitor = PerfMonitor(
+            enabled=config.perf_monitor_enabled,
+            window_size=config.perf_monitor_window_size,
+            tolerances_ms=config.perf_phase_tolerance_ms,
+            load_factor_max=config.perf_load_factor_max,
+            silence_boost_at_max=config.forgetting_overload_silence_boost,
+        )
+
+        vector_store = VectorStore(config, perf_monitor=perf_monitor)
 
         event_repo = EventRepository(db)
         role_repo = RoleRepository(db)
@@ -217,7 +233,9 @@ class REMSPipeline:
             event_repo=event_repo,
             llm=llm,
         )
-        recall_service = RecallService(config, event_repo, role_repo, vector_store)
+        recall_service = RecallService(
+            config, event_repo, role_repo, vector_store, perf_monitor=perf_monitor,
+        )
         abstraction_service = AbstractionService(
             config,
             event_repo,
@@ -227,6 +245,7 @@ class REMSPipeline:
             recall_log_repo,
             abstracted_subset_repo,
             enrichment_skill=enrichment_skill,
+            perf_monitor=perf_monitor,
         )
         belief_revision_service = BeliefRevisionService(config, event_repo, role_repo)
 
@@ -246,6 +265,7 @@ class REMSPipeline:
             abstraction_service=abstraction_service,
             belief_revision_service=belief_revision_service,
             role_skill=role_skill,
+            perf_monitor=perf_monitor,
         )
 
     # ------------------------------------------------------------------

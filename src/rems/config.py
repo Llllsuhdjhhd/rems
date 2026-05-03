@@ -111,11 +111,11 @@ class REMSConfig(BaseSettings):
     # ---- Abstraction: Frequent Maximal Subset Mining (白皮书 §3.2 唯一触发) ----
     # 每次回忆产生的回忆块 event_id 集合被登记到 ``recall_log``；在集合族中找满足：
     #   - 子集大小 >= abstract_subset_min_size（默认 6；可配置）
-    #   - 支持度（跨多少条回忆块被整体覆盖） >= abstract_subset_min_support（默认 5）
+    #   - 支持度（跨多少条回忆块被整体覆盖） >= abstract_subset_min_support（默认 12）
     # 的 **极大子集**，对其合成抽象事件。合成后把 ``recall_log`` 中该子集替换为抽象事件 id，
     # 以便后续更高阶抽象继续在同一命名空间演进（"用抽象事件 id 代替原来的子集，逻辑保持统一"）。
     abstract_subset_min_size: int = 6
-    abstract_subset_min_support: int = 5
+    abstract_subset_min_support: int = 12
 
     # 未闭合事件总长超过 len_msg * 该比例则触发 80/20 强制分裂（详见 boundary_split_* 设置）。
     # 白皮书 4.2 的物理红线（physical_redline）仍在 ``_check_physical_redline`` 兜底，
@@ -220,6 +220,47 @@ class REMSConfig(BaseSettings):
     wp_primary_field: str = "l3_decision"
     wp_default_field: str = "l2_interaction"
     wp_minor_field: str = "l2_interaction"
+
+    # ---- Performance monitor & load-driven knobs (白皮书 §2.3 高负载自我保护) ----
+    # 是否启用非 LLM 主算法的耗时监控。关闭后 timer 退化为 no-op、load_factor 恒为 1.0，
+    # 单测与基线性能对比时可关。
+    perf_monitor_enabled: bool = True
+    # 滚动窗口大小：每个 phase 保留最近 N 次耗时取均值。N 越大对短期尖峰越不敏感。
+    perf_monitor_window_size: int = 32
+    # 各 phase 的健康容忍上限（毫秒）。phase 的滚动均值越过此值即开始为 load_factor 贡献。
+    # 数值越大 = 对长耗时的容忍度越高 = 系统更晚进入"高负载自我保护"。
+    # 当前监控的非 LLM phase（按需扩展，不在表里的 phase 第一次 record 时按默认 200ms 注册）：
+    #   - rag_search          ：向量库语义检索
+    #   - recall_assembly     ：回忆块组装
+    #   - abstraction_mining  ：极大频繁子集挖掘
+    #   - narrative_dedupe    ：抽象事件叙事线判重
+    perf_phase_tolerance_ms: dict[str, float] = Field(
+        default_factory=lambda: {
+            "rag_search": 200.0,
+            "recall_assembly": 500.0,
+            "abstraction_mining": 2000.0,
+            "narrative_dedupe": 300.0,
+        }
+    )
+    # load_factor 的硬上限，避免极端尖峰把下游阈值放大到无意义的程度。
+    perf_load_factor_max: float = 4.0
+    # 满载（load_factor=perf_load_factor_max）时，把 forgetting_silence_threshold 在原值基础上
+    # 放大的最大倍数；中间按线性插值。1.0 表示完全不联动；2.0 表示满载时阈值翻倍。
+    forgetting_overload_silence_boost: float = 4.0
+
+    # ---- Narrative-line dedupe for abstract events (覆盖 is_fired / replace_subset 之间的灰区) ----
+    # 已存在的"完全包含"去重在 replace_subset 里完成；下面的"近似去重"专门拦
+    # "几乎相同的叙事线再次浮现"——overlap 高 + novelty 不足时跳过新合成。
+    # 阈值含义：overlap = |S ∩ A.leaves| / |S|；novelty = |S \ A.leaves| / |S|
+    narrative_dup_overlap_threshold: float = 0.9
+    narrative_dup_novelty_min_ratio: float = 0.1
+    # 绝对量护栏：novelty * |S| 必须 >= 这个绝对值才视为"显著新增"。
+    # 防止短子集靠"差 1 个事件"的比例诡计骗过 overlap 阈值。
+    narrative_dup_novelty_min_abs: int = 2
+    # 候选 × 已有抽象事件的全比成本：默认对最近 K 条已合成抽象做对比。
+    # PerfMonitor 检测到过载时会按 load_factor 自动收紧到 narrative_dup_min_compare_recent_k。
+    narrative_dup_compare_recent_k: int = 200
+    narrative_dup_min_compare_recent_k: int = 20
 
     @property
     def context_chars(self) -> int:

@@ -12,6 +12,8 @@
   - 角色抽取 prompt 加强：**全叙事层角色覆盖**（含第一人称叙述者与关键缺席者）、**反应型角色 B 级上限**、**L3 → L2 → L1 的"父-子"推导铁律**（严禁同义改写）、**L1 熔断字数**（§1.1.4）；情感量化明确"仅据当前片段、禁引人物生平"（§2.5.1）。
   - 边界检测 prompt 对应新增：`force_threshold` 注入、`split_id` 配对声明、`new_unclosed` 对象格式（旧扁平 `new_unclosed_indices` 继续兼容）（§4.2.4）。
   - **事件级 Enrichment 三种工作模式**（§4.2.3）：常规对话流默认走 **`names_only`**——pipeline 在 pre-recall 阶段已经基于 `shadow + raw_input` 抽出了「全局富信息池」（每个角色含 snapshot + 8 维情绪），事件级别的 `EventEnrichmentSkill` 只负责"摘要 + 该事件实际登场的角色名字符串数组"，**`role_id` 由代码用 `known_roles`（含 aliases）做字符串匹配解析**，snapshot 与情感按 role_id 从池里直接回填，不再让 LLM 重做。pre-recall 抽不到角色时自动回退 `full`（原行为）；外部已构造完整 `role_entries` 时走 `summary_only`。该路径同时把 `summary_fuse_min_chars` 从 20 调到 35，并把熔断从单条件升级为**双熔断**（下一级预算 ≤ 阈值 ‖ 上一级实际字数 × 0.5 < ⌊阈值×0.7⌋），减少"压到只剩四五个字"的不可读层级。
+  - **抽象事件叙事线判重**（§3.2）：在已有的"`is_fired` 字面去重 + `replace_subset` 完全包含去重"之间补一道**叙事线相似度去重**。挖出的子集 S 若与某条已存在抽象事件 A 在叶子层面 overlap ≥ `narrative_dup_overlap_threshold`（默认 0.9），且新增事件量同时低于比例阈值与绝对量阈值（默认 `0.1` / `2`），则视作"同一叙事线再次浮现"直接跳过；含嵌套抽象的 subset 先用 `EventRepository.resolve_basic_event_ids` 展开到叶子再比对。
+  - **非 LLM 算法耗时监控 + 高负载自我保护**（§2.3 工程化落地）：新增 `rems.observability.PerfMonitor`，对 `rag_search` / `recall_assembly` / `abstraction_mining` / `narrative_dedupe` 等主算法滚动收集均耗时，按"phase 均值 / 容忍上限"算 `load_factor ∈ [1.0, perf_load_factor_max]`。负载越高：(a) **白描静默阈值**按 `forgetting_overload_silence_boost` 抬高（更多老条目跌进 SILENT，遗忘加速）；(b) **抽象判重比对窗口 K** 从 `narrative_dup_compare_recent_k`（默认 200）线性收紧到 `narrative_dup_min_compare_recent_k`（默认 20），避免在已经卡的算法上再花算力。容忍上限越大 = 系统对长耗时容忍度越高 = 越晚进入自我保护。
 
 ## 1. 基本事件定义
 
@@ -208,6 +210,10 @@
   - **基于容量排位的动态静默阈值 (Capacity-Ranked Silencing & Recall Speed Control)**：从认知心理学的竞争性记忆痕迹理论（Competitive Trace Theory）出发，遗忘并非达到某个绝对数值，而是基于当前认知负载的末位淘汰。系统将静默阈值定义为**数据库整体容量的存活百分比（例如前 60%）**。系统会持续监控最近一段时间的**回忆速度（即检索响应延迟与处理吞吐量）**：
     - **正常认知负载**：当回忆速度处于健康区间时，系统维持默认的排位阈值（如 Top 60%）。经过时间衰减后，有效权重跌出系统全体数据前 60% 的边缘记忆条目将进入“静默状态（SILENT）”，在向量检索中被物理性过滤，实现生物级遗忘。
     - **高负荷自我保护（遗忘加速）**：当回忆速度过低（即系统出现认知超载、有效检索池过于臃肿）时，系统将动态**收紧存活比例**（例如从 Top 60% 临时压缩至 Top 40%）。这种机制迫使排名靠后的大量次要信息被主动淘汰出活跃记忆区，确保核心心智的回忆速度迅速恢复至健康水位。
+    - **工程化落地（2026.05）**：高负荷自我保护由 `rems.observability.PerfMonitor` 触发——它对 `rag_search`（向量检索）/ `recall_assembly`（回忆块组装）/ `abstraction_mining`（频繁子集挖掘）/ `narrative_dedupe`（叙事线判重）等**非 LLM 主算法**的滚动均耗时持续观察，按 phase 的"健康容忍上限 `tolerance_ms`"算 `overload_ratio = mean / tolerance`，整个系统取所有 phase 的最大值并夹到 `[1.0, perf_load_factor_max]` 得到 `load_factor`。
+      - 直接驱动力 1：**白描静默阈值**。`DefaultWhitePaintingRetentionStrategy` 读阈值时走 `PerfMonitor.adjusted_silence_threshold(base)`，按 `load_factor` 在 `base` 与 `base × forgetting_overload_silence_boost` 之间线性插值。负载越高 → 阈值越高 → 更多老条目跌进 SILENT，等价于"系统主动遗忘加速"，与上文末位淘汰的语义同构。
+      - 直接驱动力 2：**抽象事件叙事线判重比对窗口 K**。详见 §3.2，正常 K=`narrative_dup_compare_recent_k`（默认 200），过载时按 `load_factor` 收紧到 `narrative_dup_min_compare_recent_k`（默认 20），避免把抽象判重再压垮已经卡的检索。
+      - 配置侧只需改 `perf_phase_tolerance_ms`：值越大 = 对长耗时任务的容忍度越高 = 越晚进入自我保护；`forgetting_overload_silence_boost` 控制满载时静默阈值的最大倍数。`perf_monitor_enabled=False` 时所有 timer 退化 no-op、`load_factor` 恒为 1.0，便于测试与基线对比。
   - **记忆巩固与长时程增强 (LTP & Memory Consolidation)**：遵循神经科学中的长时程增强效应（Long-Term Potentiation），反复的回忆不仅是读取，更是对神经突触（权重）的物理强化。一旦记忆在回忆块中成功出现，其 `forgetting_factor` 将获得增益强化，**且被允许突破其初始的** `base_forgetting_factor`。
     - **结构性长期记忆转化**：多次成功的提取唤醒会使该条目的有效权重呈现出阶梯式上升。随着提取频率增加，反复被证明有价值的记忆会突破短期缓存极限，最终演化为极难遗忘的结构性长期记忆（如同人类的语义化知识）。
     - **情感催化固化（结合 §2.5）**：回忆时的增益幅度受该条目绑定的初始情感唤醒度（Arousal）深度调节。如果该记忆本身附带极高的高唤醒能量（如强烈的喜悦、恐惧或愤怒），在被二次召回时，其突破基础权重的倍率会显著放大。这在底层复现了人类的“闪光灯记忆（Flashbulb Memory）”或创伤后应激记忆（PTSD）的认知模型——极端情绪事件一旦被回想，会被更为深层地刻画在大脑中。
@@ -349,6 +355,21 @@ $$\text{base\_forgetting\_factor} = 100 \cdot a^{\gamma}, \quad \gamma = 2 \text
   - 生成后会遍历所有满足 $S \subseteq T_i$ 的历史 recall_log 行，将其中的 $S$ 成员移除，插入新抽象事件 ID。“用抽象事件 ID 代替原来的子集”使得挖掘逻辑在单一命名空间内统一：后续回忆块若仍然整体命中该抽象事件，会与历史记录在同一空间里累积支持度；若多个已合成的抽象事件再度频繁共现，即触发更高阶抽象（source_events 可直接嵌套抽象事件 ID，abstraction_level 递增），自然形成多阶演化树；
   - source_events 内的基本事件会被标记 is_abstracted = True（仅基本事件；嵌套的抽象事件不做此标记，因为它们本身也是高阶演化的中间节点）；
 - **从抽象反查基本事件**：需要溯源到事实层时，调用 EventRepository.resolve_basic_event_ids(event_id) 即可沿整条 source_events 链路 BFS 展开到叶子基本事件，无论抽象有多少层（见 §1.1.8）。这使得“规律 → 事实”的检索在任意阶抽象上都保持 O(1) API。
+
+#### 3.2.1 抽象事件叙事线判重（2026.05 新增）
+
+`mine_and_synthesize` 内部按以下顺序串接三道去重护栏，覆盖从"字面相同"到"叙事相似"的全谱系：
+
+1. **`is_fired(subset)`**：字面完全相同的子集直接拦截（旧机制）。
+2. **`replace_subset(...)`**：新抽象事件登记后，把所有"完全包含 $S$"的 recall_log 行原子级改写——把 $S$ 的成员替换为新抽象 ID，下一轮 mining 时同一叙事线不再以同样的子集形态被挖出（旧机制）。
+3. **`_is_narrative_duplicate(subset)`**（**新增**）：拦截 1、2 之间的灰区——subset 与某条已有抽象事件 $A$ 的**叶子**集合（含嵌套抽象的 BFS 展开）在叙事线层面高度重合：
+   - $\mathrm{overlap} = |S \cap A.\mathrm{leaves}| / |S| \geq$ `narrative_dup_overlap_threshold`（默认 0.9）；
+   - 同时新增信息**不显著**：$\mathrm{novelty\_ratio} = |S \setminus A.\mathrm{leaves}| / |S| <$ `narrative_dup_novelty_min_ratio`（默认 0.1） **或** $\mathrm{novelty\_abs} <$ `narrative_dup_novelty_min_abs`（默认 2）；
+   - 任一条件成立则跳过新合成，并把这条 subset 以 `matched_id`（被命中的 A）登记到 `fired_repo`，避免下一轮反复挖到再走一次判重。
+
+**护栏意义**：单独看 overlap 比例会被"短子集差 1 个"骗过（5/6=0.83 ≈ 边界），单独看绝对量会让"长 subset 加 1 个新事件"被误放过；两者**同时**满足才视作"老素材新叙事"（白皮书 §3 关于"同一基础事件可在多条叙事线上独立抽象"的语义）。
+
+**性能护栏**：候选 × 已有抽象的全比成本随抽象规模线性增长。判重默认只与最近 K = `narrative_dup_compare_recent_k`（默认 200）条已合成抽象比对。当 §2.3 `PerfMonitor` 检测到 `narrative_dedupe` / `abstraction_mining` 等 phase 越线时，K 按 `load_factor` 线性收紧到 `narrative_dup_min_compare_recent_k`（默认 20），保证至少 1 条比对、避免在已经卡的算法上再花算力。
 
 ### 3.3 幻觉控制与防强化循环
 

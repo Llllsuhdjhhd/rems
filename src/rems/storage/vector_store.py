@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 # Chroma 向量库：事件 L1/摘要文本的语义检索入口（回忆服务使用）。距离度量 cosine。
 
@@ -11,6 +11,9 @@ import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 from ..config import REMSConfig
+
+if TYPE_CHECKING:
+    from ..observability import PerfMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +65,7 @@ class VectorStore:
     ``add_event`` / ``search`` 为回忆服务提供「事件 L1 或摘要文本 → 向量 → 近邻事件 ID」能力（白皮书 4.4）。
     """
 
-    def __init__(self, config: REMSConfig):
+    def __init__(self, config: REMSConfig, perf_monitor: "PerfMonitor | None" = None):
         provider = (config.embedding.provider or "local").lower()
         if provider == "hash":
             # Offline-first: never downloads model weights.
@@ -72,6 +75,9 @@ class VectorStore:
                 model_name=config.embedding.model_name,
             )
         self._in_memory = not bool(config.storage.chromadb_path)
+        # 可选 PerfMonitor：把 search() 与 search_white_paintings() 包一层 timer，
+        # 让"RAG 耗时"参与 load_factor 计算，进而驱动遗忘加速 / 判重剪枝（白皮书 §2.3）。
+        self._perf = perf_monitor
         self._memory_events: dict[str, dict[str, Any]] = {}
         self._memory_wp: dict[str, dict[str, Any]] = {}
         if self._in_memory:
@@ -150,6 +156,17 @@ class VectorStore:
         n_results: int = 10,
         where: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        if self._perf is not None:
+            with self._perf.timer("rag_search"):
+                return self._search_inner(query, n_results, where)
+        return self._search_inner(query, n_results, where)
+
+    def _search_inner(
+        self,
+        query: str,
+        n_results: int,
+        where: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
         if self._in_memory:
             return self._memory_search(self._memory_events, query, n_results, where, id_key="event_id")
 
@@ -221,6 +238,17 @@ class VectorStore:
         query: str,
         n_results: int = 10,
         where: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if self._perf is not None:
+            with self._perf.timer("rag_search"):
+                return self._search_white_paintings_inner(query, n_results, where)
+        return self._search_white_paintings_inner(query, n_results, where)
+
+    def _search_white_paintings_inner(
+        self,
+        query: str,
+        n_results: int,
+        where: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
         if self._in_memory:
             return self._memory_search(self._memory_wp, query, n_results, where, id_key="wp_id")
