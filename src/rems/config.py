@@ -45,6 +45,10 @@ class TaskModelMapping(BaseModel):
     # 事件充实：一次调用产出摘要 + 角色；与 summary 同主模型时便于在 DashScope 侧统一配额。
     event_enrichment: str = "deepseek-v4-flash"
     abstraction: str = "deepseek-v4-flash"
+    # 抽象前叙事同一性自检；可与 abstraction 共用模型。
+    narrative_coherence: str = "deepseek-v4-flash"
+    # 回忆块与当前输入的相关性抽检（低频）。
+    recall_block_relevance: str = "deepseek-v4-flash"
     insight: str = "deepseek-v4-flash"
     default: str = "deepseek-v4-flash"
 
@@ -116,6 +120,10 @@ class REMSConfig(BaseSettings):
     # 中该子集替换为抽象事件 id，以便后续更高阶抽象继续在同一命名空间演进。
     abstract_subset_min_size: int = 6
     abstract_subset_min_support: int = 12
+    # ---- Abstraction narrative coherence gate (自检 → 相关率 a) ----
+    # 挖矿子集送入合成前先做 LLM 划分：相干叙事 vs 剔除；相干数低于阈值则跳过本次抽象。
+    abstract_narrative_coherence_enabled: bool = True
+    abstract_narrative_coherence_min_count: int = 3
     # ---- 抽象覆盖度 → 回忆 RRF 降权（多次被更高阶抽象覆盖则分更低，恒 >0）----
     # 单次新抽象对覆盖集内事件的增量：abstract_coverage_strength / (1 + ln(|C|))，再封顶 abstract_coverage_max。
     abstract_coverage_strength: float = 1.0
@@ -163,6 +171,24 @@ class REMSConfig(BaseSettings):
     recall_intermediate_filter_factor: float = 1.2
     # 初始保持高保真摘要的头部条目比例（由条目数决定）。
     recall_head_ratio: float = 0.66
+
+    # ---- Recall quality: 回忆块相关性抽检 (b) + 动态语义距离钳制 ----
+    # 每 N 次 ingest 可选跑一次回忆块抽检；≤0 表示永不跑 **b**（仅 **a** 驱动 EMA，若也未观测则中性）。
+    recall_relevance_audit_every_n_ingests: int = 10
+    # EMA α；combined = w_coherence·ema_a + (1-w_coherence)·ema_b；**w 为「a」的权重**，默认可取小（权在 **b**）。
+    recall_quality_ema_alpha: float = 0.25
+    recall_quality_weight_coherence_vs_relevance: float = 0.1
+    # True 时对向量检索命中按 distance ≤ cap 预过滤（流 A/B）；False 等同旧行为。
+    recall_dynamic_distance_enabled: bool = False
+    # 语义距离上限（与本库 VectorStore.distance 同源；通常 1-cos，越小越相似）。combined 高→略抬高 cap。
+    recall_dynamic_distance_cap_base: float = 2.0
+    recall_dynamic_distance_cap_floor: float = 0.45
+    recall_dynamic_distance_cap_ceiling: float = 2.0
+    recall_dynamic_distance_sensitivity: float = 0.08
+    recall_dynamic_distance_quality_neutral: float = 0.5
+    # 将单次 ingest 中流 A+B 向量命中 distance 的全集视作样本，取其分位数（0~100）经 floor/ceiling 夹挤后，
+    # 与 EMA-driven 的 semantic_cap 取 **min**（谁更严用谁）；None = 不关分位帽（仅原有 cap 逻辑）。
+    recall_dynamic_distance_hit_percentile: float | None = None
 
     # 兼容旧配置：当前实现已改为始终展开到叶子基本事件并使用 content_raw 作为抽象证据。
     hallucination_anchor_prob: float = 0.3

@@ -37,6 +37,7 @@ def env(config: REMSConfig, db: Database, fake_llm: FakeLLM):
     config.abstract_subset_min_size = 3
     config.abstract_subset_min_support = 3
     config.enable_narrative_dedup = True
+    config.abstract_narrative_coherence_enabled = False
 
     event_repo = EventRepository(db)
     vector_store = VectorStore(config)

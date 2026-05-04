@@ -206,6 +206,15 @@ class LLMProvider:
 
     # ------------------------------------------------------------------
     @staticmethod
+    def _strip_raw_control_chars(fragment: str) -> str:
+        """Replace raw ASCII controls (``U+0000``–``U+001F``) so ``json.loads`` accepts LLM prose.
+
+        LLMs sometimes emit literal newlines/quotes-invalid controls inside JSON string fields;
+        we collapse them to spaces before the stock decoder sees the payload.
+        """
+        return "".join(" " if ord(c) < 32 else c for c in fragment)
+
+    @staticmethod
     def _extract_json(text: str) -> dict[str, Any]:
         text = text.strip()
         # 1. Isolating JSON from markdown fences (handles leading/trailing LLM talk)
@@ -241,13 +250,21 @@ class LLMProvider:
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
-            # Fallback 1: Truncate to outermost {}
-            start = candidate.find("{")
-            end = candidate.rfind("}") + 1
-            if start >= 0 and end > start:
-                inner = candidate[start:end]
+            sanitized_outer = LLMProvider._strip_raw_control_chars(candidate)
+            if sanitized_outer != candidate:
                 try:
-                    return json.loads(clean_basic(inner))
+                    return json.loads(clean_basic(sanitized_outer))
+                except json.JSONDecodeError:
+                    pass
+            candidate_body = sanitized_outer
+            # Fallback 1: Truncate to outermost {}
+            start = candidate_body.find("{")
+            end = candidate_body.rfind("}") + 1
+            if start >= 0 and end > start:
+                inner = candidate_body[start:end]
+                inner_clean = LLMProvider._strip_raw_control_chars(inner)
+                try:
+                    return json.loads(clean_basic(inner_clean))
                 except json.JSONDecodeError:
                     # Fallback 2: Structural Scraper (Regex)
                     # This targets specific keys to rebuild the dictionary manually

@@ -17,11 +17,13 @@ from .services.belief_revision_service import BeliefRevisionService
 from .services.emotion_service import EMAEvolver
 from .services.event_service import EventService
 from .services.metabolism_service import MetabolismService
+from .services.recall_quality import RecallQualityController
 from .services.recall_service import RecallService
 from .services.role_service import RoleService
 from .skills.boundary_detection import BoundaryDetectionSkill
 from .skills.event_enrichment import EventEnrichmentSkill
 from .skills.inductive_evolution import InductiveEvolutionSkill
+from .skills.recall_block_relevance import RecallBlockRelevanceSkill
 from .skills.role_extraction import RoleExtractionSkill
 from .skills.summary_generation import SummaryGenerationSkill
 from .storage.database import Database
@@ -153,6 +155,8 @@ class REMSPipeline:
         belief_revision_service: BeliefRevisionService,
         role_skill: RoleExtractionSkill | None = None,
         perf_monitor: PerfMonitor | None = None,
+        recall_quality: RecallQualityController | None = None,
+        recall_block_relevance_skill: RecallBlockRelevanceSkill | None = None,
     ):
         self.config = config
         self.llm = llm
@@ -171,6 +175,9 @@ class REMSPipeline:
         self.role_skill = role_skill
         # 暴露 perf_monitor，便于上层脚本读取耗时指标 / 当前 load_factor 做诊断。
         self.perf_monitor = perf_monitor
+        self.recall_quality = recall_quality
+        self.recall_block_relevance_skill = recall_block_relevance_skill
+        self._ingest_seq = 0
 
     # ------------------------------------------------------------------
     @classmethod
@@ -203,6 +210,8 @@ class REMSPipeline:
         recall_log_repo = RecallLogRepository(db)
         abstracted_subset_repo = AbstractedSubsetRepository(db)
 
+        recall_quality = RecallQualityController(config)
+
         # SummaryGenerationSkill 仍用于抽象事件（inductive evolution 后的总结）。
         # 基本事件流已被 EventEnrichmentSkill 接管（一次调用产出摘要 + 角色）。
         summary_skill = SummaryGenerationSkill(llm, config)
@@ -210,6 +219,7 @@ class REMSPipeline:
         boundary_skill = BoundaryDetectionSkill(llm, config)
         enrichment_skill = EventEnrichmentSkill(llm, config, role_fallback=role_skill)
         evolution_skill = InductiveEvolutionSkill(llm, config)
+        relevance_skill = RecallBlockRelevanceSkill(llm, config)
 
         emotion_evolver = EMAEvolver(config, role_repo)
         # Pass llm to role_service so semantic cards can be refreshed in-process
@@ -235,6 +245,7 @@ class REMSPipeline:
         )
         recall_service = RecallService(
             config, event_repo, role_repo, vector_store, perf_monitor=perf_monitor,
+            recall_quality=recall_quality,
         )
         abstraction_service = AbstractionService(
             config,
@@ -246,6 +257,7 @@ class REMSPipeline:
             abstracted_subset_repo,
             enrichment_skill=enrichment_skill,
             perf_monitor=perf_monitor,
+            recall_quality=recall_quality,
         )
         belief_revision_service = BeliefRevisionService(config, event_repo, role_repo)
 
@@ -266,6 +278,8 @@ class REMSPipeline:
             belief_revision_service=belief_revision_service,
             role_skill=role_skill,
             perf_monitor=perf_monitor,
+            recall_quality=recall_quality,
+            recall_block_relevance_skill=relevance_skill,
         )
 
     # ------------------------------------------------------------------
@@ -352,6 +366,20 @@ class REMSPipeline:
                     recall_id=f"RCL-{uuid.uuid4().hex}",
                     event_ids=recall_event_ids,
                 )
+
+        self._ingest_seq += 1
+        rq, rel_skill = self.recall_quality, self.recall_block_relevance_skill
+        if (
+            rq is not None
+            and rel_skill is not None
+            and rq.should_audit_relevance(self._ingest_seq)
+            and ctx.recall_block.items
+        ):
+            try:
+                rate_b = rel_skill.evaluate_relevance_ratio(raw_input, ctx.recall_block)
+                rq.record_recall_block_relevance_rate(rate_b)
+            except Exception as exc:
+                logger.warning("recall block relevance audit failed: %s", exc)
 
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
         # 把 pre-recall 已提取的角色作为 enrichment 去代词化 hint 透传，避免事件层面重复抽取。

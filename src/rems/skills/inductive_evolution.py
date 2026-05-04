@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 # 归纳演化：多条基本/低阶事件 → 合成一条抽象事件（``is_abstract=True``）。
 # 抽象事件不登记任何角色（白皮书 §3.2），但合成输入始终使用叶子基本事件的 content_raw，
@@ -8,10 +9,25 @@ import logging
 
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
-from ..llm.prompts import EVOLUTION_SYSTEM, EVOLUTION_USER
+from ..llm.prompts import (
+    EVOLUTION_SYSTEM,
+    EVOLUTION_USER,
+    NARRATIVE_COHERENCE_SYSTEM,
+    NARRATIVE_COHERENCE_USER,
+)
 from ..models.event import Event, EventStatus, generate_event_id
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class NarrativeCoherenceOutcome:
+    """LLM partitioning of mined subset events into one coherent narrative strand vs unrelated items."""
+
+    coherent_event_ids: frozenset[str]
+    excluded_event_ids: frozenset[str]
+    rate_a: float
+    passed_gate: bool  # coherent count >= configured min
 
 
 class InductiveEvolutionSkill:
@@ -25,6 +41,84 @@ class InductiveEvolutionSkill:
     def __init__(self, llm: LLMProvider, config: REMSConfig):
         self._llm = llm
         self._config = config
+
+    def evaluate_narrative_coherence(self, events: list[Event]) -> NarrativeCoherenceOutcome:
+        """Partition ``events`` into one coherent narrative strand vs unrelated.
+
+        Judges **logical subset members**（挖矿条目）—not only flattened leaf basics.
+        On JSON/validation failure → all events treated excluded, ``rate_a=0``.
+        """
+
+        cfg = self._config
+        if not events:
+            return NarrativeCoherenceOutcome(
+                coherent_event_ids=frozenset(),
+                excluded_event_ids=frozenset(),
+                rate_a=0.0,
+                passed_gate=False,
+            )
+        expected = frozenset(e.event_id for e in events)
+
+        logical_text = self._build_logical_evidence_text(events)
+        user_msg = NARRATIVE_COHERENCE_USER.format(
+            event_contents=logical_text,
+        )
+
+        try:
+            data = self._llm.complete_json(
+                "narrative_coherence",
+                [
+                    {"role": "system", "content": NARRATIVE_COHERENCE_SYSTEM},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+        except Exception as exc:
+            logger.warning("narrative coherence LLM failure: %s", exc)
+            return NarrativeCoherenceOutcome(
+                coherent_event_ids=frozenset(),
+                excluded_event_ids=expected,
+                rate_a=0.0,
+                passed_gate=False,
+            )
+
+        raw_coh = list(data.get("coherent_event_ids") or [])
+        raw_exc = list(data.get("excluded_event_ids") or [])
+        coh_set = frozenset(str(x) for x in raw_coh if x)
+        exc_set = frozenset(str(x) for x in raw_exc if x)
+
+        invalid = False
+        if coh_set - expected or exc_set - expected:
+            invalid = True
+        if coh_set & exc_set:
+            invalid = True
+        if coh_set | exc_set != expected:
+            invalid = True
+
+        if invalid:
+            logger.warning(
+                "narrative coherence invalid partition "
+                "(expected=%d coherent=%d excluded=%d)",
+                len(expected),
+                len(coh_set),
+                len(exc_set),
+            )
+            return NarrativeCoherenceOutcome(
+                coherent_event_ids=frozenset(),
+                excluded_event_ids=expected,
+                rate_a=0.0,
+                passed_gate=False,
+            )
+
+        n = len(expected)
+        rate_a = len(coh_set) / max(1, n)
+        min_c = max(1, getattr(cfg, "abstract_narrative_coherence_min_count", 3))
+        passed_gate = len(coh_set) >= min_c
+        return NarrativeCoherenceOutcome(
+            coherent_event_ids=coh_set,
+            excluded_event_ids=exc_set,
+            rate_a=rate_a,
+            passed_gate=passed_gate,
+        )
 
     def synthesize(
         self,
@@ -98,6 +192,20 @@ class InductiveEvolutionSkill:
         )
 
     # ------------------------------------------------------------------
+
+    def _build_logical_evidence_text(self, events: list[Event]) -> str:
+        """Prompt body for coherence gate: logical mining members (basic or abstract)."""
+
+        lines: list[str] = []
+        for e in events:
+            role_context = self._build_role_context(e)
+            label = "抽象事件" if getattr(e, "is_abstract", False) else "基本事件"
+            lines.append(
+                f"### {label} {e.event_id} (创建于 {e.create_time.isoformat()})\n"
+                f"content_raw:\n{e.content_raw}\n"
+                f"角色线索:\n{role_context}"
+            )
+        return "\n\n".join(lines)
 
     def _build_content_raw_text(self, events: list[Event]) -> str:
         lines: list[str] = []

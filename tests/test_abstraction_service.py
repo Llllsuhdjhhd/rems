@@ -30,6 +30,7 @@ def abstraction_env(config: REMSConfig, db: Database, fake_llm: FakeLLM, tmp_dir
     # 让小数据集就能触发挖掘：子集大小最小 3，被回忆 3 次。
     config.abstract_subset_min_size = 3
     config.abstract_subset_min_support = 3
+    config.abstract_narrative_coherence_enabled = False
 
     event_repo = EventRepository(db)
     vector_store = VectorStore(config)
@@ -119,3 +120,45 @@ class TestMineAndSynthesize:
         # recall_log 已被同一抽象 id 替换，且 fired_repo 标记过 → 第二次空跑。
         second = svc.mine_and_synthesize()
         assert second == []
+
+    def test_coherence_replaces_only_coherent_subset(self, abstraction_env):
+        svc, event_repo, vector_store, recall_log_repo, fake_llm = abstraction_env
+        svc._config.abstract_narrative_coherence_enabled = True
+        svc._config.abstract_narrative_coherence_min_count = 2
+
+        events = [
+            _save_event(event_repo, vector_store, f"张三事件{i}") for i in range(4)
+        ]
+        e0, e1, e2, e3 = events
+        miner_core = [e0.event_id, e1.event_id, e2.event_id]
+        for k in range(3):
+            row_ids = list(miner_core)
+            if k == 0:
+                row_ids.append(e3.event_id)
+            recall_log_repo.append(
+                recall_id=f"RCL-{k}",
+                event_ids=sorted(row_ids),
+            )
+
+        fake_llm.push_response(
+            {
+                "coherent_event_ids": [e0.event_id, e1.event_id],
+                "excluded_event_ids": [e2.event_id],
+                "narrative_label": "张三线",
+            }
+        )
+        fake_llm.push_response({"content_raw": "相干两条合并", "insight": ""})
+        for _ in range(5):
+            fake_llm.push_response({"summary": "short", "char_count": 6})
+
+        created = svc.mine_and_synthesize()
+        assert len(created) == 1
+        abs_id = created[0].event_id
+        assert set(created[0].source_events) == {e0.event_id, e1.event_id}
+
+        logs = recall_log_repo.list_all()
+        for _rid, ids in logs:
+            assert e0.event_id not in ids
+            assert e1.event_id not in ids
+            assert abs_id in ids
+            assert e2.event_id in ids

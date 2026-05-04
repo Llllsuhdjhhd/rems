@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import Any
 
 # 回忆服务：事件流 + 白描流检索、RRF 融合、遗忘/情绪修饰与懒摘要降级。
 # 总长约束约 1/6.6 上下文（config.physical_redline）。对照白皮书 4.4。
@@ -19,6 +20,8 @@ from ..strategies.recall import (
 from ..strategies.forgetting import DefaultWhitePaintingRetentionStrategy
 from ..storage.repository import EventRepository, RoleRepository
 from ..storage.vector_store import VectorStore
+
+from .recall_quality import RecallQualityController
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,7 @@ class RecallService:
         scoring_strategy: RecallScoringStrategy | None = None,
         summary_tier_policy: SummaryTierPolicy | None = None,
         perf_monitor: PerfMonitor | None = None,
+        recall_quality: RecallQualityController | None = None,
     ):
         self._config = config
         self._event_repo = event_repo
@@ -59,6 +63,80 @@ class RecallService:
         # 把 perf_monitor 同时透给 forgetting strategy，让"白描静默阈值"也按系统负载动态收紧。
         self._perf = perf_monitor
         self._forgetting_strategy = DefaultWhitePaintingRetentionStrategy(config, perf_monitor=perf_monitor)
+        self._recall_quality = recall_quality
+        # 单次 build_recall_block 内对流 A/B 距离过滤的有效 cap（分位帽 ∩ EMA 帽）；None = 本条不额外收紧。
+        self._stream_distance_cap_effective: float | None = None
+        # 最近一轮回忆拼装用的分位帽/EMA/effective（供诊断）；每次 _prepare_* 覆盖。
+        self.recall_distance_cap_audit_snapshot: dict[str, Any] | None = None
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _linear_percentile(samples: list[float], p: float) -> float:
+        """``p`` in [0,100]; linear interpolation on sorted samples (nearest at degenerate lengths)."""
+        if not samples:
+            return float("nan")
+        xs = sorted(samples)
+        if len(xs) == 1:
+            return xs[0]
+        p_clamped = max(0.0, min(100.0, float(p)))
+        if p_clamped <= 0.0:
+            return xs[0]
+        if p_clamped >= 100.0:
+            return xs[-1]
+        rank = (len(xs) - 1) * (p_clamped / 100.0)
+        lo = int(math.floor(rank))
+        hi = int(math.ceil(rank))
+        lo = max(0, min(lo, len(xs) - 1))
+        hi = max(0, min(hi, len(xs) - 1))
+        if lo == hi:
+            return xs[lo]
+        w = rank - lo
+        return xs[lo] * (1.0 - w) + xs[hi] * w
+
+    def _prepare_stream_distance_cap_from_hits(
+        self,
+        hits_a: list[dict[str, Any]],
+        hits_b: list[dict[str, Any]],
+    ) -> None:
+        """双流原始 distance 池化后取配置分位数，并与 ``RecallQualityController.semantic_distance_cap`` 取 min。"""
+        cfg = self._config
+        dists: list[float] = [float(h.get("distance", 1.0)) for h in hits_a]
+        dists.extend(float(h.get("distance", 1.0)) for h in hits_b)
+
+        pct_spec = cfg.recall_dynamic_distance_hit_percentile
+        percentile_cap: float | None = None
+        if pct_spec is not None and dists:
+            raw = RecallService._linear_percentile(dists, float(pct_spec))
+            if not math.isnan(raw):
+                lo, hi = cfg.recall_dynamic_distance_cap_floor, cfg.recall_dynamic_distance_cap_ceiling
+                if lo > hi:
+                    lo, hi = hi, lo
+                percentile_cap = max(lo, min(hi, raw))
+
+        ema_cap: float | None = None
+        if self._recall_quality is not None:
+            ema_cap = self._recall_quality.semantic_distance_cap()
+
+        eff: float | None
+        if percentile_cap is not None and ema_cap is not None:
+            eff = min(percentile_cap, ema_cap)
+        elif percentile_cap is not None:
+            eff = percentile_cap
+        else:
+            eff = ema_cap
+
+        self._stream_distance_cap_effective = eff
+        self.recall_distance_cap_audit_snapshot = {
+            "hit_distances_count": len(dists),
+            "hit_percentile_config": pct_spec,
+            "percentile_cap_after_clamp": percentile_cap,
+            "ema_semantic_cap": ema_cap,
+            "effective_cap": eff,
+        }
+        logger.debug("recall stream distance cap audit %s", self.recall_distance_cap_audit_snapshot)
+
+    def _clear_stream_distance_cap_scope(self) -> None:
+        self._stream_distance_cap_effective = None
 
     # ------------------------------------------------------------------
     def build_recall_block(
@@ -87,8 +165,27 @@ class RecallService:
         # time_decay 与角色重要性、情感共振等修饰统一在阶段 2 的 RRF * Factor * Mood 里施加。
         # 这样才符合白皮书"摒弃绝对值、用名次驱动"的设计目的。
 
-        # Stream A: 事件语义检索（含 70/30 容量分层）；存 (event, distance)
-        hits_a = self._get_stream_a_hits(search_text, focus_role_ids or set())
+        # Stream A / B: 双流原始向量 distance 池化 → 分位帽（可选）∩ EMA 帽 → 过滤后再进 RRF。
+        b_query = search_text
+        if focus_role_entries:
+            snapshot_texts: list[str] = []
+            for r in focus_role_entries:
+                if r.role_snapshot.l2_interaction:
+                    snapshot_texts.append(r.role_snapshot.l2_interaction)
+                elif r.role_snapshot.l1_mention:
+                    snapshot_texts.append(r.role_snapshot.l1_mention)
+            if snapshot_texts:
+                b_query += "\n" + "\n".join(snapshot_texts)
+
+        hits_a_raw = self._get_stream_a_hits(search_text, focus_role_ids or set())
+        hits_b_raw = self._get_stream_b_hits(b_query)
+        self._prepare_stream_distance_cap_from_hits(hits_a_raw, hits_b_raw)
+        try:
+            hits_a = self._filter_hits_semantic_distance(hits_a_raw)
+            hits_b = self._filter_hits_semantic_distance(hits_b_raw)
+        finally:
+            self._clear_stream_distance_cap_scope()
+
         stream_a: dict[str, tuple[Event, float]] = {}
         for hit in hits_a:
             event = self._event_repo.get(hit["event_id"])
@@ -102,21 +199,7 @@ class RecallService:
             distance = float(hit.get("distance", 1.0))
             stream_a[event.event_id] = (event, distance)
 
-        # Stream B: 白描（角色）反向激活
-        # 优化：将当前提取的角色摘要（Snapshots）也作为检索词的一部分，实现"摘要对摘要"精准匹配。
-        b_query = search_text
-        if focus_role_entries:
-            snapshot_texts: list[str] = []
-            for r in focus_role_entries:
-                if r.role_snapshot.l2_interaction:
-                    snapshot_texts.append(r.role_snapshot.l2_interaction)
-                elif r.role_snapshot.l1_mention:
-                    snapshot_texts.append(r.role_snapshot.l1_mention)
-            if snapshot_texts:
-                b_query += "\n" + "\n".join(snapshot_texts)
-
-        hits_b = self._get_stream_b_hits(b_query)
-        # 流 B 存 (event, effective_distance, effective_forgetting)：
+        # Stream B：白描（角色）反向激活（过滤后的 hit distance 仍为向量库原始语义距）。
         # effective_distance = distance / max(effective_forgetting, eps)，让遗忘惩罚作用于排位本身。
         stream_b: dict[str, tuple[Event, float, float]] = {}
         for hit in hits_b:
@@ -329,6 +412,18 @@ class RecallService:
             self._event_repo.update_status(event.event_id, status=EventStatus.SILENT)
             return True
         return False
+
+    def _filter_hits_semantic_distance(self, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop vector hits whose distance exceeds the active cap (分位帽∩EMA 或其一)."""
+
+        if not hits:
+            return hits
+        cap = self._stream_distance_cap_effective
+        if cap is None and self._recall_quality is not None:
+            cap = self._recall_quality.semantic_distance_cap()
+        if cap is None:
+            return hits
+        return [h for h in hits if float(h.get("distance", 1.0)) <= cap + 1e-9]
 
     def _get_stream_a_hits(self, query: str, focus_role_ids: set[str]) -> list[dict]:
         """Tiered Stream A retrieval implementation (70/30 Rule, 白皮书 §4.4)."""

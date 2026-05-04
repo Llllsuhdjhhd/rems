@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 
 # 抽象事件：唯一触发路径 = 回忆块 event_id 集合中的频繁子集挖掘（白皮书 §3.2）。
 # - 子集大小 >= abstract_subset_min_size（默认 6，可配置）
@@ -22,7 +23,16 @@ from ..storage.repository import (
 )
 from ..storage.vector_store import VectorStore
 
+from .abstraction_constants import SKIPPED_COHERENCE_FINGERPRINT_ID
+from .recall_quality import RecallQualityController
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SubsetSynthesisOutcome:
+    abstract_event: Event | None = None
+    coherence_rejected: bool = False
 
 
 class AbstractionService:
@@ -53,6 +63,7 @@ class AbstractionService:
         evidence_policy: AbstractionEvidencePolicy | None = None,
         enrichment_skill: EventEnrichmentSkill | None = None,
         perf_monitor: PerfMonitor | None = None,
+        recall_quality: RecallQualityController | None = None,
     ):
         self._config = config
         self._event_repo = event_repo
@@ -68,6 +79,7 @@ class AbstractionService:
         # 可选 PerfMonitor：mining / 叙事线判重各包一层 timer，
         # 同时让叙事线判重的"比对窗口 K"按系统负载动态收紧（白皮书 §2.3）。
         self._perf = perf_monitor
+        self._recall_quality = recall_quality
 
     # ------------------------------------------------------------------
     # Public entry
@@ -123,16 +135,19 @@ class AbstractionService:
                 # matched_id 在叙事线层面承载"。
                 self._fired_repo.mark_fired(subset, matched_id)
                 continue
-            evt = self._synthesize_from_subset(subset, support)
-            if evt is not None:
-                created.append(evt)
-                self._fired_repo.mark_fired(subset, evt.event_id)
-                # 用抽象事件 id 替换 recall_log 中的该子集，保持统一命名空间。
-                replaced = self._recall_log_repo.replace_subset(set(subset), evt.event_id)
+            synth = self._synthesize_from_subset(subset, support)
+            if synth.abstract_event is not None:
+                ae = synth.abstract_event
+                created.append(ae)
+                self._fired_repo.mark_fired(subset, ae.event_id)
                 logger.info(
-                    "Abstract %s created from %d events (support=%d); rewrote %d recall_log rows",
-                    evt.event_id, len(subset), support, replaced,
+                    "Abstract %s created from mined subset_size=%d (support=%d); coherent-only rewrite",
+                    ae.event_id,
+                    len(subset),
+                    support,
                 )
+            elif synth.coherence_rejected:
+                self._fired_repo.mark_fired(subset, SKIPPED_COHERENCE_FINGERPRINT_ID)
         return created
 
     # ------------------------------------------------------------------
@@ -218,7 +233,7 @@ class AbstractionService:
     # Synthesis
     # ------------------------------------------------------------------
 
-    def _synthesize_from_subset(self, subset: frozenset[str], support: int) -> Event | None:
+    def _synthesize_from_subset(self, subset: frozenset[str], support: int) -> SubsetSynthesisOutcome:
         events: list[Event] = []
         for eid in subset:
             e = self._event_repo.get(eid)
@@ -233,17 +248,34 @@ class AbstractionService:
                 "abstract mining: subset shrunk below min_size after DB filtering (%d < %d)",
                 len(events), self._config.abstract_subset_min_size,
             )
-            return None
+            return SubsetSynthesisOutcome(None, False)
 
         events.sort(key=lambda e: (e.create_time, e.event_id))
-        evidence_events = self._evidence_policy.collect(events, self._event_repo)
-        if not evidence_events:
-            logger.debug("abstract mining: no basic content_raw evidence for subset")
-            return None
+        cfg = self._config
 
-        max_level = max((e.abstraction_level or 0) for e in events) + 1
+        coherent_events = events
+        if cfg.abstract_narrative_coherence_enabled:
+            coherence = self._evolution.evaluate_narrative_coherence(events)
+            if self._recall_quality is not None:
+                self._recall_quality.record_abstraction_coherence_rate(coherence.rate_a)
+            if not coherence.passed_gate:
+                return SubsetSynthesisOutcome(None, True)
+            coherent_events = [
+                e for e in events if e.event_id in coherence.coherent_event_ids
+            ]
+            if len(coherent_events) < cfg.abstract_narrative_coherence_min_count:
+                return SubsetSynthesisOutcome(None, True)
+
+        evidence_events = self._evidence_policy.collect(coherent_events, self._event_repo)
+        if not evidence_events:
+            logger.debug(
+                "abstract mining: no basic content_raw evidence after coherence filtering",
+            )
+            return SubsetSynthesisOutcome(None, False)
+
+        max_level = max((e.abstraction_level or 0) for e in coherent_events) + 1
         abstract_event = self._evolution.synthesize(
-            events,
+            coherent_events,
             abstraction_level=max_level,
             evidence_events=evidence_events,
         )
@@ -270,13 +302,25 @@ class AbstractionService:
         self._event_repo.save(abstract_event)
         self._index_abstract(abstract_event)
 
-        for evt in events:
+        for evt in coherent_events:
             if not evt.is_abstract:
                 self._event_repo.update_status(evt.event_id, is_abstracted=True)
 
-        self._apply_abstract_coverage_for_subset(frozenset(e.event_id for e in events))
+        self._apply_abstract_coverage_for_subset(
+            frozenset(e.event_id for e in coherent_events),
+        )
 
-        return abstract_event
+        rewrote = self._recall_log_repo.replace_subset(
+            {e.event_id for e in coherent_events},
+            abstract_event.event_id,
+        )
+        logger.info(
+            "recall_log replace_subset rewrote=%d rows (abstract=%s)",
+            rewrote,
+            abstract_event.event_id,
+        )
+
+        return SubsetSynthesisOutcome(abstract_event, False)
 
     def _apply_abstract_coverage_for_subset(self, member_ids: frozenset[str]) -> None:
         """对已Persist的新抽象的成员集：基本事件 + 子抽象节点及其叶子一次性累加 abstract_coverage。"""
