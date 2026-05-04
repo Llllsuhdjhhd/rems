@@ -115,11 +115,17 @@ class REMSConfig(BaseSettings):
     # ---- Abstraction: Frequent Subset Mining (白皮书 §3.2 唯一触发) ----
     # 每次回忆产生的回忆块 event_id 集合被登记到 ``recall_log``；在集合族中找满足：
     #   - 子集大小 >= abstract_subset_min_size（默认 6；可配置）
-    #   - 支持度（跨多少条回忆块被整体覆盖） >= abstract_subset_min_support（默认 12）
-    # 的 **全部**频繁子集（非仅极大），对其逐个经护栏后合成抽象事件。合成后把 ``recall_log``
-    # 中该子集替换为抽象事件 id，以便后续更高阶抽象继续在同一命名空间演进。
+    #   - 支持度（跨多少条回忆块被整体覆盖） >= abstract_subset_min_support（默认 12）；连续多条抽象后可抬高至
+    #     ``abstract_subset_min_support_escalated``（见 ``abstract_mining_escalate_min_support_after_consecutive_abstracts``）。
+    # 挖掘器先枚举频繁闭包；对满足阈值的 **全部**频繁子集（非仅极大）逐个经护栏后合成抽象事件。
+    # 合成成功后 ``replace_subset`` 会改写 ``recall_log``；若继续沿用本轮开始时算出的候选与支持度，
+    # 可能对「已被替换掉的基本事件」仍尝试合成（过时统计）。默认在每次成功抽象后基于最新日志重新挖掘。
+    abstract_mining_max_refresh_rounds: int = 256
     abstract_subset_min_size: int = 6
     abstract_subset_min_support: int = 12
+    # 单次 ``mine_and_synthesize`` 内已成功抽象的条数 **>** 该阈值后，后续刷新轮改用更高的最小支持度（默认 >2 即从第 4 条起收紧）。
+    abstract_mining_escalate_min_support_after_consecutive_abstracts: int = 2
+    abstract_subset_min_support_escalated: int = 13
     # ---- Abstraction narrative coherence gate (自检 → 相关率 a) ----
     # 挖矿子集送入合成前先做 LLM 划分：相干叙事 vs 剔除；相干数低于阈值则跳过本次抽象。
     abstract_narrative_coherence_enabled: bool = True

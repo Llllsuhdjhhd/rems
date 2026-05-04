@@ -7,7 +7,8 @@ from dataclasses import dataclass
 # 抽象事件：唯一触发路径 = 回忆块 event_id 集合中的频繁子集挖掘（白皮书 §3.2）。
 # - 子集大小 >= abstract_subset_min_size（默认 6，可配置）
 # - 支持度（被多少条回忆块整体覆盖） >= abstract_subset_min_support（默认 12）
-# 满足两条件的**所有**频繁项集（非仅极大）进入候选队列；之后用抽象事件 id 在 recall_log 中替换该子集。
+# 满足两条件的**所有**频繁项集（非仅极大）进入候选队列；成功合成一次后即基于最新 ``recall_log``
+# 重新挖掘（见 ``abstract_mining_max_refresh_rounds``），避免在已过时的支持度上继续消费子集。
 
 from ..config import REMSConfig
 from ..models.event import CompressionBudget, Event
@@ -23,7 +24,11 @@ from ..storage.repository import (
 )
 from ..storage.vector_store import VectorStore
 
-from .abstraction_constants import SKIPPED_COHERENCE_FINGERPRINT_ID
+from .abstraction_constants import (
+    SKIPPED_ABSTRACTION_MINING_NOOP_ID,
+    SKIPPED_COHERENCE_FINGERPRINT_ID,
+    SKIPPED_SYNTHESIS_FAILURE_ID,
+)
 from .recall_quality import RecallQualityController
 
 logger = logging.getLogger(__name__)
@@ -33,6 +38,7 @@ logger = logging.getLogger(__name__)
 class SubsetSynthesisOutcome:
     abstract_event: Event | None = None
     coherence_rejected: bool = False
+    synthesis_failed: bool = False
 
 
 class AbstractionService:
@@ -96,6 +102,10 @@ class AbstractionService:
                （overlap / novelty 双护栏，含叶子展开；比对窗口 K 随 ``PerfMonitor`` 负载收紧）。
             3. 合成成功后 ``replace_subset`` — 把所有**完全包含** S 的 recall_log 行中的 S
                替换为新抽象 id（行级「完全包含」去重，多叙事线共享叶子仍由各自行决定）。
+            4. 每次成功合成后立即用最新 ``recall_log`` 重新频繁集挖掘（至多 ``abstract_mining_max_refresh_rounds`` 轮），
+               避免沿用过期的支持度统计。
+            5. 本轮内已成功抽象条数超过 ``abstract_mining_escalate_min_support_after_consecutive_abstracts`` 后，
+               后续刷新轮改用 ``abstract_subset_min_support_escalated`` 作为最小支持度。
         """
         if self._perf is not None:
             with self._perf.timer("abstraction_mining"):
@@ -107,47 +117,69 @@ class AbstractionService:
         min_size = max(2, cfg.abstract_subset_min_size)
         min_support = max(2, cfg.abstract_subset_min_support)
 
-        rows = self._recall_log_repo.list_all()
-        transactions = [frozenset(ids) for _, ids in rows if len(ids) >= min_size]
-        if len(transactions) < min_support:
-            return []
-
-        candidates = _find_all_frequent_subsets(transactions, min_size, min_support)
-        if not candidates:
-            return []
-
         created: list[Event] = []
-        for subset, support in candidates:
-            if self._fired_repo.is_fired(subset):
-                continue
-            if cfg.enable_narrative_dedup:
-                dup_info = self._is_narrative_duplicate(subset)
-            else:
-                dup_info = None
-            if dup_info is not None:
-                matched_id, overlap, novelty_abs = dup_info
-                logger.info(
-                    "narrative-dup-skip: subset_size=%d support=%d matched=%s overlap=%.2f novelty=%d",
-                    len(subset), support, matched_id, overlap, novelty_abs,
-                )
-                # 仍然登记为 fired，避免下一轮 mining 反复挖到同一组合再走一遍叙事线判重。
-                # 这里用一个占位 abstract_id（matched_id 本身）登记，语义上"该 subset 已由
-                # matched_id 在叙事线层面承载"。
-                self._fired_repo.mark_fired(subset, matched_id)
-                continue
-            synth = self._synthesize_from_subset(subset, support)
-            if synth.abstract_event is not None:
-                ae = synth.abstract_event
-                created.append(ae)
-                self._fired_repo.mark_fired(subset, ae.event_id)
-                logger.info(
-                    "Abstract %s created from mined subset_size=%d (support=%d); coherent-only rewrite",
-                    ae.event_id,
-                    len(subset),
-                    support,
-                )
-            elif synth.coherence_rejected:
-                self._fired_repo.mark_fired(subset, SKIPPED_COHERENCE_FINGERPRINT_ID)
+        max_refresh = max(1, cfg.abstract_mining_max_refresh_rounds)
+        abstracts_this_pass = 0
+
+        for _round in range(max_refresh):
+            effective_support = min_support
+            if abstracts_this_pass > cfg.abstract_mining_escalate_min_support_after_consecutive_abstracts:
+                effective_support = max(min_support, max(2, cfg.abstract_subset_min_support_escalated))
+
+            rows = self._recall_log_repo.list_all()
+            transactions = [frozenset(ids) for _, ids in rows if len(ids) >= min_size]
+            if len(transactions) < effective_support:
+                break
+
+            candidates = _find_all_frequent_subsets(transactions, min_size, effective_support)
+            if not candidates:
+                break
+
+            progressed = False
+            for subset, support in candidates:
+                if self._fired_repo.is_fired(subset):
+                    continue
+                if cfg.enable_narrative_dedup:
+                    dup_info = self._is_narrative_duplicate(subset)
+                else:
+                    dup_info = None
+                if dup_info is not None:
+                    matched_id, overlap, novelty_abs = dup_info
+                    logger.info(
+                        "narrative-dup-skip: subset_size=%d support=%d matched=%s overlap=%.2f novelty=%d",
+                        len(subset), support, matched_id, overlap, novelty_abs,
+                    )
+                    self._fired_repo.mark_fired(subset, matched_id)
+                    continue
+
+                synth = self._synthesize_from_subset(subset, support)
+                if synth.abstract_event is not None:
+                    ae = synth.abstract_event
+                    created.append(ae)
+                    abstracts_this_pass += 1
+                    self._fired_repo.mark_fired(subset, ae.event_id)
+                    logger.info(
+                        "Abstract %s created from mined subset_size=%d (support=%d); "
+                        "effective_min_support=%d abstracts_this_pass=%d",
+                        ae.event_id,
+                        len(subset),
+                        support,
+                        effective_support,
+                        abstracts_this_pass,
+                    )
+                    progressed = True
+                    break
+                if synth.coherence_rejected:
+                    self._fired_repo.mark_fired(subset, SKIPPED_COHERENCE_FINGERPRINT_ID)
+                    continue
+                if synth.synthesis_failed:
+                    self._fired_repo.mark_fired(subset, SKIPPED_SYNTHESIS_FAILURE_ID)
+                    continue
+                self._fired_repo.mark_fired(subset, SKIPPED_ABSTRACTION_MINING_NOOP_ID)
+
+            if not progressed:
+                break
+
         return created
 
     # ------------------------------------------------------------------
@@ -274,53 +306,62 @@ class AbstractionService:
             return SubsetSynthesisOutcome(None, False)
 
         max_level = max((e.abstraction_level or 0) for e in coherent_events) + 1
-        abstract_event = self._evolution.synthesize(
-            coherent_events,
-            abstraction_level=max_level,
-            evidence_events=evidence_events,
-        )
-
-        # 抽象事件的摘要与基本事件同规则（白皮书 §1.1.3）。
-        # 优先一次 LLM 调用拿全部层级（EventEnrichmentSkill, skip_roles=True），与基本事件流共用 prompt 与解析；
-        # 没注入 enrichment 时退回 SummaryGenerationSkill 的递归实现（旧路径，多次 LLM 往返）。
-        if self._enrichment is not None:
-            budget = self._estimate_budget(abstract_event.content_raw)
-            er = self._enrichment.enrich(
-                abstract_event.content_raw,
-                budget=budget,
-                skip_roles=True,
+        try:
+            abstract_event = self._evolution.synthesize(
+                coherent_events,
+                abstraction_level=max_level,
+                evidence_events=evidence_events,
             )
-            abstract_event.summaries = er.summaries
-            abstract_event.summary_lengths = er.summary_lengths
-            abstract_event.actual_max_level = er.actual_max_level
-        else:
-            sr = self._summary.generate(abstract_event.content_raw)
-            abstract_event.summaries = sr.summaries
-            abstract_event.summary_lengths = sr.summary_lengths
-            abstract_event.actual_max_level = sr.actual_max_level
 
-        self._event_repo.save(abstract_event)
-        self._index_abstract(abstract_event)
+            # 抽象事件的摘要与基本事件同规则（白皮书 §1.1.3）。
+            # 优先一次 LLM 调用拿全部层级（EventEnrichmentSkill, skip_roles=True），与基本事件流共用 prompt 与解析；
+            # 没注入 enrichment 时退回 SummaryGenerationSkill 的递归实现（旧路径，多次 LLM 往返）。
+            if self._enrichment is not None:
+                budget = self._estimate_budget(abstract_event.content_raw)
+                er = self._enrichment.enrich(
+                    abstract_event.content_raw,
+                    budget=budget,
+                    skip_roles=True,
+                )
+                abstract_event.summaries = er.summaries
+                abstract_event.summary_lengths = er.summary_lengths
+                abstract_event.actual_max_level = er.actual_max_level
+            else:
+                sr = self._summary.generate(abstract_event.content_raw)
+                abstract_event.summaries = sr.summaries
+                abstract_event.summary_lengths = sr.summary_lengths
+                abstract_event.actual_max_level = sr.actual_max_level
 
-        for evt in coherent_events:
-            if not evt.is_abstract:
-                self._event_repo.update_status(evt.event_id, is_abstracted=True)
+            self._event_repo.save(abstract_event)
+            self._index_abstract(abstract_event)
 
-        self._apply_abstract_coverage_for_subset(
-            frozenset(e.event_id for e in coherent_events),
-        )
+            for evt in coherent_events:
+                if not evt.is_abstract:
+                    self._event_repo.update_status(evt.event_id, is_abstracted=True)
 
-        rewrote = self._recall_log_repo.replace_subset(
-            {e.event_id for e in coherent_events},
-            abstract_event.event_id,
-        )
-        logger.info(
-            "recall_log replace_subset rewrote=%d rows (abstract=%s)",
-            rewrote,
-            abstract_event.event_id,
-        )
+            self._apply_abstract_coverage_for_subset(
+                frozenset(e.event_id for e in coherent_events),
+            )
 
-        return SubsetSynthesisOutcome(abstract_event, False)
+            rewrote = self._recall_log_repo.replace_subset(
+                {e.event_id for e in coherent_events},
+                abstract_event.event_id,
+            )
+            logger.info(
+                "recall_log replace_subset rewrote=%d rows (abstract=%s)",
+                rewrote,
+                abstract_event.event_id,
+            )
+
+            return SubsetSynthesisOutcome(abstract_event, False)
+        except Exception as exc:
+            logger.warning(
+                "abstract synthesis failed subset_size=%d support=%d: %s",
+                len(subset),
+                support,
+                exc,
+            )
+            return SubsetSynthesisOutcome(None, False, synthesis_failed=True)
 
     def _apply_abstract_coverage_for_subset(self, member_ids: frozenset[str]) -> None:
         """对已Persist的新抽象的成员集：基本事件 + 子抽象节点及其叶子一次性累加 abstract_coverage。"""
