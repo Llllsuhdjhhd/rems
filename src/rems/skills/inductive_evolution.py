@@ -1,97 +1,183 @@
 from __future__ import annotations
 
 import logging
-import random
+from dataclasses import dataclass
 
-# 归纳演化：由多条基本事件合成抽象事件（is_abstract=True，insight/content_raw 等由 LLM 给出）。
-# hallucination_anchor_prob 控制是否强制用子事件 L1 锚定，抑制幻觉闭环（白皮书 3.3）。
+# 归纳演化：多条基本/低阶事件 → 合成一条抽象事件（``is_abstract=True``）。
+# 抽象事件不登记任何角色（白皮书 §3.2），但合成输入始终使用叶子基本事件的 content_raw，
+# 并附带角色线索，防止压缩时把主体关系抹掉。
 
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
-from ..llm.prompts import EVOLUTION_SYSTEM, EVOLUTION_USER
-from ..models.event import (
-    EmotionalModel,
-    Event,
-    EventRoleEntry,
-    EventStatus,
-    Importance,
-    Klesha,
-    RoleSnapshot,
-    Vedana,
-    generate_event_id,
+from ..llm.prompts import (
+    EVOLUTION_SYSTEM,
+    EVOLUTION_USER,
+    NARRATIVE_COHERENCE_SYSTEM,
+    NARRATIVE_COHERENCE_USER,
 )
+from ..models.event import Event, EventStatus, generate_event_id
 
 logger = logging.getLogger(__name__)
 
 
-def _emotion_subfields(raw: dict, field_names: set[str]) -> dict[str, float]:
-    """Keep only known keys and coerce to float; skip values the LLM returned as labels."""
-    out: dict[str, float] = {}
-    for k, v in raw.items():
-        if k not in field_names:
-            continue
-        try:
-            out[k] = float(v)
-        except (TypeError, ValueError):
-            logger.warning("inductive_evolution: skip non-numeric emotion field %s=%r", k, v)
-    return out
+@dataclass(frozen=True)
+class NarrativeCoherenceOutcome:
+    """LLM partitioning of mined subset events into one coherent narrative strand vs unrelated items."""
+
+    coherent_event_ids: frozenset[str]
+    excluded_event_ids: frozenset[str]
+    rate_a: float
+    passed_gate: bool  # coherent count >= configured min
 
 
 class InductiveEvolutionSkill:
-    """Synthesises an abstract event from a cluster of basic/lower-order events.
-
-    Hallucination Control (white paper section 3.3):
-        With probability ``config.hallucination_anchor_prob`` the synthesiser
-        is forced to use each sub-event's *raw L1 summary* (or content_raw)
-        instead of the mid-level synthesised text.  This prevents the model
-        from recursively abstracting its own prior inferences as if they were
-        ground-truth facts, preserving a path back to objective evidence.
+    """Synthesise an abstract event from a cluster of basic/lower-order events.
 
     由多条基本/低阶事件归纳生成抽象事件（``is_abstract=True``，并填充 ``source_events``、
-    ``insight`` 等）。防幻觉：以 ``hallucination_anchor_prob`` 概率强制各子事件只提供 L1 或原文
-    作为证据输入，避免模型把上一轮抽象结论当作「新事实」再次递归抽象，从而在链路上保留回到客观 L0/L1 的锚点（白皮书 3.3）。
+    ``content_raw``、可选 ``insight`` / ``decoration``）。抽象事件 **无角色、无角色快照、无情感模型**；
+    summaries 由外层 ``SummaryGenerationSkill`` 基于 ``content_raw`` 递归生成（白皮书 §3.1–§3.3）。
     """
 
     def __init__(self, llm: LLMProvider, config: REMSConfig):
         self._llm = llm
         self._config = config
 
-    def synthesize(self, events: list[Event], abstraction_level: int = 1) -> Event:
-        use_anchor = random.random() < self._config.hallucination_anchor_prob
-        summaries_text = self._build_summaries_text(events, anchor=use_anchor)
+    def evaluate_narrative_coherence(self, events: list[Event]) -> NarrativeCoherenceOutcome:
+        """Partition ``events`` into one coherent narrative strand vs unrelated.
 
-        if use_anchor:
-            logger.debug(
-                "Hallucination control: anchoring to raw L1 summaries for %d events", len(events)
+        Judges **logical subset members**（挖矿条目）—not only flattened leaf basics.
+        On JSON/validation failure → all events treated excluded, ``rate_a=0``.
+        """
+
+        cfg = self._config
+        if not events:
+            return NarrativeCoherenceOutcome(
+                coherent_event_ids=frozenset(),
+                excluded_event_ids=frozenset(),
+                rate_a=0.0,
+                passed_gate=False,
+            )
+        expected = frozenset(e.event_id for e in events)
+
+        logical_text = self._build_logical_evidence_text(events)
+        user_msg = NARRATIVE_COHERENCE_USER.format(
+            event_contents=logical_text,
+        )
+
+        try:
+            data = self._llm.complete_json(
+                "narrative_coherence",
+                [
+                    {"role": "system", "content": NARRATIVE_COHERENCE_SYSTEM},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+        except Exception as exc:
+            logger.warning("narrative coherence LLM failure: %s", exc)
+            return NarrativeCoherenceOutcome(
+                coherent_event_ids=frozenset(),
+                excluded_event_ids=expected,
+                rate_a=0.0,
+                passed_gate=False,
             )
 
+        raw_coh = list(data.get("coherent_event_ids") or [])
+        raw_exc = list(data.get("excluded_event_ids") or [])
+        coh_set = frozenset(str(x) for x in raw_coh if x)
+        exc_set = frozenset(str(x) for x in raw_exc if x)
+
+        invalid = False
+        if coh_set - expected or exc_set - expected:
+            invalid = True
+        if coh_set & exc_set:
+            invalid = True
+        if coh_set | exc_set != expected:
+            invalid = True
+
+        if invalid:
+            logger.warning(
+                "narrative coherence invalid partition "
+                "(expected=%d coherent=%d excluded=%d)",
+                len(expected),
+                len(coh_set),
+                len(exc_set),
+            )
+            return NarrativeCoherenceOutcome(
+                coherent_event_ids=frozenset(),
+                excluded_event_ids=expected,
+                rate_a=0.0,
+                passed_gate=False,
+            )
+
+        n = len(expected)
+        rate_a = len(coh_set) / max(1, n)
+        min_c = max(1, getattr(cfg, "abstract_narrative_coherence_min_count", 3))
+        passed_gate = len(coh_set) >= min_c
+        return NarrativeCoherenceOutcome(
+            coherent_event_ids=coh_set,
+            excluded_event_ids=exc_set,
+            rate_a=rate_a,
+            passed_gate=passed_gate,
+        )
+
+    def synthesize(
+        self,
+        events: list[Event],
+        abstraction_level: int = 1,
+        *,
+        evidence_events: list[Event] | None = None,
+    ) -> Event:
+        """Create an abstract event.
+
+        ``events`` remains the logical source set written to ``source_events``. ``evidence_events``
+        is the flattened leaf-basic evidence used in the prompt, so higher-order abstractions
+        still compress from basic ``content_raw`` rather than from prior abstract text.
+        """
+        evidence = evidence_events or events
+        event_contents = self._build_content_raw_text(evidence)
+        leaf_count, leaf_avg_len, target_content_len = self._leaf_evidence_stats(evidence)
+        insight_enabled = self._config.enable_abstract_insight
+        insight_instruction = (
+            "- `insight`：开启。请提炼跨事件的认知/规律，强调角色行为模式或关系变化；不要复述事实本身。"
+            if insight_enabled
+            else "- `insight`：关闭。不要输出 `insight` 字段。"
+        )
+        json_schema = (
+            '{\n'
+            '  "content_raw": "压缩后的抽象事件主文本",\n'
+            '  "insight": "跨事件提炼出的认知/规律",\n'
+            '  "decoration": "主观装饰（可选；无则省略或写 null）"\n'
+            '}'
+            if insight_enabled
+            else '{\n'
+            '  "content_raw": "压缩后的抽象事件主文本",\n'
+            '  "decoration": "主观装饰（可选；无则省略或写 null）"\n'
+            '}'
+        )
+
         user_msg = EVOLUTION_USER.format(
-            count=len(events),
-            event_summaries=summaries_text,
+            count=len(evidence),
+            event_contents=event_contents,
+            target_content_len=target_content_len,
+            leaf_count=leaf_count,
+            leaf_avg_len=leaf_avg_len,
+            insight_instruction=insight_instruction,
+            json_schema=json_schema,
+        )
+
+        system_msg = EVOLUTION_SYSTEM.format(
+            target_content_len=target_content_len,
+            leaf_count=leaf_count,
+            leaf_avg_len=leaf_avg_len,
         )
 
         data = self._llm.complete_json(
             "abstraction",
             [
-                {"role": "system", "content": EVOLUTION_SYSTEM},
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
         )
-
-        role_entries: list[EventRoleEntry] = []
-        for rd in data.get("roles", []):
-            trend = rd.get("emotion_trend", {}) or {}
-            vedana_d = _emotion_subfields(trend.get("vedana") or {}, set(Vedana.model_fields))
-            klesha_d = _emotion_subfields(trend.get("klesha") or {}, set(Klesha.model_fields))
-            role_entries.append(EventRoleEntry(
-                role_id=rd.get("role_id", ""),
-                importance=Importance(rd["importance"]) if rd.get("importance") in Importance.__members__ else Importance.C,
-                role_snapshot=RoleSnapshot(l3_decision=rd.get("l3_decision")),
-                emotional_model=EmotionalModel(
-                    vedana=Vedana(**vedana_d),
-                    klesha=Klesha(**klesha_d),
-                ),
-            ))
 
         return Event(
             event_id=generate_event_id(),
@@ -99,27 +185,68 @@ class InductiveEvolutionSkill:
             is_abstract=True,
             status=EventStatus.ACTIVE,
             decoration=data.get("decoration"),
-            insight=data.get("insight"),
+            insight=data.get("insight") if insight_enabled else None,
             abstraction_level=abstraction_level,
             source_events=[e.event_id for e in events],
-            role_list=role_entries,
+            role_list=[],
         )
 
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_summaries_text(events: list[Event], *, anchor: bool) -> str:
+    def _build_logical_evidence_text(self, events: list[Event]) -> str:
+        """Prompt body for coherence gate: logical mining members (basic or abstract)."""
+
         lines: list[str] = []
         for e in events:
-            if anchor:
-                # Force-anchor: prefer L1 (most faithful compression of raw fact); 白皮书 3.3 锚定事实层。
-                text = e.summaries.get("L1", e.content_raw)
-                label = "L1（锚定事实层）"
-            else:
-                # Normal: use mid-level summary — 常规路径，用中间档摘要平衡信息量与抽象度。
-                text = e.summaries.get(e.mid_summary_key, e.content_raw)
-                label = e.mid_summary_key
+            role_context = self._build_role_context(e)
+            label = "抽象事件" if getattr(e, "is_abstract", False) else "基本事件"
             lines.append(
-                f"### 事件 {e.event_id} (创建于 {e.create_time.isoformat()}) [{label}]\n{text}"
+                f"### {label} {e.event_id} (创建于 {e.create_time.isoformat()})\n"
+                f"content_raw:\n{e.content_raw}\n"
+                f"角色线索:\n{role_context}"
             )
         return "\n\n".join(lines)
+
+    def _build_content_raw_text(self, events: list[Event]) -> str:
+        lines: list[str] = []
+        for e in events:
+            role_context = self._build_role_context(e)
+            lines.append(
+                f"### 基本事件 {e.event_id} (创建于 {e.create_time.isoformat()})\n"
+                f"content_raw:\n{e.content_raw}\n"
+                f"角色线索:\n{role_context}"
+            )
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _leaf_evidence_stats(events: list[Event]) -> tuple[int, int, int]:
+        """``(leaf_count, avg_content_raw_len_rounded, target_len)`` for prompts.
+
+        ``target_len`` = ``max(1, int(mean(len(content_raw)) * 1.2))``，与原先
+        ``_target_content_len`` 一致；``avg`` 取四舍五入整数便于模型读数。
+        """
+        if not events:
+            return 0, 0, 0
+        n = len(events)
+        total = sum(len(e.content_raw) for e in events)
+        avg_f = total / n
+        target = max(1, int(avg_f * 1.2))
+        avg_rounded = int(round(avg_f))
+        return n, avg_rounded, target
+
+    @staticmethod
+    def _build_role_context(event: Event) -> str:
+        if not event.role_list:
+            return "无显式角色线索"
+        lines: list[str] = []
+        for entry in event.role_list:
+            snap = entry.role_snapshot
+            fragments = [
+                snap.l1_mention,
+                snap.l2_interaction,
+                snap.l3_decision,
+            ]
+            summary = " / ".join(f for f in fragments if f)
+            importance = entry.importance.value if hasattr(entry.importance, "value") else str(entry.importance)
+            lines.append(f"- {entry.role_id}（{importance}）：{summary or '无快照'}")
+        return "\n".join(lines)

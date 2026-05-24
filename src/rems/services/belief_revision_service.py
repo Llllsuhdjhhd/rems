@@ -119,14 +119,12 @@ class BeliefRevisionService:
         """Return pairs of potentially conflicting white-painting entries.
 
         Conflict heuristic: two entries for the same role have near-identical
-        L1 topics but opposite sentiment (one joy-dominant, one suffering-
-        dominant), which may indicate a factual contradiction worth reviewing.
+        L1 topics but opposite valence, which may indicate a factual contradiction worth reviewing.
 
         This is a lightweight advisory scan — final resolution is by the LLM
         or operator.
 
-        返回同一角色白描时间线中**可能**互斥的条目对（启发式）：若两条目在 Vedana 上呈现
-        「一乐主导、一苦主导」式相反情感主导（英文说明中的 joy-dominant vs suffering-dominant），
+        返回同一角色白描时间线中**可能**互斥的条目对（启发式）：若两条目呈现相反效价，
         则标记为待人工或 LLM 复核的冲突线索。
         该扫描仅为建议列表，不构成自动仲裁；与墓碑 API 正交。
         """
@@ -134,8 +132,8 @@ class BeliefRevisionService:
         conflicts: list[dict] = []
         for i, a in enumerate(entries):
             for b in entries[i + 1:]:
-                a_joy = a.emotional_model.vedana.joy - a.emotional_model.vedana.suffering
-                b_joy = b.emotional_model.vedana.joy - b.emotional_model.vedana.suffering
+                a_joy = a.emotional_model.valence
+                b_joy = b.emotional_model.valence
                 # Opposite sentiment polarity may signal contradiction
                 if a_joy * b_joy < -0.2:
                     conflicts.append({

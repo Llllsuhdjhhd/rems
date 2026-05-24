@@ -32,23 +32,24 @@
 ## LLM / 嵌入环境
 
 - **Chroma 嵌入**: `BAAI/bge-small-zh-v1.5`（`torch` 2.4.1 · 解释器: `C:\Users\40575\anaconda3\envs\py3125\python.exe`）
-- - **剧本截断**: `REMS_WP_LIVE_NARRATIVE_ROUNDS=3` → 本轮 **3** 条
+- **剧本截断**: `REMS_WP_LIVE_NARRATIVE_ROUNDS=5` → 本轮 **5** 条
 
 ## 指标核对表
 
 | 指标 | 状态 | 实测摘要 | 章节 |
 | --- | --- | --- | --- |
-| §1.1.1 event_id 字典序递增 | **PASS** | {"count": 3, "first": ["EVT-0019d9ebbadc0-60e19f60", "EVT-0019d9ebbc7ca-0d3a0928", "EVT-0019d9ebbdd2a-45abdde7"], "last": ["EVT-0019d9ebbadc0-60e19f60", "EVT-0019d9ebbc7ca-0d3a0928", "EVT-0019d9ebbdd2 | §1.1.1 |
-| §1.1.3 摘要熔断 | **PASS** | {"actual_max_level": 1, "summary_lengths": {"L1": 8}} | §1.1.3 |
-| §1.1.7 event_length ≤ len_msg | **PASS** | 14 | §1.1.7 |
+| §1.1.1 event_id 字典序递增 | **PASS** | {"count": 4, "first": ["EVT-0019da0df2728-1d2be413", "EVT-0019da0df3dd8-983aba25", "EVT-0019da0df5286-0cddc911"], "last": ["EVT-0019da0df3dd8-983aba25", "EVT-0019da0df5286-0cddc911", "EVT-0019da0df6d9 | §1.1.1 |
+| §1.1.3 摘要熔断 | **PASS** | {"actual_max_level": 1, "summary_lengths": {"L1": 14}} | §1.1.3 |
+| §1.1.7 event_length ≤ len_msg | **PASS** | 19 | §1.1.7 |
 | §1.1.7 防碎片化聚合 | **PASS** | {"hits": ["跑", "打扫", "小说"], "content_preview": "我去跑了步，然后回家，接着打扫了卫生，又看了一小时小说。"} | §1.1.7 |
 | §2.2 single 模式提示词注入 | **PASS** | {"单人隔离模式": true, "核心用户": true, "ROL-wp-live-core": true} | §2.2 |
 | §2.3 动态遗忘：高 AE > 低 AE 有效留存 | **PASS** | {"high_avg": 0.8998, "low_avg": 0.5043, "high_count": 1, "low_count": 1} | §2.3 |
 | §2.4 语义卡片键上限 | **PASS** | 0 | §2.4 |
 | §2.5 EMA | **INFO** | 无捕获（首轮或无历史） | §2.5 |
 | §2.5 activation_energy 硬绑定 | **PASS** | {"ae": 1.0, "activation_energy": 1.0} | §2.5 |
-| §4.4 回忆块 ≤ physical_redline | **PASS** | 27 | §4.4 |
-| §4.4 ultra fallback 触发 | **FAIL** | {"levels": ["L1", "L1", "L1"], "has_ultra": false} | §4.4 |
+| §2.5 activation_energy 硬绑定 | **PASS** | {"ae": 1.0, "activation_energy": 1.0} | §2.5 |
+| §4.4 回忆块 ≤ physical_redline | **PASS** | 48 | §4.4 |
+| §4.4 ultra fallback 触发 | **FAIL** | {"levels": ["L1", "L1", "L1", "L1"], "has_ultra": false} | §4.4 |
 
 ## §1.1.1 event_id 递增
 
@@ -61,7 +62,7 @@
 ### 现场数据 · §1.1.1 event_id 字典序递增 **`PASS`**
 
 - **期望**：封存顺序下 event_id 列表整体呈升序
-- **实测**：`{"count": 3, "first": ["EVT-0019d9ebbadc0-60e19f60", "EVT-0019d9ebbc7ca-0d3a0928", "EVT-0019d9ebbdd2a-45abdde7"], "last": ["EVT-0019d9ebbadc0-60e19f60", "EVT-0019d9ebbc7ca-0d3a0928", "EVT-0019d9ebbdd2`
+- **实测**：`{"count": 4, "first": ["EVT-0019da0df2728-1d2be413", "EVT-0019da0df3dd8-983aba25", "EVT-0019da0df5286-0cddc911"], "last": ["EVT-0019da0df3dd8-983aba25", "EVT-0019da0df5286-0cddc911", "EVT-0019da0df6d9`
 
 ## §1.1.3 递归摘要熔断
 
@@ -74,13 +75,13 @@
 ### 现场数据 · §1.1.3 摘要熔断 **`PASS`**
 
 - **期望**：末级摘要字数 < 20 或 actual_max_level == 5
-- **实测**：`{"actual_max_level": 1, "summary_lengths": {"L1": 8}}`
+- **实测**：`{"actual_max_level": 1, "summary_lengths": {"L1": 14}}`
 
 
 ```
 {
-  "event_id": "EVT-0019d9ebbdd2a-45abdde7",
-  "tail_len": 8,
+  "event_id": "EVT-0019da0df6d95-a901c6e6",
+  "tail_len": 14,
   "beyond_tail": false
 }
 ```
@@ -93,12 +94,12 @@
 ### 现场数据 · §1.1.7 event_length ≤ len_msg **`PASS`**
 
 - **期望**：≤ 62
-- **实测**：`14`
+- **实测**：`19`
 
 
 ```
 {
-  "event_id": "EVT-0019d9ebbdd2a-45abdde7"
+  "event_id": "EVT-0019da0df6d95-a901c6e6"
 }
 ```
 
@@ -118,14 +119,14 @@
 
 ```
 {
-  "event_id": "EVT-0019d9ebbc7ca-0d3a0928"
+  "event_id": "EVT-0019da0df3dd8-983aba25"
 }
 ```
 ### 合并事件摘录
 
 ```json
 {
-  "event_id": "EVT-0019d9ebbc7ca-0d3a0928",
+  "event_id": "EVT-0019da0df3dd8-983aba25",
   "l0": "我去跑了步，然后回家，接着打扫了卫生，又看了一小时小说。"
 }
 ```
@@ -228,7 +229,19 @@ _未找到多角色白描对齐样本，可能模型未拆分角色。_
 
 ```
 {
-  "event_id": "EVT-0019d9ebbadc0-60e19f60",
+  "event_id": "EVT-0019da0df5286-0cddc911",
+  "gain": 1.0
+}
+```
+### 现场数据 · §2.5 activation_energy 硬绑定 **`PASS`**
+
+- **期望**：≥ min(1, ae·gain·1.5) = 1.000
+- **实测**：`{"ae": 1.0, "activation_energy": 1.0}`
+
+
+```
+{
+  "event_id": "EVT-0019da0df6d95-a901c6e6",
   "gain": 1.0
 }
 ```
@@ -244,13 +257,15 @@ _未找到多角色白描对齐样本，可能模型未拆分角色。_
 ### 现场数据 · §4.4 回忆块 ≤ physical_redline **`PASS`**
 
 - **期望**：≤ 620 字
-- **实测**：`27`
+- **实测**：`48`
 
 
 ```
 {
-  "items": 2,
+  "items": 4,
   "levels": [
+    "L1",
+    "L1",
     "L1",
     "L1"
   ]
@@ -259,14 +274,23 @@ _未找到多角色白描对齐样本，可能模型未拆分角色。_
 **Top 混合分分量（近期轨迹）**
 
 ```text
-`EVT-0019d9ebbadc0-60e19f60` cosine:0.193 | time:0.150 | role:0.060 | ae:0.150 | act:0.100 → total=0.653
-`EVT-0019d9ebbadc0-60e19f60` cosine:0.200 | time:0.150 | role:0.060 | ae:0.150 | act:0.100 → total=0.660
-`EVT-0019d9ebbc7ca-0d3a0928` cosine:0.167 | time:0.150 | role:0.060 | ae:0.000 | act:0.000 → total=0.377
+`EVT-0019da0df2728-1d2be413` cosine:0.193 | time:0.150 | role:0.060 | ae:0.075 | act:0.050 → total=0.528
+`EVT-0019da0df2728-1d2be413` cosine:0.200 | time:0.150 | role:0.060 | ae:0.075 | act:0.050 → total=0.535
+`EVT-0019da0df3dd8-983aba25` cosine:0.151 | time:0.150 | role:0.060 | ae:0.000 | act:0.000 → total=0.361
+`EVT-0019da0df2728-1d2be413` cosine:0.200 | time:0.150 | role:0.060 | ae:0.075 | act:0.050 → total=0.535
+`EVT-0019da0df3dd8-983aba25` cosine:0.177 | time:0.150 | role:0.060 | ae:0.000 | act:0.000 → total=0.387
+`EVT-0019da0df5286-0cddc911` cosine:0.162 | time:0.150 | role:0.060 | ae:0.150 | act:0.100 → total=0.622
+`EVT-0019da0df5286-0cddc911` cosine:0.218 | time:0.150 | role:0.060 | ae:0.150 | act:0.100 → total=0.678
+`EVT-0019da0df6d95-a901c6e6` cosine:0.211 | time:0.150 | role:0.060 | ae:0.150 | act:0.100 → total=0.671
+`EVT-0019da0df2728-1d2be413` cosine:0.211 | time:0.150 | role:0.060 | ae:0.075 | act:0.050 → total=0.546
+`EVT-0019da0df3dd8-983aba25` cosine:0.167 | time:0.150 | role:0.060 | ae:0.000 | act:0.000 → total=0.377
 ```
 **RecallBlock Top-K**
 
-- `EVT-0019d9ebbadc0-60e19f60` score=0.6600 level=L1
-- `EVT-0019d9ebbc7ca-0d3a0928` score=0.3767 level=L1
+- `EVT-0019da0df5286-0cddc911` score=0.6776 level=L1
+- `EVT-0019da0df6d95-a901c6e6` score=0.6706 level=L1
+- `EVT-0019da0df2728-1d2be413` score=0.5455 level=L1
+- `EVT-0019da0df3dd8-983aba25` score=0.3766 level=L1
 
 ## §4.4 ultra 降级
 
@@ -279,19 +303,52 @@ _未找到多角色白描对齐样本，可能模型未拆分角色。_
 ### 现场数据 · §4.4 ultra fallback 触发 **`FAIL`**
 
 - **期望**：items 中至少一条 summary_level == 'ultra'
-- **实测**：`{"levels": ["L1", "L1", "L1"], "has_ultra": false}`
+- **实测**：`{"levels": ["L1", "L1", "L1", "L1"], "has_ultra": false}`
 
 ## 运行摘要
 
-- 剧本轮次：**3**（全量剧本共 18 条）
-- 新封存事件数：**3**
-- LLM 调用次数：**15**
+- 剧本轮次：**5**（全量剧本共 18 条）
+- 新封存事件数：**4**
+- LLM 调用次数：**22**
+
+## LLM 调用记录
+
+数据来自 **`LLMProvider.invocation_history()`**（每次 ``complete`` 一行）。
+
+**延迟**为客户端测量的往返时间（毫秒）；**token** 取自 API `usage`，网关未返回时显示为「—」。
+
+| # | task_type | model | 延迟(ms) | prompt | completion | total |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 1 | `boundary_detection` | `qwen-turbo` | 1034.82 | 571 | 55 | 626 |
+| 2 | `summary` | `tongyi-xiaomi-analysis-pro` | 733.62 | 201 | 29 | 230 |
+| 3 | `role_extraction` | `qwen-turbo` | 2396.39 | 493 | 188 | 681 |
+| 4 | `summary` | `tongyi-xiaomi-analysis-pro` | 568.30 | 78 | 22 | 100 |
+| 5 | `summary` | `tongyi-xiaomi-analysis-pro` | 588.00 | 166 | 21 | 187 |
+| 6 | `boundary_detection` | `qwen-turbo` | 846.66 | 577 | 61 | 638 |
+| 7 | `summary` | `tongyi-xiaomi-analysis-pro` | 733.08 | 207 | 29 | 236 |
+| 8 | `role_extraction` | `qwen-turbo` | 2487.74 | 499 | 217 | 716 |
+| 9 | `summary` | `tongyi-xiaomi-analysis-pro` | 942.41 | 84 | 39 | 123 |
+| 10 | `summary` | `tongyi-xiaomi-analysis-pro` | 809.53 | 215 | 35 | 250 |
+| 11 | `boundary_detection` | `qwen-turbo` | 849.33 | 568 | 52 | 620 |
+| 12 | `summary` | `tongyi-xiaomi-analysis-pro` | 623.48 | 198 | 24 | 222 |
+| 13 | `role_extraction` | `qwen-turbo` | 2158.41 | 490 | 201 | 691 |
+| 14 | `summary` | `tongyi-xiaomi-analysis-pro` | 735.82 | 75 | 32 | 107 |
+| 15 | `summary` | `tongyi-xiaomi-analysis-pro` | 904.33 | 266 | 43 | 309 |
+| 16 | `boundary_detection` | `qwen-turbo` | 844.01 | 575 | 59 | 634 |
+| 17 | `summary` | `tongyi-xiaomi-analysis-pro` | 717.93 | 205 | 31 | 236 |
+| 18 | `role_extraction` | `qwen-turbo` | 3658.62 | 497 | 355 | 852 |
+| 19 | `summary` | `tongyi-xiaomi-analysis-pro` | 677.08 | 82 | 26 | 108 |
+| 20 | `summary` | `tongyi-xiaomi-analysis-pro` | 1467.70 | 303 | 54 | 357 |
+| 21 | `summary` | `tongyi-xiaomi-analysis-pro` | 1235.31 | 343 | 65 | 408 |
+| 22 | `boundary_detection` | `qwen-turbo` | 879.89 | 568 | 63 | 631 |
+
+**Token 合计（仅统计 API 返回了对应字段的调用）**：prompt Σ=7261 · completion Σ=1701 · total Σ=8962
 
 ## 环境 & 复现命令
 
-- **生成时间**：2026-04-18 03:56:25 UTC
+- **生成时间**：2026-04-18 13:54:27 UTC
 - **Python**：`C:\Users\40575\anaconda3\envs\py3125\python.exe`
-- **pytest 命令**：`python -m pytest tests/test_wp_live_single_mode_narrative.py -v -s  # REMS_WP_LIVE_NARRATIVE_ROUNDS=3`
+- **pytest 命令**：`python -m pytest tests/test_wp_live_single_mode_narrative.py -v -s  # REMS_WP_LIVE_NARRATIVE_ROUNDS=5`
 - **相关环境变量键**（值不落盘）：`REMS_LIVE_ALLOW_FAKE_EMBEDDING`、`REMS_RUN_LIVE_METABOLISM_TEST`、`REMS_WP_REPORT_DIR`
 
-<!-- wp-live-stats: {"report": "wp_live_single_mode.md", "pass": 9, "fail": 1, "na": 1} -->
+<!-- wp-live-stats: {"report": "wp_live_single_mode.md", "pass": 10, "fail": 1, "na": 1} -->

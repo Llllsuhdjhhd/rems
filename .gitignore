@@ -13,3 +13,9 @@ chroma_data/
 *.so
 .venv/
 venv/
+
+# --- Simulation Data ---
+tests/scenarios/*/outputs/
+tests/integration/outputs/
+test_chroma/
+

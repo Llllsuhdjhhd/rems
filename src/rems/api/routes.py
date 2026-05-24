@@ -57,6 +57,7 @@ class EventOut(BaseModel):
     insight: str | None = None
     affective_energy: float = 0.0
     activation_energy: float = 0.0
+    abstract_coverage: float = 0.0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -152,15 +153,6 @@ def list_roles():
     return [r.model_dump(mode="json", exclude={"white_painting"}) for r in roles]
 
 
-@router.get("/roles/{role_id}/card")
-def get_semantic_card(role_id: str):
-    pipeline = get_pipeline()
-    card = pipeline.role_service.get_semantic_card(role_id)
-    if not card:
-        raise HTTPException(404, f"No semantic card for role {role_id}")
-    return card.model_dump(mode="json")
-
-
 @router.get("/roles/{role_id}/conflicts")
 def detect_conflicts(role_id: str, top_n: int = 50):
     pipeline = get_pipeline()
@@ -193,4 +185,5 @@ def _event_out(e) -> EventOut:
         insight=e.insight,
         affective_energy=round(e.affective_energy, 4),
         activation_energy=round(e.activation_energy, 4),
+        abstract_coverage=round(float(getattr(e, "abstract_coverage", 0.0) or 0.0), 4),
     )

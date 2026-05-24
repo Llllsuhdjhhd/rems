@@ -1,6 +1,7 @@
 """Unit tests for Pydantic data models."""
 
 from rems.models import (
+    BasicEmotionVector,
     ContextPackage,
     EmotionalModel,
     Event,
@@ -34,7 +35,7 @@ class TestEvent:
     def test_role_entry(self):
         entry = EventRoleEntry(role_id="ROL-test", importance=Importance.S)
         assert entry.importance == Importance.S
-        assert entry.emotional_model.vedana.joy == 0.0
+        assert entry.emotional_model.emotion.joy == 0.0
 
     def test_serialization_roundtrip(self):
         e = Event(content_raw="data", summaries={"L1": "d"})
@@ -87,14 +88,13 @@ class TestMetabolism:
 class TestEmotionalModel:
     def test_defaults_zero(self):
         em = EmotionalModel()
-        assert em.vedana.joy == 0.0
-        assert em.klesha.greed == 0.0
+        assert em.emotion.joy == 0.0
+        assert em.arousal == 0.0
+        assert em.valence == 0.0
 
     def test_custom_values(self):
-        em = EmotionalModel(
-            vedana={"joy": 0.8, "equanimity": 0.2},
-            klesha={"anger": 0.5},
-        )
-        assert em.vedana.joy == 0.8
-        assert em.klesha.anger == 0.5
-        assert em.klesha.pride == 0.0
+        em = EmotionalModel.from_emotion(BasicEmotionVector(joy=0.8, anger=0.5))
+        assert em.emotion.joy == 0.8
+        assert em.emotion.anger == 0.5
+        assert em.arousal == 0.8
+        assert em.valence > 0.0

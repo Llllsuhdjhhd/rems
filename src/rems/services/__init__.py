@@ -6,6 +6,7 @@ from .metabolism_service import MetabolismService
 from .recall_service import RecallService
 from .abstraction_service import AbstractionService
 from .belief_revision_service import BeliefRevisionService
+from .recall_quality import RecallQualityController
 
 __all__ = [
     "EventService",
@@ -14,4 +15,5 @@ __all__ = [
     "RecallService",
     "AbstractionService",
     "BeliefRevisionService",
+    "RecallQualityController",
 ]

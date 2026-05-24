@@ -1,27 +1,39 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 from .config import REMSConfig, UserMode
 from .llm.provider import LLMProvider
-from .models.event import Event
+from .models.event import Event, EventRoleEntry
 from .models.metabolism import ContextPackage
+from .models.role import Role
+from .observability import PerfMonitor
 from .services.abstraction_service import AbstractionService
 from .services.belief_revision_service import BeliefRevisionService
 from .services.emotion_service import EMAEvolver
 from .services.event_service import EventService
 from .services.metabolism_service import MetabolismService
+from .services.recall_quality import RecallQualityController
 from .services.recall_service import RecallService
 from .services.role_service import RoleService
 from .skills.boundary_detection import BoundaryDetectionSkill
+from .skills.event_enrichment import EventEnrichmentSkill
 from .skills.inductive_evolution import InductiveEvolutionSkill
+from .skills.recall_block_relevance import RecallBlockRelevanceSkill
 from .skills.role_extraction import RoleExtractionSkill
 from .skills.summary_generation import SummaryGenerationSkill
 from .storage.database import Database
-from .storage.repository import EventRepository, MetabolismRepository, RoleRepository
+from .storage.repository import (
+    AbstractedSubsetRepository,
+    EventRepository,
+    MetabolismRepository,
+    RecallLogRepository,
+    RoleRepository,
+)
 from .storage.vector_store import VectorStore
 
 # 顶层编排：ingest 串联回忆（ContextPackage）、代谢封存、角色白描/语义卡片、
@@ -35,34 +47,40 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 
 class ProcessingMode(str, Enum):
-    """Output mode controlling pipeline behaviour.
+    """Output mode controlling what the pipeline **returns** to the caller.
+
+    重要设计约定（与白皮书 §5 一致）：**模式只影响"输出形态"，不影响"内部记忆动力学"**。
+    回忆块组装、``recall_log`` 登记、频繁子集挖掘 (§3.2) 等一律无条件执行——因为：
+        (a) 抽象事件的唯一触发路径是 ``recall_log``，跳过回忆等于放弃所有抽象合成；
+        (b) 白描、AE、语义卡片等后台巩固机制都依赖对事件的持续检索相关性；
+        (c) "静默倾听"的语义是「不对用户可见」，而不是「不要构建记忆」。
+
+    所以模式的差异收敛到一个布尔属性 :pyattr:`returns_context_package` 以及少量输出
+    装配逻辑（例如 NPC 的 Directive）。新增模式时只需在枚举中追加成员、覆盖属性或
+    扩展 ``_build_*_directives``，不需要触动 ``ingest`` 的主干流程。
 
     DIALOGUE
-        Standard interactive mode.  Assembles full Context Package for LLM
-        response generation.  Metabolism (sealing, indexing) runs in the
-        same call (in-process; use async/worker in production for latency).
-
+        标准强输出交互。ingest 返回完整 ContextPackage，供上游 LLM 生成自然语言回复。
     PASSIVE_LOG
-        "Silent listener" mode for wearables, meeting recordings, etc.
-        No context package is assembled.  Input is fed directly to shadow
-        buffer and sealed when thresholds are met.  No text output expected.
-
+        "静默倾听"：穿戴录音、会议转写等「只记不说」场景。回忆、代谢、抽象合成**仍然执行**
+        且登记入库，只是 ``ContextPackage`` 不对外暴露（:pyattr:`returns_context_package`
+        ``= False``），不产出人类可见的文本回复。
     NPC_AGENT
-        Generative-agent / virtual-sandbox mode.  Output is a structured
-        dict with ``action`` and updated Klesha/Vedana deltas, intended
-        for a downstream Directive Parser.  No natural-language reply.
-
-    中文（对照白皮书第 5 章）：
-        DIALOGUE：标准强输出交互；组装完整 Context Package供 LLM 生成自然语言回复；
-        代谢（封存、索引）可与本次调用同进程执行（生产环境建议异步/队列以降低延迟）。
-        PASSIVE_LOG：被动日志/静默倾听；不组装上下文包；输入进入残影并按阈值封存；
-        不向用户输出任何文本（穿戴设备、会议转写等「只记不说」场景）。
-        NPC_AGENT：生成式智能体/沙盒 NPC；输出含 ``action`` 与 Klesha/Vedana 增量等的结构化字典，
-        交由下游 Directive Parser 转为引擎调用，无需人类可见的对话文本。
+        生成式 NPC / 沙盒 Agent。除了 ContextPackage 外，还输出结构化 ``npc_directives``
+        （动作 + 情绪增量等），交给下游 Directive Parser 转为引擎调用。
     """
     DIALOGUE = "dialogue"
     PASSIVE_LOG = "passive_log"
     NPC_AGENT = "npc_agent"
+
+    @property
+    def returns_context_package(self) -> bool:
+        """Whether ``ingest`` should expose the ContextPackage to the caller.
+
+        默认对外暴露；被动日志等"静默"模式重写为 False。新增对外不回复、只沉淀记忆的模式
+        时复写此属性即可，内部回忆与抽象管线不需要改动。
+        """
+        return self != ProcessingMode.PASSIVE_LOG
 
 
 # =====================================================================
@@ -128,12 +146,17 @@ class REMSPipeline:
         event_repo: EventRepository,
         role_repo: RoleRepository,
         meta_repo: MetabolismRepository,
+        recall_log_repo: RecallLogRepository,
         event_service: EventService,
         role_service: RoleService,
         metabolism_service: MetabolismService,
         recall_service: RecallService,
         abstraction_service: AbstractionService,
         belief_revision_service: BeliefRevisionService,
+        role_skill: RoleExtractionSkill | None = None,
+        perf_monitor: PerfMonitor | None = None,
+        recall_quality: RecallQualityController | None = None,
+        recall_block_relevance_skill: RecallBlockRelevanceSkill | None = None,
     ):
         self.config = config
         self.llm = llm
@@ -142,12 +165,19 @@ class REMSPipeline:
         self.event_repo = event_repo
         self.role_repo = role_repo
         self.meta_repo = meta_repo
+        self.recall_log_repo = recall_log_repo
         self.event_service = event_service
         self.role_service = role_service
         self.metabolism_service = metabolism_service
         self.recall_service = recall_service
         self.abstraction_service = abstraction_service
         self.belief_revision_service = belief_revision_service
+        self.role_skill = role_skill
+        # 暴露 perf_monitor，便于上层脚本读取耗时指标 / 当前 load_factor 做诊断。
+        self.perf_monitor = perf_monitor
+        self.recall_quality = recall_quality
+        self.recall_block_relevance_skill = recall_block_relevance_skill
+        self._ingest_seq = 0
 
     # ------------------------------------------------------------------
     @classmethod
@@ -160,32 +190,75 @@ class REMSPipeline:
         llm = LLMProvider(config)
         db = Database(config.storage.database_url)
         db.create_tables()
-        vector_store = VectorStore(config)
+
+        # 性能监控（白皮书 §2.3 高负载自我保护）：
+        # 监听 RAG / 回忆组装 / 抽象挖掘 / 叙事判重 等非 LLM 主算法的滚动均耗时，
+        # load_factor 上升时驱动 (1) 白描静默阈值收紧 (2) 抽象判重 K 收窄。
+        perf_monitor = PerfMonitor(
+            enabled=config.perf_monitor_enabled,
+            window_size=config.perf_monitor_window_size,
+            tolerances_ms=config.perf_phase_tolerance_ms,
+            load_factor_max=config.perf_load_factor_max,
+            silence_boost_at_max=config.forgetting_overload_silence_boost,
+        )
+
+        vector_store = VectorStore(config, perf_monitor=perf_monitor)
 
         event_repo = EventRepository(db)
         role_repo = RoleRepository(db)
         meta_repo = MetabolismRepository(db)
+        recall_log_repo = RecallLogRepository(db)
+        abstracted_subset_repo = AbstractedSubsetRepository(db)
 
+        recall_quality = RecallQualityController(config)
+
+        # SummaryGenerationSkill 仍用于抽象事件（inductive evolution 后的总结）。
+        # 基本事件流已被 EventEnrichmentSkill 接管（一次调用产出摘要 + 角色）。
         summary_skill = SummaryGenerationSkill(llm, config)
         role_skill = RoleExtractionSkill(llm, config)
         boundary_skill = BoundaryDetectionSkill(llm, config)
+        enrichment_skill = EventEnrichmentSkill(llm, config, role_fallback=role_skill)
         evolution_skill = InductiveEvolutionSkill(llm, config)
+        relevance_skill = RecallBlockRelevanceSkill(llm, config)
 
         emotion_evolver = EMAEvolver(config, role_repo)
+        # Pass llm to role_service so semantic cards can be refreshed in-process
+        role_service = RoleService(config, role_repo, role_skill, llm=llm, vector_store=vector_store)
+
         event_service = EventService(
             config,
             llm,
             event_repo,
             vector_store,
-            summary_skill,
-            role_skill,
+            enrichment_skill,
+            role_service=role_service,
             emotion_evolver=emotion_evolver,
         )
-        # Pass llm to role_service so semantic cards can be refreshed in-process
-        role_service = RoleService(config, role_repo, role_skill, llm=llm)
-        metabolism_service = MetabolismService(config, meta_repo, boundary_skill, event_service)
-        recall_service = RecallService(config, event_repo, role_repo, vector_store)
-        abstraction_service = AbstractionService(config, event_repo, vector_store, evolution_skill, summary_skill)
+        
+        metabolism_service = MetabolismService.with_default_boundary_repair(
+            config,
+            meta_repo,
+            boundary_skill,
+            event_service,
+            event_repo=event_repo,
+            llm=llm,
+        )
+        recall_service = RecallService(
+            config, event_repo, role_repo, vector_store, perf_monitor=perf_monitor,
+            recall_quality=recall_quality,
+        )
+        abstraction_service = AbstractionService(
+            config,
+            event_repo,
+            vector_store,
+            evolution_skill,
+            summary_skill,
+            recall_log_repo,
+            abstracted_subset_repo,
+            enrichment_skill=enrichment_skill,
+            perf_monitor=perf_monitor,
+            recall_quality=recall_quality,
+        )
         belief_revision_service = BeliefRevisionService(config, event_repo, role_repo)
 
         return cls(
@@ -196,12 +269,17 @@ class REMSPipeline:
             event_repo=event_repo,
             role_repo=role_repo,
             meta_repo=meta_repo,
+            recall_log_repo=recall_log_repo,
             event_service=event_service,
             role_service=role_service,
             metabolism_service=metabolism_service,
             recall_service=recall_service,
             abstraction_service=abstraction_service,
             belief_revision_service=belief_revision_service,
+            role_skill=role_skill,
+            perf_monitor=perf_monitor,
+            recall_quality=recall_quality,
+            recall_block_relevance_skill=relevance_skill,
         )
 
     # ------------------------------------------------------------------
@@ -215,73 +293,134 @@ class REMSPipeline:
         force_save: bool = False,
         mode: ProcessingMode = ProcessingMode.DIALOGUE,
         npc_role_id: str | None = None,
+        input_id: str | None = None,
     ) -> ProcessingResult:
-        """Full processing cycle with multi-scenario output.
+        """Full processing cycle.
 
-        PASSIVE_LOG:
-            Skip context package assembly; feed directly to metabolism.
+        **内部记忆动力学（所有模式一律执行）**：
+            1. 取残影 + 焦点角色；
+            2. 组装 ``ContextPackage``（回忆块 + 残影 + 当前输入）；
+            3. 把回忆块真实事件 ID 登记到 ``recall_log``——白皮书 §3.2 规定这是抽象事件的**唯一**触发路径，
+               因此即使被动日志模式"不对用户说话"，也必须完成回忆与登记，否则系统永远不会演化出抽象规律；
+            4. 代谢：边界检测、封存基本事件、维护残影与未完成库（§4.1–§4.2）；
+            5. 角色更新：对每个新基本事件追加白描时间线、必要时刷新语义卡片（§2.2–§2.3，抽象事件自动跳过）；
+            6. 抽象合成：扫 ``recall_log`` 全量历史做频繁子集挖掘（§3.2）。
 
-        DIALOGUE:
-            Assemble context package first, then metabolism.
-
-        NPC_AGENT:
-            Assemble context package, derive action directives from recalled
-            memories, run metabolism in background.
-
-        完整处理周期（多场景输出形态由 ``mode`` 决定）：
-
-        PASSIVE_LOG：
-            不组装 Context Package；输入直接进入代谢（残影/边界/封存），适用于「只记不说」的被动日志场景。
-
-        DIALOGUE：
-            先基于残影与当前输入组装 Context Package（供上游 LLM 生成回复），
-            再执行代谢封存；两者在同一调用内顺序执行（生产可改为后台代谢）。
-
-        NPC_AGENT：
-            同样组装 Context Package；根据回忆块等生成 NPC 结构化指令；
-            代谢仍执行以持久化环境事件（注释中所述 background 指与「对话生成」解耦的语义，
-            本实现仍为同进程顺序调用，部署时可拆分为异步工作者）。
+        **外部输出形态（由 ``mode`` 决定）**：
+            - ``returns_context_package == True``：对外返回 ContextPackage 供上游 LLM 生成回复；
+            - ``returns_context_package == False``：ContextPackage 留在内部，对外返回 ``None``
+              （"静默倾听"）；
+            - ``NPC_AGENT``：额外基于回忆块派生 ``npc_directives``；
+            - 新增模式只需在 :class:`ProcessingMode` 追加成员并复写 ``returns_context_package``
+              （或扩展专属装配步骤），不需要改动主干流程。
         """
         shadow = self.meta_repo.get_shadow()
 
-        # 从当前输入和残影中提取焦点角色（用于回忆时的角色感知摘要档位选择）。
-        focus_role_ids = self._extract_focus_roles(raw_input, shadow.content if shadow else "")
+        # Step 1: 提前角色抽取（输入 + 残影）。
+        # 这一轮主要目的是为 RecallService 准备焦点角色与已知角色快照（白皮书 §4.4 流 B）；
+        # 抽得的 role_entries 同时会作为 ``known_roles`` 透传给代谢层，让 EventEnrichmentSkill
+        # 走 summary-only 分支，省掉 seal 阶段的二次角色提取（P1-6）。
+        combined_text = (shadow.content + "\n" + raw_input).strip()
+        logger.debug(
+            "ingest pre-recall: role_skill=%s, combined_text_len=%d",
+            self.role_skill is not None, len(combined_text),
+        )
+        role_entries: list[EventRoleEntry] = []
+        if self.role_skill and combined_text:
+            extraction_result = self.role_skill.extract(combined_text)
+            extracted_roles = list(extraction_result.roles)
+            if extracted_roles:
+                id_mapping = self.role_service.resolve_and_register(extracted_roles, is_suspicious=False)
+                for er in extracted_roles:
+                    lookup_key = er.role_id or er.name
+                    assigned_id = id_mapping.get(lookup_key, lookup_key)
+                    role_entries.append(self.role_skill.to_event_role_entry(er, assigned_id))
 
-        # 对话/NPC：用「残影 + 当前输入」检索并组装 ContextPackage；被动日志跳过（白皮书 5.2）。
-        ctx: Optional[ContextPackage] = None
-        if mode != ProcessingMode.PASSIVE_LOG:
-            ctx = self.recall_service.build_context_package(
-                raw_input, shadow, focus_role_ids=focus_role_ids
-            )
+        # 从当前输入、残影以及刚抽取的角色中提取焦点角色
+        focus_role_ids = set(r.role_id for r in role_entries)
+        if self.config.user_mode == UserMode.SINGLE and self.config.core_user_role_id:
+            focus_role_ids.add(self.config.core_user_role_id)
+        focus_role_ids.update(self._extract_focus_roles(raw_input, shadow.content if shadow else ""))
+
+        # 回忆（所有模式必须执行）：
+        # 抽象事件的唯一触发路径是 recall_log 的频繁子集挖掘，跳过回忆等于放弃所有归纳演化；
+        # "静默倾听"等模式只是不把 ctx 交给外部，内部仍然完整组装、登记与挖掘。
+        ctx: ContextPackage = self.recall_service.build_context_package(
+            raw_input, shadow, focus_role_ids=focus_role_ids, focus_role_entries=role_entries
+        )
+
+        # 登记本次回忆块 event_id 到 recall_log（白皮书 §3.2 唯一抽象触发路径的输入流）。
+        # 只记录真实 basic/abstract 事件；抽象事件 id 同样进入命名空间，
+        # 便于后续更高阶抽象在同一空间继续挖掘。
+        if ctx.recall_block.items:
+            recall_event_ids: list[str] = []
+            seen_ids: set[str] = set()
+            for it in ctx.recall_block.items:
+                eid = it.event_id
+                if not eid or eid in seen_ids:
+                    continue
+                seen_ids.add(eid)
+                recall_event_ids.append(eid)
+            if recall_event_ids:
+                self.recall_log_repo.append(
+                    recall_id=f"RCL-{uuid.uuid4().hex}",
+                    event_ids=recall_event_ids,
+                )
+
+        self._ingest_seq += 1
+        rq, rel_skill = self.recall_quality, self.recall_block_relevance_skill
+        if (
+            rq is not None
+            and rel_skill is not None
+            and rq.should_audit_relevance(self._ingest_seq)
+            and ctx.recall_block.items
+        ):
+            try:
+                rate_b = rel_skill.evaluate_relevance_ratio(raw_input, ctx.recall_block)
+                rq.record_recall_block_relevance_rate(rate_b)
+            except Exception as exc:
+                logger.warning("recall block relevance audit failed: %s", exc)
 
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
-        sealed = self.metabolism_service.process_input(raw_input, force_save=force_save)
+        # 把 pre-recall 已提取的角色作为 enrichment 去代词化 hint 透传，避免事件层面重复抽取。
+        # 同时把抽到的富信息 EventRoleEntry（含 snapshot + 8 维情绪）作为「全局池」下放：
+        # EventService.seal_event 会让 enrichment 走 names_only 分支，仅识别本事件登场的角色名，
+        # 然后按 role_id 从池中回填 snapshot/情感，避免事件级别重复 LLM 抽取（白皮书 2.1）。
+        known_roles_hint: list[Role] = []
+        if role_entries:
+            for re_entry in role_entries:
+                role_obj = self.role_repo.get(re_entry.role_id)
+                if role_obj is not None:
+                    known_roles_hint.append(role_obj)
+        sealed = self.metabolism_service.process_input(
+            raw_input,
+            force_save=force_save,
+            input_id=input_id,
+            known_roles_hint=known_roles_hint or None,
+            pre_role_entries=role_entries or None,
+        )
 
         # 角色：每个新事件更新白描时间线并刷新语义卡片（第 2.2–2.3）。
+        # RoleService 对 is_abstract=True 的事件自带早退，抽象事件不会污染白描。
         for event in sealed:
             self.role_service.update_from_event(event)
 
-        # 记忆再巩固：回忆块中同一主题基本事件数量达阈值则归纳抽象（第 4.4）。
-        abstract_events: list[Event] = []
-
-        if ctx and ctx.recall_block.items and mode != ProcessingMode.PASSIVE_LOG:
-            abstract_events.extend(self._reconsolidate(ctx, sealed))
-
-        # 封存后再以新事件为锚做一次向量聚类抽象（第 3.2 演化驱动触发的一种实现路径）。
-        for event in sealed:
-            abstract = self.abstraction_service.check_and_abstract(event)
-            if abstract:
-                abstract_events.append(abstract)
+        # 抽象事件触发 —— 唯一路径：``recall_log`` 中的频繁子集挖掘（白皮书 §3.2）。
+        # 所有模式都跑：被动日志场景下仍然需要持续演化出抽象规律供未来检索或审计。
+        abstract_events: list[Event] = self.abstraction_service.mine_and_synthesize()
 
         # NPC：由回忆与威胁启发式生成行为指令（第 5.3）。
         npc_directives: list[dict] = []
         if mode == ProcessingMode.NPC_AGENT and npc_role_id:
             npc_directives = self._build_npc_directives(npc_role_id, ctx, sealed)
 
+        # 输出路由：``returns_context_package`` 控制 ctx 是否对外暴露；内部管线与产物不变。
+        exposed_ctx: Optional[ContextPackage] = ctx if mode.returns_context_package else None
+
         return ProcessingResult(
             sealed_events=sealed,
             abstract_events=abstract_events,
-            context_package=ctx,
+            context_package=exposed_ctx,
             mode=mode,
             npc_directives=npc_directives,
         )
@@ -321,69 +460,6 @@ class REMSPipeline:
         return focus
 
     # ------------------------------------------------------------------
-    # Memory Reconsolidation
-    # ------------------------------------------------------------------
-
-    def _reconsolidate(
-        self,
-        ctx: ContextPackage,
-        newly_sealed: list[Event],
-    ) -> list[Event]:
-        """If recall block contains >= threshold unique basic events,
-        trigger abstract event synthesis (Memory Reconsolidation; white paper section 4.4).
-
-        当本次组装的回忆块中，去重后的基本事件（非抽象、非墓碑）数量达到
-        ``config.recall_cluster_threshold`` 时，触发抽象事件合成：将被再激活的一批记忆
-        视为进入「重组」状态，由归纳技能合成 ``is_abstract=True`` 的新事件并落库，
-        同时将参与簇的基本事件标记为 ``is_abstracted``。语义卡片伪条目（event_id 前缀
-        ``CARD:``）不计入基本事件计数。
-        """
-        # 语义卡片条目 event_id 形如 CARD:...，不计入「基本事件」簇规模。
-        recall_event_ids = [
-            it.event_id
-            for it in ctx.recall_block.items
-            if not it.event_id.startswith("CARD:")
-        ]
-        if len(recall_event_ids) < self.config.recall_cluster_threshold:
-            return []
-
-        recalled_events: list[Event] = []
-        for eid in recall_event_ids:
-            e = self.event_repo.get(eid)
-            if e and not e.is_abstract and not e.is_tombstoned:
-                recalled_events.append(e)
-
-        if len(recalled_events) < self.config.recall_cluster_threshold:
-            return []
-
-        logger.info(
-            "Memory Reconsolidation triggered: %d recalled events → abstract synthesis",
-            len(recalled_events),
-        )
-
-        from .skills.inductive_evolution import InductiveEvolutionSkill
-        evolution_skill = InductiveEvolutionSkill(self.llm, self.config)
-        abstract_evt = evolution_skill.synthesize(recalled_events, abstraction_level=1)
-
-        from .skills.summary_generation import SummaryGenerationSkill
-        summary_skill = SummaryGenerationSkill(self.llm, self.config)
-        sr = summary_skill.generate(abstract_evt.content_raw)
-        abstract_evt.summaries = sr.summaries
-        abstract_evt.summary_lengths = sr.summary_lengths
-        abstract_evt.actual_max_level = sr.actual_max_level
-
-        self.event_repo.save(abstract_evt)
-        self.vector_store.add_event(
-            abstract_evt.event_id,
-            abstract_evt.summaries.get("L1", abstract_evt.content_raw),
-            {"is_abstract": True, "status": abstract_evt.status.value},
-        )
-        for e in recalled_events:
-            self.event_repo.update_status(e.event_id, is_abstracted=True)
-
-        return [abstract_evt]
-
-    # ------------------------------------------------------------------
     # NPC / Generative-Agent directives
     # ------------------------------------------------------------------
 
@@ -402,7 +478,7 @@ class REMSPipeline:
 
         为指定 ``npc_role_id`` 生成结构化 NPC 指令：在当前 ``ContextPackage`` 的回忆条目中，
         用启发式统计该 ID 在文本中的出现次数以估计威胁程度，并映射为 ``idle`` / ``watch`` /
-        ``flee`` 等 ``action`` 及 ``klesha_delta``。下游 Directive Parser 将其翻译为
+        ``flee`` 等 ``action`` 及 ``emotion_delta``。下游 Directive Parser 将其翻译为
         寻路、动画或状态机变更（白皮书 5.3）；本实现为轻量示例，非完整游戏 AI。
         """
         directives: list[dict] = []
@@ -416,19 +492,19 @@ class REMSPipeline:
                 threat_score += 0.2  # heuristic bump per mention
 
         action = "idle"
-        klesha_delta: dict[str, float] = {}
+        emotion_delta: dict[str, float] = {}
         if threat_score >= 0.6:
             action = "flee"
-            klesha_delta = {"anger": 0.3, "ignorance": -0.1}
+            emotion_delta = {"fear": 0.4, "anger": 0.2}
         elif threat_score >= 0.3:
             action = "watch"
-            klesha_delta = {"doubt": 0.2}
+            emotion_delta = {"anticipation": 0.2, "fear": 0.1}
 
         if action != "idle":
             directives.append({
                 "npc_role_id": npc_role_id,
                 "action": action,
-                "klesha_delta": klesha_delta,
+                "emotion_delta": emotion_delta,
                 "reason": f"threat_score={threat_score:.2f}",
             })
         return directives
@@ -442,15 +518,33 @@ class REMSPipeline:
         if not role:
             return {"error": f"Role '{name_or_id}' not found"}
         summary = self.role_service.get_white_painting_summary(role.role_id)
-        card = self.role_service.get_semantic_card(role.role_id)
         return {
-            "role": role.model_dump(mode="json", exclude={"white_painting", "semantic_card"}),
+            "role": role.model_dump(mode="json", exclude={"white_painting"}),
             "white_painting_summary": summary,
-            "semantic_card": card.data if card else {},
         }
 
     def run_evolution(self) -> list[Event]:
-        return self.abstraction_service.run_background_evolution()
+        """Manually drive the subset-mining pass (白皮书 §3.2).
+
+        Equivalent to what ``ingest`` already runs after each recall; exposed for batch jobs.
+        """
+        return self.abstraction_service.mine_and_synthesize()
+
+    def resolve_to_basic_events(self, event_id: str) -> list[Event]:
+        """Resolve an abstract event to the flat list of basic events it ultimately derives from.
+
+        从某条事件出发，沿 ``source_events`` 的嵌套链下钻直到叶子层（基本事件），
+        返回 ``Event`` 模型列表（白皮书 §1.1.8 / §3.2）。
+        输入若是基本事件，直接返回含自身的单元素列表；抽象事件会跨多层抽象逐级展开；
+        墓碑事件不会进入结果。
+        """
+        basic_ids = self.event_repo.resolve_basic_event_ids(event_id)
+        events: list[Event] = []
+        for eid in basic_ids:
+            ev = self.event_repo.get(eid)
+            if ev is not None:
+                events.append(ev)
+        return events
 
     def tombstone(self, event_id: str, reason: str, replacement_id: str | None = None) -> bool:
         return self.belief_revision_service.tombstone_event(

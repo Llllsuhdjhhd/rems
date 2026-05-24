@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from rems.config import REMSConfig
 from rems.pipeline import REMSPipeline
-from .conftest import FakeEmbeddingFunction
+from tests.conftest import FakeEmbeddingFunction
 
 
 class TestPipelineConstruction:

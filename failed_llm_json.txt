@@ -1,0 +1,14 @@
+{
+"character": "REMS",
+    "core": {
+        "age": "未知",
+        "gender": "女",
+        "occupation": "未知"
+    },
+    "personality": {
+        "bias": "无明显倾向",
+        "trait": "神秘、平静、智慧"
+    },
+    "location": "未知",
+   : "status": "未知"
+}
