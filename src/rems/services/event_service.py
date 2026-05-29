@@ -15,8 +15,11 @@ from ..models.role import Role
 from ..skills.event_enrichment import EnrichmentResult, EventEnrichmentSkill
 from ..skills.role_extraction import ExtractedRole, RoleExtractionSkill
 from ..storage.repository import EventRepository
+from ..storage.tier1_store import Tier1Store
 from ..storage.vector_store import VectorStore
+from ..strategies.event_weight import EventWeightDeriver
 from .emotion_service import EMAEvolver
+from .role_service import RoleService
 
 logger = logging.getLogger(__name__)
 
@@ -39,16 +42,18 @@ class EventService:
         enrichment_skill: EventEnrichmentSkill,
         role_service: RoleService | None = None,
         emotion_evolver: EMAEvolver | None = None,
+        tier1_store: Tier1Store | None = None,
+        event_weight: EventWeightDeriver | None = None,
     ):
         self._config = config
         self._llm = llm
         self._event_repo = event_repo
         self._vector = vector_store
-        # 一次 LLM 调用同时产出摘要 + 角色（替代原 summary_skill + role_skill 二次调用）。
         self._enrichment_skill = enrichment_skill
         self._role_service = role_service
-        # 可选：若传入 EMAEvolver，则在封存前做情感动态演化并计算 activation_energy（白皮书 2.5）。
         self._emotion_evolver = emotion_evolver
+        self._tier1 = tier1_store
+        self._event_weight = event_weight
 
     # ------------------------------------------------------------------
     def seal_event(
@@ -219,8 +224,17 @@ class EventService:
             except Exception:
                 logger.debug("EMA evolution skipped due to error", exc_info=True)
 
+        # §4.7.3 PTSD 免死金牌
+        threshold = self._config.lifecycle.ptsd_arousal_threshold
+        if any(entry.emotional_model.arousal > threshold for entry in event.role_list):
+            event.ptsd_immune = True
+
         self._event_repo.save(event)
         self._index_event(event)
+        if self._tier1 is not None and self._event_weight is not None:
+            w_i = self._event_weight.derive_wi(event)
+            asf = self._tier1.get_asf(event.event_id)
+            self._tier1.upsert_tier1(event.event_id, w_i=w_i, asf_i=asf)
 
         logger.info(
             "Sealed event %s (%d chars, %d roles, ratio=%.4f)",
@@ -257,20 +271,18 @@ class EventService:
             return ""
 
     def _index_event(self, event: Event) -> None:
-        # 检索主键采用「默认档」（mid 级摘要），与回忆块展示默认档位对齐，
-        # 避免索引/展示粒度错位（白皮书 §4.4）。若无摘要则退回原文。
+        if hasattr(self._vector, "upsert_event_vectors"):
+            self._vector.upsert_event_vectors(event)
+            return
         index_text = event.summaries.get(event.mid_summary_key, event.content_raw)
         metadata: dict = {
             "is_abstract": event.is_abstract,
             "status": event.status.value,
             "event_length": event.event_length,
-            # 白皮书 §4.4 70/30 分层依赖按时间过滤：以 POSIX 秒存为标量，方便 $gte/$lt 比较。
             "create_time": event.create_time.timestamp(),
         }
         if event.role_list:
             metadata["role_ids"] = ",".join(r.role_id for r in event.role_list)
-            # 角色白名单标志位：``role_<id>: True`` 让 70/30 分层用 $or 多角色等值匹配
-            # （Chroma 不支持对 metadata 做 $contains，必须用标量等值；详见 vector_store._sanitize_metadata）。
             for r in event.role_list:
                 metadata[f"role_{r.role_id}"] = True
         self._vector.add_event(event.event_id, index_text, metadata)

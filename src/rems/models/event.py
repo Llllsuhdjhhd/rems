@@ -196,6 +196,11 @@ class Event(BaseModel):
     # 回忆时 RecallService 会在命中本事件后自动把这些前缀事件拉进回忆块（允许降档压缩，但不丢弃）。
     split_prefix_event_ids: list[str] = Field(default_factory=list)
 
+    # §4.7.3 情感极值免死金牌：禁止摘要降级与 ASF 遮蔽。
+    ptsd_immune: bool = False
+    # 事件来源：normal / dream 等（§4.7.2 梦境演化不写 recall_log）。
+    origin: str = "normal"
+
     def model_post_init(self, __context: object) -> None:
         if not self.event_length:
             self.event_length = len(self.content_raw)

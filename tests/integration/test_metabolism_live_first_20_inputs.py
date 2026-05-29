@@ -196,7 +196,7 @@ def _isolated_config(tmp_path: Path) -> REMSConfig:
         update={
             "storage": StorageConfig(
                 database_url=f"sqlite:///{db_path.as_posix()}",
-                chromadb_path=str(chroma_path),
+                qdrant_path=str(chroma_path),
             ),
         },
     )

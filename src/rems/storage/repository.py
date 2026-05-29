@@ -53,6 +53,8 @@ class EventRepository:
                 abstract_coverage=float(getattr(event, "abstract_coverage", 0.0) or 0.0),
                 split_successor_event_ids=list(event.split_successor_event_ids or []),
                 split_prefix_event_ids=list(event.split_prefix_event_ids or []),
+                ptsd_immune=bool(getattr(event, "ptsd_immune", False)),
+                origin=getattr(event, "origin", "normal") or "normal",
             )
             s.merge(record)
             s.commit()
@@ -248,6 +250,8 @@ class EventRepository:
             abstract_coverage=float(getattr(r, "abstract_coverage", 0.0) or 0.0),
             split_successor_event_ids=list(getattr(r, "split_successor_event_ids", None) or []),
             split_prefix_event_ids=list(getattr(r, "split_prefix_event_ids", None) or []),
+            ptsd_immune=bool(getattr(r, "ptsd_immune", False)),
+            origin=getattr(r, "origin", "normal") or "normal",
         )
 
 
@@ -537,6 +541,18 @@ class RecallLogRepository:
         with self._db.session() as s:
             rows = s.query(RecallLogRecord).order_by(RecallLogRecord.created_at).all()
             return [(r.recall_id, list(r.event_ids or [])) for r in rows]
+
+    def list_recent_transactions(self, k: int) -> list[tuple[frozenset[str], datetime]]:
+        """Return recent recall transactions with timestamps for decayed support."""
+        with self._db.session() as s:
+            rows = (
+                s.query(RecallLogRecord)
+                .order_by(RecallLogRecord.created_at.desc())
+                .limit(max(1, k))
+                .all()
+            )
+            rows.reverse()
+            return [(frozenset(r.event_ids or []), r.created_at) for r in rows if r.event_ids]
 
     def replace_subset(self, subset: set[str], abstract_event_id: str) -> int:
         """For every recall log row whose id set ⊇ *subset*, remove *subset* and add *abstract_event_id*.

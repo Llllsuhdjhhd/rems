@@ -17,6 +17,7 @@ from ..models.metabolism import Shadow, UnclosedEvent
 from ..models.role import Role
 from ..services.event_service import EventService
 from ..skills.boundary_detection import BoundaryDetectionSkill, BoundaryResult
+from ..skills.shadow_compaction import ShadowCompactionSkill
 from ..skills.boundary_split import (
     BoundaryForceThresholdEvaluator,
     BoundarySkillContext,
@@ -59,12 +60,14 @@ class MetabolismService:
         event_repo: EventRepository | None = None,
         boundary_evaluators: list[SkillEvaluator] | None = None,
         boundary_remediator: SkillRemediator | None = None,
+        shadow_compaction: ShadowCompactionSkill | None = None,
     ):
         self._config = config
         self._repo = meta_repo
         self._boundary = boundary_skill
         self._event_svc = event_service
         self._event_repo = event_repo
+        self._shadow_compaction = shadow_compaction
         # 默认评估链：仅规则型评估器（零 LLM 成本，始终开）。LLM 二级评估默认关。
         self._boundary_evaluators: list[SkillEvaluator] = (
             boundary_evaluators
@@ -88,6 +91,7 @@ class MetabolismService:
         *,
         event_repo: EventRepository | None = None,
         llm=None,
+        shadow_compaction: ShadowCompactionSkill | None = None,
     ) -> "MetabolismService":
         """Construct a service wired with the default evaluator + split remediator.
 
@@ -97,12 +101,12 @@ class MetabolismService:
         """
         evaluators: list[SkillEvaluator] = [BoundaryForceThresholdEvaluator(config)]
         remediator: SkillRemediator | None = None
+        llm_for_split = llm if llm is not None else getattr(boundary_skill, "_llm", None)
         if config.boundary_remediation_enabled:
-            # BoundaryDetectionSkill 的 _llm 是其唯一公共/半公共属性；为了不产生新的
-            # 公开 getter，优先使用外部显式传入的 llm，否则回退到 skill 内嵌的那个。
-            llm_for_split = llm if llm is not None else getattr(boundary_skill, "_llm")
             split_skill = OverlongUCSplitSkill(llm_for_split, config)
             remediator = OverlongUCSplitRemediator(split_skill)
+        if shadow_compaction is None and llm_for_split is not None:
+            shadow_compaction = ShadowCompactionSkill(llm_for_split, config)
         return cls(
             config,
             meta_repo,
@@ -111,6 +115,7 @@ class MetabolismService:
             event_repo=event_repo,
             boundary_evaluators=evaluators,
             boundary_remediator=remediator,
+            shadow_compaction=shadow_compaction,
         )
 
     # ------------------------------------------------------------------
@@ -312,6 +317,7 @@ class MetabolismService:
         new_shadow_content = "\n".join(ue.merged_content for ue in final_unclosed)
         self._repo.update_shadow(Shadow(content=new_shadow_content, updated_at=datetime.now()))
 
+        self._maybe_shadow_compact(final_unclosed)
         self._check_physical_redline()
 
         return sealed
@@ -373,6 +379,18 @@ class MetabolismService:
         return sealed
 
     # ------------------------------------------------------------------
+    def _maybe_shadow_compact(self, unclosed: list[UnclosedEvent]) -> None:
+        """Rewrite fragmented unclosed narratives when fragment count exceeds threshold (§4.2.2)."""
+        skill = self._shadow_compaction
+        if skill is None or not skill.should_compact(unclosed):
+            return
+        for ue in unclosed:
+            compacted = skill.compact(ue.merged_content)
+            if compacted != ue.merged_content:
+                ue.merged_content = compacted
+                self._repo.save_unclosed_event(ue)
+                logger.info("Shadow-compacted unclosed %s", ue.id)
+
     def _check_physical_redline(self) -> None:
         """If shadow + unclosed exceed physical redline, force-compact.
 

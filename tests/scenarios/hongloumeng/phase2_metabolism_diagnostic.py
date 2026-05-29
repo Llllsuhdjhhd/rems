@@ -31,7 +31,7 @@ def run_phase2_diagnostic(chunk_idx: int):
     config = REMSConfig(
         storage=StorageConfig(
             database_url=f"sqlite:///{base_dir}/rems_sim.db",
-            chromadb_path=str(base_dir / "chroma_sim")
+            qdrant_path=str(base_dir / "qdrant_sim")
         ),
         embedding={"provider": "hash"},
         user_mode=UserMode.MULTI

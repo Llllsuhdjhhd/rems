@@ -52,7 +52,7 @@ def isolated_config(tmp_path: Path, **updates) -> REMSConfig:
     chroma_path = root / "chroma_wp_live"
     storage = StorageConfig(
         database_url=f"sqlite:///{db_path.as_posix()}",
-        chromadb_path=str(chroma_path),
+        qdrant_url=":memory:",
     )
     return base.model_copy(update={"storage": storage, **updates})
 
@@ -71,11 +71,9 @@ def build_pipeline(
     require_live_llm_api_key(cfg)
     notes: list[str] = []
     if fake_embedding_escape_enabled():
-        with patch("rems.storage.vector_store.SentenceTransformerEmbeddingFunction") as mock_ef:
-            mock_ef.return_value = FakeEmbeddingFunction()
-            pipeline = REMSPipeline.from_config(cfg)
+        cfg.embedding.provider = "hash"
         notes.append(
-            "**Chroma 嵌入**: 假向量（`REMS_LIVE_ALLOW_FAKE_EMBEDDING=1`），语义检索质量不保证。"
+            "**Qdrant 嵌入**: hash 向量（`REMS_LIVE_ALLOW_FAKE_EMBEDDING=1`），语义检索质量不保证。"
         )
     else:
         torch_ok, torch_msg = probe_torch()
@@ -85,8 +83,8 @@ def build_pipeline(
                 f"{torch_msg}\n"
                 "请改用可用 torch 的环境，或设置 `REMS_LIVE_ALLOW_FAKE_EMBEDDING=1`。"
             )
-        pipeline = REMSPipeline.from_config(cfg)
-        notes.append(f"**Chroma 嵌入**: `{cfg.embedding.model_name}`（{torch_msg}）")
+        notes.append(f"**Qdrant 嵌入**: `{cfg.embedding.model_name}`（{torch_msg}）")
+    pipeline = REMSPipeline.from_config(cfg)
     return pipeline, cfg, notes
 
 

@@ -16,7 +16,7 @@ def tmp_dir(tmp_path):
 def config(tmp_dir):
     cfg = REMSConfig()
     cfg.storage.database_url = f"sqlite:///{tmp_dir}/test.db"
-    cfg.storage.chromadb_path = ""  # Use in-memory for tests
+    cfg.storage.qdrant_url = ":memory:"
     cfg.embedding.provider = "hash"  # Use deterministic hash to avoid downloading models
     return cfg
 
@@ -59,3 +59,16 @@ class FakeEmbeddingFunction:
         return [[0.1] * 128 for _ in input]
     def embed_query(self, text):
         return [0.1] * 128
+
+
+@pytest.fixture
+def vector_store(config, db):
+    from rems.embedding.tri_band import TriBandEncoder
+    from rems.storage.repository import EventRepository, RoleRepository
+    from rems.storage.vector_store import VectorStore
+
+    event_repo = EventRepository(db)
+    role_repo = RoleRepository(db)
+    vs = VectorStore(config)
+    vs.set_tri_band(TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo))
+    return vs

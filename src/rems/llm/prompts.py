@@ -598,10 +598,12 @@ EVOLUTION_SYSTEM = """\
 你是 REMS 抽象事件压缩组件。输入是若干基本事件的 content_raw 及其角色线索（仅用于辅助保留主体）。
 
 硬性约束：
-- 输出 JSON 仅包含用户消息末尾 schema 所列字段（勿自行添加其它键）。
-- `content_raw` 是若干基本事件融合后的事实性压缩，保留核心人物、动作、对象与因果线；不是口号式的泛化摘要，也不是事件清单。
-- **`content_raw` 字数目标：约 {target_content_len} 字**（当前证据共 **{leaf_count}** 条叶子事件，各条 `content_raw` 长度均值约 **{leaf_avg_len} 字**，由后端按「均值 × 1.2」取整得到前一数字；可略浮动，勿显著缩水以致因果残缺，勿堆砌冗余）。
-- 角色线索只用于帮助保持主体清晰，不要将线索中的角色快照、情感等带进 content_raw。
+- 首先仲裁这些事件之间的认知拓扑关系，从下列常量中选一：CAUSALITY、PROTOTYPE_INVARIANT、TEMPORAL_CHRONO、COGNITIVE_DIALECTIC、MERONYMY、NONE。
+- 若关系为 NONE（纯属巧合共现），仍输出 JSON，但 cognitive_relation 必须为 "NONE"，content_raw 可为空字符串。
+- 若关系非 NONE，输出 `content_raw` 及（若要求）`insight`。
+- `shadow_lambda` ∈ [0,1]：高阶抽象对底层事实的覆写强度（1=强遮蔽，0=无遮蔽）。
+- `content_raw` 字数目标约 {target_content_len} 字（证据 {leaf_count} 条，均值约 {leaf_avg_len} 字）。
+- 抽象事件 role_list 恒为空；角色线索仅辅助压缩，勿输出角色对象。
 
 输出严格 JSON。
 """

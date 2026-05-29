@@ -25,6 +25,8 @@ def test_uses_basic_content_raw_and_role_context():
     config = REMSConfig()
     llm = _DummyJSONLLM(
         {
+            "cognitive_relation": "CAUSALITY",
+            "shadow_lambda": 0.5,
             "content_raw": "张三多次围绕项目进度协调风险、里程碑与测试计划。",
             "insight": "SHOULD_BE_IGNORED_WHEN_DISABLED",
         }
@@ -42,7 +44,7 @@ def test_uses_basic_content_raw_and_role_context():
         ],
     )
 
-    abstract = skill.synthesize([event])
+    outcome = skill.synthesize([event])
     assert llm.last_messages is not None
     user_prompt = llm.last_messages[1]["content"]
 
@@ -50,31 +52,47 @@ def test_uses_basic_content_raw_and_role_context():
     assert "张三在会议室讨论项目进度：梳理风险清单。" in user_prompt
     assert "摘要不应作为抽象输入" not in user_prompt
     assert "ROL-zhangsan" in user_prompt
-    assert abstract.insight is None
+    assert outcome.event is not None
+    assert outcome.event.insight is None
+    assert outcome.event.role_list == []
 
 
 def test_abstract_insight_switch():
     config = REMSConfig(enable_abstract_insight=True)
     llm = _DummyJSONLLM(
         {
+            "cognitive_relation": "TEMPORAL_CHRONO",
+            "shadow_lambda": 0.3,
             "content_raw": "张三多次围绕项目进度协调风险、里程碑与测试计划。",
-            "insight": "张三倾向通过连续会议推进不确定事项。",
+            "insight": {"relation": "TEMPORAL_CHRONO", "conclusion": "张三倾向通过连续会议推进不确定事项。"},
         }
     )
     skill = InductiveEvolutionSkill(llm, config)
     event = Event(content_raw="张三在会议室讨论项目进度。")
 
-    abstract = skill.synthesize([event])
+    outcome = skill.synthesize([event])
     assert llm.last_messages is not None
     user_prompt = llm.last_messages[1]["content"]
 
     assert "`insight`：开启" in user_prompt
-    assert abstract.insight == "张三倾向通过连续会议推进不确定事项。"
+    assert outcome.event is not None
+    assert "张三倾向通过连续会议推进不确定事项。" in (outcome.event.insight or "")
+
+
+def test_none_relation_rejects_synthesis():
+    config = REMSConfig()
+    llm = _DummyJSONLLM({"cognitive_relation": "NONE", "shadow_lambda": 0.0, "content_raw": "x"})
+    skill = InductiveEvolutionSkill(llm, config)
+    outcome = skill.synthesize([Event(content_raw="a")])
+    assert outcome.rejected_none is True
+    assert outcome.event is None
 
 
 def test_target_content_len_is_1_2x_average():
     config = REMSConfig()
-    llm = _DummyJSONLLM({"content_raw": "抽象事件"})
+    llm = _DummyJSONLLM(
+        {"cognitive_relation": "CAUSALITY", "shadow_lambda": 0.5, "content_raw": "抽象事件"}
+    )
     skill = InductiveEvolutionSkill(llm, config)
     events = [
         Event(content_raw="a" * 10),

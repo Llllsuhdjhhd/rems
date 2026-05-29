@@ -74,9 +74,35 @@ class EmbeddingConfig(BaseModel):
 
 
 class StorageConfig(BaseModel):
-    # 关系型数据（事件/角色/代谢状态）与 Chroma 向量持久化路径。
+    # 关系型数据（事件/角色/代谢状态）与 Qdrant 向量库。
     database_url: str = "sqlite:///rems.db"
-    chromadb_path: str = "./chroma_data"
+    qdrant_url: str = ":memory:"
+    qdrant_collection: str = "rems_events"
+    qdrant_path: str | None = None
+
+
+class Tier1Config(BaseModel):
+    active_pool_base: int = 100_000
+    active_pool_min: int = 20_000
+    sample_key_refresh_interval_s: int = 3600
+
+
+class TriBandConfig(BaseModel):
+    vector_dim_act: int = 512
+    vector_dim_emo: int = 512
+    vector_dim_ent: int = 512
+    weight_fact: tuple[float, float, float] = (0.7, 0.1, 0.2)
+    weight_emotion: tuple[float, float, float] = (0.2, 0.6, 0.2)
+    weight_entity: tuple[float, float, float] = (0.1, 0.0, 0.9)
+
+
+class LifecycleConfig(BaseModel):
+    bypass_confidence_threshold: float = 0.5
+    bypass_rate_limit_per_minute: int = 1
+    ptsd_arousal_threshold: float = 0.8
+    dream_enabled: bool = False
+    dream_batch_size: int = 5
+    shadow_compaction_fragment_threshold: int = 8
 
 
 class REMSConfig(BaseSettings):
@@ -95,6 +121,9 @@ class REMSConfig(BaseSettings):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    tier1: Tier1Config = Field(default_factory=Tier1Config)
+    tri_band: TriBandConfig = Field(default_factory=TriBandConfig)
+    lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
 
     # ---- Recall: role-aware summary tier selection (白皮书 4.4 Lazy Index) ----
     # 默认召回摘要起点：0 = 中间级（mid），-N = 向 L1 偏移 N 档（更精细），+N = 向最高级偏移 N 档（更压缩）。
@@ -121,6 +150,9 @@ class REMSConfig(BaseSettings):
     # 合成成功后 ``replace_subset`` 会改写 ``recall_log``；若继续沿用本轮开始时算出的候选与支持度，
     # 可能对「已被替换掉的基本事件」仍尝试合成（过时统计）。默认在每次成功抽象后基于最新日志重新挖掘。
     abstract_mining_max_refresh_rounds: int = 256
+    abstract_mining_recent_k: int = 1000
+    abstract_mining_min_recent_k: int = 200
+    abstract_support_decay_lambda: float = 0.01
     abstract_subset_min_size: int = 6
     abstract_subset_min_support: int = 12
     # 单次 ``mine_and_synthesize`` 内已成功抽象的条数 **>** 该阈值后，后续刷新轮改用更高的最小支持度（默认 >2 即从第 4 条起收紧）。
@@ -282,9 +314,14 @@ class REMSConfig(BaseSettings):
     )
     # load_factor 的硬上限，避免极端尖峰把下游阈值放大到无意义的程度。
     perf_load_factor_max: float = 4.0
-    # 满载（load_factor=perf_load_factor_max）时，把 forgetting_silence_threshold 在原值基础上
-    # 放大的最大倍数；中间按线性插值。1.0 表示完全不联动；2.0 表示满载时阈值翻倍。
+    # Deprecated: 2026.06 双通道 PerfMonitor 不再用 load_factor 抬高静默阈值。
     forgetting_overload_silence_boost: float = 4.0
+    perf_recall_phases: list[str] = Field(
+        default_factory=lambda: ["rag_search", "recall_assembly"],
+    )
+    perf_abstract_phases: list[str] = Field(
+        default_factory=lambda: ["abstraction_mining", "narrative_dedupe"],
+    )
 
     # ---- Narrative-line dedupe for abstract events (覆盖 is_fired / replace_subset 之间的灰区) ----
     # 默认关闭。开启后：已存在的"完全包含"去重仍在 replace_subset 里完成；本项专门拦

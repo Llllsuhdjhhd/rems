@@ -56,6 +56,22 @@ class EventRecord(Base):
     # 80/20 强制分裂链路（2026-05）：前后向指针，回忆时用来把前缀事件拉进回忆块。
     split_successor_event_ids = Column(JSON, default=list)
     split_prefix_event_ids = Column(JSON, default=list)
+    ptsd_immune = Column(Boolean, default=False)
+    origin = Column(String, default="normal")
+
+
+class EventTier1Record(Base):
+    """Tier-1 active pool metadata: A-Res sample_key + ASF (§4.5)."""
+
+    __tablename__ = "event_tier1"
+
+    event_id = Column(String, ForeignKey("events.event_id"), primary_key=True)
+    sample_key = Column(Float, nullable=False, default=0.0, index=True)
+    sample_u = Column(Float, nullable=False, default=0.5)
+    asf_i = Column(Float, nullable=False, default=0.0)
+    w_i_cached = Column(Float, nullable=False, default=0.0)
+    w_eff_cached = Column(Float, nullable=False, default=0.0)
+    updated_at = Column(DateTime, nullable=False)
 
 
 class RoleRecord(Base):
@@ -192,6 +208,8 @@ class Database:
                 ("split_successor_event_ids", "TEXT DEFAULT '[]'"),
                 ("split_prefix_event_ids", "TEXT DEFAULT '[]'"),
                 ("abstract_coverage", "FLOAT DEFAULT 0.0"),
+                ("ptsd_immune", "BOOLEAN DEFAULT 0"),
+                ("origin", "TEXT DEFAULT 'normal'"),
             ],
             "unclosed_events": [
                 ("split_prefix_event_ids", "TEXT DEFAULT '[]'"),

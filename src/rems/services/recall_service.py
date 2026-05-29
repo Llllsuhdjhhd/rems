@@ -19,8 +19,13 @@ from ..strategies.recall import (
 )
 from ..strategies.forgetting import DefaultWhitePaintingRetentionStrategy
 from ..storage.repository import EventRepository, RoleRepository
+from ..embedding.tri_band import TriBandEncoder
+from ..skills.recall_intent import RecallIntentClassifier
+from ..storage.active_pool_cache import ActivePoolCache
+from ..strategies.event_weight import EventWeightDeriver
 from ..storage.vector_store import VectorStore
 
+from .recall_bypass import RecallBypassController
 from .recall_quality import RecallQualityController
 
 logger = logging.getLogger(__name__)
@@ -53,6 +58,11 @@ class RecallService:
         summary_tier_policy: SummaryTierPolicy | None = None,
         perf_monitor: PerfMonitor | None = None,
         recall_quality: RecallQualityController | None = None,
+        active_pool_cache: ActivePoolCache | None = None,
+        tri_band: TriBandEncoder | None = None,
+        event_weight: EventWeightDeriver | None = None,
+        intent_classifier: RecallIntentClassifier | None = None,
+        bypass_controller: RecallBypassController | None = None,
     ):
         self._config = config
         self._event_repo = event_repo
@@ -60,10 +70,17 @@ class RecallService:
         self._vector = vector_store
         self._scoring_strategy = scoring_strategy or DefaultRecallScoringStrategy(config)
         self._summary_tier_policy = summary_tier_policy or DefaultSummaryTierPolicy(config)
-        # 把 perf_monitor 同时透给 forgetting strategy，让"白描静默阈值"也按系统负载动态收紧。
         self._perf = perf_monitor
         self._forgetting_strategy = DefaultWhitePaintingRetentionStrategy(config, perf_monitor=perf_monitor)
         self._recall_quality = recall_quality
+        self._active_pool = active_pool_cache
+        self._tri_band = tri_band
+        self._event_weight = event_weight
+        self._intent = intent_classifier or RecallIntentClassifier(config)
+        self._bypass = bypass_controller or RecallBypassController(
+            confidence_threshold=config.lifecycle.bypass_confidence_threshold,
+            rate_limit_per_minute=config.lifecycle.bypass_rate_limit_per_minute,
+        )
         # 单次 build_recall_block 内对流 A/B 距离过滤的有效 cap（分位帽 ∩ EMA 帽）；None = 本条不额外收紧。
         self._stream_distance_cap_effective: float | None = None
         # 最近一轮回忆拼装用的分位帽/EMA/effective（供诊断）；每次 _prepare_* 覆盖。
@@ -158,78 +175,61 @@ class RecallService:
         # 实际工程中可异步执行，此处为确保逻辑闭环，对检索到的潜在命中做实时校验。
 
         # ========================================================
-        # Dual-Stream Hybrid Recall (白皮书 §4.4)
+        # Tri-band unified retrieval (§4.4.0)
         # ========================================================
-        # 关键修复（P1-7）：流 A / 流 B 在阶段 1 只持有"原始距离"，**不**与 time_decay /
-        # role_boost / arousal 等绝对量混合。Rank 直接来自按距离的升序排位；
-        # time_decay 与角色重要性、情感共振等修饰统一在阶段 2 的 RRF * Factor * Mood 里施加。
-        # 这样才符合白皮书"摒弃绝对值、用名次驱动"的设计目的。
+        intent = self._intent.classify(search_text)
+        pool_limit = self._config.tier1.active_pool_base
+        if self._perf is not None:
+            pool_limit = self._perf.adjusted_active_pool_limit(
+                self._config.tier1.active_pool_base,
+                self._config.tier1.active_pool_min,
+            )
+        active_ids: list[str] | None = None
+        if self._active_pool is not None:
+            active_ids = self._active_pool.fetch(pool_limit)
 
-        # Stream A / B: 双流原始向量 distance 池化 → 分位帽（可选）∩ EMA 帽 → 过滤后再进 RRF。
-        b_query = search_text
-        if focus_role_entries:
-            snapshot_texts: list[str] = []
-            for r in focus_role_entries:
-                if r.role_snapshot.l2_interaction:
-                    snapshot_texts.append(r.role_snapshot.l2_interaction)
-                elif r.role_snapshot.l1_mention:
-                    snapshot_texts.append(r.role_snapshot.l1_mention)
-            if snapshot_texts:
-                b_query += "\n" + "\n".join(snapshot_texts)
+        query_vec = None
+        if self._tri_band is not None:
+            valence = self._current_query_valence(focus_role_entries or [])
+            query_vec = self._tri_band.encode_query(search_text, valence=valence)
 
-        hits_a_raw = self._get_stream_a_hits(search_text, focus_role_ids or set())
-        hits_b_raw = self._get_stream_b_hits(b_query)
-        self._prepare_stream_distance_cap_from_hits(hits_a_raw, hits_b_raw)
-        try:
-            hits_a = self._filter_hits_semantic_distance(hits_a_raw)
-            hits_b = self._filter_hits_semantic_distance(hits_b_raw)
-        finally:
-            self._clear_stream_distance_cap_scope()
+        hits: list[dict] = []
+        if query_vec is not None:
+            hits = self._vector.search_tri_band(
+                query_vec,
+                weights=intent.weights,
+                filter_ids=active_ids,
+                n_results=60,
+            )
+            max_score = max((h.get("score", 0.0) for h in hits), default=0.0)
+            if self._bypass.should_bypass(max_score) and query_vec is not None:
+                hits = self._vector.search_tri_band(
+                    query_vec,
+                    weights=intent.weights,
+                    filter_ids=None,
+                    n_results=60,
+                    bypass_filter=True,
+                )
+        else:
+            hits = self._vector.search(search_text, n_results=60)
 
-        stream_a: dict[str, tuple[Event, float]] = {}
-        for hit in hits_a:
-            event = self._event_repo.get(hit["event_id"])
+        stream: dict[str, tuple[Event, float, float]] = {}
+        for hit in hits:
+            eid = hit.get("event_id")
+            if not eid:
+                continue
+            event = self._event_repo.get(eid)
             if event is None or event.is_tombstoned or event.status.value == "silent":
                 continue
-
-            # 集体遗忘检查：若事件关联的所有角色遗忘因子均低于阈值，则静默该事件
             if self._check_and_silence_event(event):
                 continue
-
             distance = float(hit.get("distance", 1.0))
-            stream_a[event.event_id] = (event, distance)
+            eff_w = 0.0
+            if self._event_weight is not None:
+                eff_w = self._event_weight.derive_wi(event)
+            stream[eid] = (event, distance, eff_w)
 
-        # Stream B：白描（角色）反向激活（过滤后的 hit distance 仍为向量库原始语义距）。
-        # effective_distance = distance / max(effective_forgetting, eps)，让遗忘惩罚作用于排位本身。
-        stream_b: dict[str, tuple[Event, float, float]] = {}
-        for hit in hits_b:
-            wp_id = hit["wp_id"]
-            try:
-                role_id, event_id = wp_id.split("::")
-            except ValueError:
-                continue
-
-            event = self._event_repo.get(event_id)
-            if event is None or event.is_tombstoned or event.status.value == "silent":
-                continue
-
-            wp_entry = self._role_repo.get_white_painting_by_event(role_id, event_id)
-            if not wp_entry:
-                continue
-
-            f_score = self._forgetting_strategy.score(wp_entry, is_penalized=True)
-            if f_score.is_silenced:
-                continue
-
-            distance = float(hit.get("distance", 1.0))
-            # 用遗忘因子拉近/拉远名次：高 effective_forgetting → 距离更近（排位前移）。
-            effective_distance = distance / max(f_score.effective_forgetting, 1e-3)
-
-            existing = stream_b.get(event_id)
-            if existing is None or existing[1] > effective_distance:
-                stream_b[event_id] = (event, effective_distance, f_score.effective_forgetting)
-
-        scored_events = self._rrf_merge(stream_a, stream_b, focus_role_entries or [])
+        scored_events = self._single_stream_score(stream, focus_role_entries or [])
         decay = self._config.abstract_coverage_decay_rate
         if decay > 0:
             scored_events = [
@@ -279,6 +279,26 @@ class RecallService:
                     self._role_repo.update_white_painting_access(role_entry.role_id, event.event_id, new_factor)
 
         return block
+
+    def _single_stream_score(
+        self,
+        stream: dict[str, tuple[Event, float, float]],
+        focus_role_entries: list["EventRoleEntry"],
+    ) -> list[tuple[Event, float]]:
+        """Single-stream rank + Factor/Mood modifiers (§4.4, stream B abolished)."""
+        sorted_items = sorted(stream.items(), key=lambda x: x[1][1])
+        rank_map = {eid: idx + 1 for idx, (eid, _) in enumerate(sorted_items)}
+        current_valence = self._current_query_valence(focus_role_entries)
+        k = self._config.recall_rrf_k
+        merged: list[tuple[Event, float]] = []
+        for eid, (event, _dist, eff_w) in stream.items():
+            rrf = 1.0 / (k + rank_map.get(eid, len(stream) + 1))
+            factor_modifier = 1.0 + self._config.recall_factor_alpha * math.log10(
+                1.0 + max(eff_w, 0.0)
+            )
+            mood_modifier = self._mood_modifier(event.event_valence, current_valence)
+            merged.append((event, rrf * factor_modifier * mood_modifier))
+        return sorted(merged, key=lambda x: x[1], reverse=True)[:60]
 
     def _rrf_merge(
         self,

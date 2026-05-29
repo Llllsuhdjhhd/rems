@@ -19,7 +19,9 @@ from rems.storage.repository import (
     AbstractedSubsetRepository,
     EventRepository,
     RecallLogRepository,
+    RoleRepository,
 )
+from rems.embedding.tri_band import TriBandEncoder
 from rems.storage.vector_store import VectorStore
 
 from .conftest import FakeLLM
@@ -34,6 +36,8 @@ def abstraction_env(config: REMSConfig, db: Database, fake_llm: FakeLLM, tmp_dir
 
     event_repo = EventRepository(db)
     vector_store = VectorStore(config)
+    tri_band = TriBandEncoder(config, event_repo=event_repo, role_repo=RoleRepository(db))
+    vector_store.set_tri_band(tri_band)
     recall_log_repo = RecallLogRepository(db)
     fired_repo = AbstractedSubsetRepository(db)
     evolution_skill = InductiveEvolutionSkill(fake_llm, config)
@@ -54,7 +58,7 @@ def abstraction_env(config: REMSConfig, db: Database, fake_llm: FakeLLM, tmp_dir
 def _save_event(event_repo: EventRepository, vector_store: VectorStore, content: str) -> Event:
     e = Event(content_raw=content, summaries={"L1": content[:30]})
     event_repo.save(e)
-    vector_store.add_event(e.event_id, e.content_raw, {"is_abstract": False})
+    vector_store.upsert_event_vectors(e)
     return e
 
 
@@ -89,6 +93,8 @@ class TestMineAndSynthesize:
 
         # InductiveEvolutionSkill.synthesize 期望的字段（白皮书 §3.1）。
         fake_llm.push_response({
+            "cognitive_relation": "CAUSALITY",
+            "shadow_lambda": 0.5,
             "content_raw": "张三多次参与项目进度会议",
             "insight": "张三对项目进度高度关注",
         })
@@ -110,7 +116,12 @@ class TestMineAndSynthesize:
         for k in range(3):
             recall_log_repo.append(recall_id=f"RCL-{k}", event_ids=common)
 
-        fake_llm.push_response({"content_raw": "abstract", "insight": ""})
+        fake_llm.push_response({
+            "cognitive_relation": "CAUSALITY",
+            "shadow_lambda": 0.5,
+            "content_raw": "abstract",
+            "insight": "",
+        })
         for _ in range(5):
             fake_llm.push_response({"summary": "s", "char_count": 1})
 
@@ -121,7 +132,8 @@ class TestMineAndSynthesize:
         second = svc.mine_and_synthesize()
         assert second == []
 
-    def test_coherence_replaces_only_coherent_subset(self, abstraction_env):
+    def test_coherence_flag_does_not_block_merged_synthesis(self, abstraction_env):
+        """2026.06: narrative coherence is merged into synthesize(); no pre-filter gate."""
         svc, event_repo, vector_store, recall_log_repo, fake_llm = abstraction_env
         svc._config.abstract_narrative_coherence_enabled = True
         svc._config.abstract_narrative_coherence_min_count = 2
@@ -140,25 +152,15 @@ class TestMineAndSynthesize:
                 event_ids=sorted(row_ids),
             )
 
-        fake_llm.push_response(
-            {
-                "coherent_event_ids": [e0.event_id, e1.event_id],
-                "excluded_event_ids": [e2.event_id],
-                "narrative_label": "张三线",
-            }
-        )
-        fake_llm.push_response({"content_raw": "相干两条合并", "insight": ""})
+        fake_llm.push_response({
+            "cognitive_relation": "CAUSALITY",
+            "shadow_lambda": 0.5,
+            "content_raw": "三条合并",
+            "insight": "",
+        })
         for _ in range(5):
             fake_llm.push_response({"summary": "short", "char_count": 6})
 
         created = svc.mine_and_synthesize()
         assert len(created) == 1
-        abs_id = created[0].event_id
-        assert set(created[0].source_events) == {e0.event_id, e1.event_id}
-
-        logs = recall_log_repo.list_all()
-        for _rid, ids in logs:
-            assert e0.event_id not in ids
-            assert e1.event_id not in ids
-            assert abs_id in ids
-            assert e2.event_id in ids
+        assert set(created[0].source_events) == set(miner_core)

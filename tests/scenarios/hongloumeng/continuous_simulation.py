@@ -243,7 +243,7 @@ def run_continuous_simulation(num_chunks_to_process=3):
     config = REMSConfig(
         storage=StorageConfig(
             database_url=f"sqlite:///{db_path}",
-            chromadb_path=str(chroma_path)
+            qdrant_path=str(chroma_path)
         ),
         embedding={"provider": "hash"},
         user_mode=UserMode.MULTI

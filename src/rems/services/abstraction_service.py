@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 # 抽象事件：唯一触发路径 = 回忆块 event_id 集合中的频繁子集挖掘（白皮书 §3.2）。
 # - 子集大小 >= abstract_subset_min_size（默认 6，可配置）
@@ -15,7 +16,8 @@ from ..models.event import CompressionBudget, Event
 from ..observability import PerfMonitor
 from ..strategies.abstraction import AbstractionEvidencePolicy, LeafContentRawEvidencePolicy
 from ..skills.event_enrichment import EventEnrichmentSkill
-from ..skills.inductive_evolution import InductiveEvolutionSkill
+from ..mining.closed_itemsets import mine_closed_frequent_itemsets
+from ..skills.inductive_evolution import InductiveEvolutionSkill, SynthesisOutcome
 from ..skills.summary_generation import SummaryGenerationSkill
 from ..storage.repository import (
     AbstractedSubsetRepository,
@@ -30,6 +32,9 @@ from .abstraction_constants import (
     SKIPPED_SYNTHESIS_FAILURE_ID,
 )
 from .recall_quality import RecallQualityController
+
+if TYPE_CHECKING:
+    from .abstraction_shadowing import AbstractionShadowingService
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +75,7 @@ class AbstractionService:
         enrichment_skill: EventEnrichmentSkill | None = None,
         perf_monitor: PerfMonitor | None = None,
         recall_quality: RecallQualityController | None = None,
+        asf_service: AbstractionShadowingService | None = None,
     ):
         self._config = config
         self._event_repo = event_repo
@@ -86,6 +92,7 @@ class AbstractionService:
         # 同时让叙事线判重的"比对窗口 K"按系统负载动态收紧（白皮书 §2.3）。
         self._perf = perf_monitor
         self._recall_quality = recall_quality
+        self._asf = asf_service
 
     # ------------------------------------------------------------------
     # Public entry
@@ -127,11 +134,24 @@ class AbstractionService:
                 effective_support = max(min_support, max(2, cfg.abstract_subset_min_support_escalated))
 
             rows = self._recall_log_repo.list_all()
-            transactions = [frozenset(ids) for _, ids in rows if len(ids) >= min_size]
-            if len(transactions) < effective_support:
+            recent_k = cfg.abstract_mining_recent_k
+            if self._perf is not None:
+                recent_k = self._perf.adjusted_recent_k(
+                    recent_k,
+                    cfg.abstract_mining_min_recent_k,
+                    channel="abstract",
+                )
+            transactions = self._recall_log_repo.list_recent_transactions(recent_k)
+            tx_filtered = [(t, ts) for t, ts in transactions if len(t) >= min_size]
+            if len(tx_filtered) < effective_support:
                 break
 
-            candidates = _find_all_frequent_subsets(transactions, min_size, effective_support)
+            candidates = mine_closed_frequent_itemsets(
+                tx_filtered,
+                min_size=min_size,
+                min_support=float(effective_support),
+                decay_lambda=cfg.abstract_support_decay_lambda,
+            )
             if not candidates:
                 break
 
@@ -286,17 +306,6 @@ class AbstractionService:
         cfg = self._config
 
         coherent_events = events
-        if cfg.abstract_narrative_coherence_enabled:
-            coherence = self._evolution.evaluate_narrative_coherence(events)
-            if self._recall_quality is not None:
-                self._recall_quality.record_abstraction_coherence_rate(coherence.rate_a)
-            if not coherence.passed_gate:
-                return SubsetSynthesisOutcome(None, True)
-            coherent_events = [
-                e for e in events if e.event_id in coherence.coherent_event_ids
-            ]
-            if len(coherent_events) < cfg.abstract_narrative_coherence_min_count:
-                return SubsetSynthesisOutcome(None, True)
 
         evidence_events = self._evidence_policy.collect(coherent_events, self._event_repo)
         if not evidence_events:
@@ -307,11 +316,16 @@ class AbstractionService:
 
         max_level = max((e.abstraction_level or 0) for e in coherent_events) + 1
         try:
-            abstract_event = self._evolution.synthesize(
+            outcome: SynthesisOutcome = self._evolution.synthesize(
                 coherent_events,
                 abstraction_level=max_level,
                 evidence_events=evidence_events,
             )
+            if outcome.rejected_none:
+                return SubsetSynthesisOutcome(None, True)
+            abstract_event = outcome.event
+            if abstract_event is None:
+                return SubsetSynthesisOutcome(None, False, synthesis_failed=True)
 
             # 抽象事件的摘要与基本事件同规则（白皮书 §1.1.3）。
             # 优先一次 LLM 调用拿全部层级（EventEnrichmentSkill, skip_roles=True），与基本事件流共用 prompt 与解析；
@@ -334,6 +348,9 @@ class AbstractionService:
 
             self._event_repo.save(abstract_event)
             self._index_abstract(abstract_event)
+
+            if self._asf is not None:
+                self._asf.propagate(abstract_event, outcome.shadow_lambda)
 
             for evt in coherent_events:
                 if not evt.is_abstract:
@@ -415,19 +432,11 @@ class AbstractionService:
         )
 
     def _index_abstract(self, event: Event) -> None:
-        # 与基本事件保持一致：向量索引使用默认档（mid）摘要，对齐回忆块展示档位（白皮书 §4.4）。
-        text = event.summaries.get(event.mid_summary_key, event.content_raw)
-        self._vector.add_event(
-            event.event_id,
-            text,
-            {
-                "is_abstract": True,
-                "status": event.status.value,
-                "abstraction_level": event.abstraction_level or 1,
-                # 与基本事件统一：把 create_time 作为标量秒数写入，参与 70/30 分层（白皮书 §4.4）。
-                "create_time": event.create_time.timestamp(),
-            },
-        )
+        if hasattr(self._vector, "upsert_event_vectors"):
+            self._vector.upsert_event_vectors(event)
+        else:
+            text = event.summaries.get(event.mid_summary_key, event.content_raw)
+            self._vector.add_event(event.event_id, text, {"is_abstract": True})
 
 
 # =====================================================================

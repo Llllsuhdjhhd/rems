@@ -41,7 +41,7 @@ def build_pipeline(
     """Construct a REMSPipeline rooted at *tmp_path* with config overrides applied."""
     cfg = REMSConfig()
     cfg.storage.database_url = f"sqlite:///{tmp_path}/wp_live.db"
-    cfg.storage.chromadb_path = str(tmp_path / "chroma")
+    cfg.storage.qdrant_url = ":memory:"
 
     if _truthy_env("REMS_LIVE_ALLOW_FAKE_EMBEDDING"):
         cfg.embedding.provider = "hash"

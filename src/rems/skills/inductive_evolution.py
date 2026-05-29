@@ -4,8 +4,6 @@ import logging
 from dataclasses import dataclass
 
 # 归纳演化：多条基本/低阶事件 → 合成一条抽象事件（``is_abstract=True``）。
-# 抽象事件不登记任何角色（白皮书 §3.2），但合成输入始终使用叶子基本事件的 content_raw，
-# 并附带角色线索，防止压缩时把主体关系抹掉。
 
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
@@ -18,6 +16,19 @@ from ..llm.prompts import (
 from ..models.event import Event, EventStatus, generate_event_id
 
 logger = logging.getLogger(__name__)
+
+COGNITIVE_RELATIONS = frozenset({
+    "CAUSALITY", "PROTOTYPE_INVARIANT", "TEMPORAL_CHRONO",
+    "COGNITIVE_DIALECTIC", "MERONYMY", "NONE",
+})
+
+
+@dataclass(frozen=True)
+class SynthesisOutcome:
+    event: Event | None
+    cognitive_relation: str
+    shadow_lambda: float
+    rejected_none: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,32 +137,31 @@ class InductiveEvolutionSkill:
         abstraction_level: int = 1,
         *,
         evidence_events: list[Event] | None = None,
-    ) -> Event:
-        """Create an abstract event.
-
-        ``events`` remains the logical source set written to ``source_events``. ``evidence_events``
-        is the flattened leaf-basic evidence used in the prompt, so higher-order abstractions
-        still compress from basic ``content_raw`` rather than from prior abstract text.
-        """
+    ) -> SynthesisOutcome:
+        """Create an abstract event with semantic posterior in one LLM call (§3.2.3)."""
         evidence = evidence_events or events
         event_contents = self._build_content_raw_text(evidence)
         leaf_count, leaf_avg_len, target_content_len = self._leaf_evidence_stats(evidence)
         insight_enabled = self._config.enable_abstract_insight
         insight_instruction = (
-            "- `insight`：开启。请提炼跨事件的认知/规律，强调角色行为模式或关系变化；不要复述事实本身。"
+            "- `insight`：开启。JSON 对象含 relation（认知关系常量）与 conclusion（规律结论）。"
             if insight_enabled
-            else "- `insight`：关闭。不要输出 `insight` 字段。"
+            else "- `insight`：关闭。不要输出 insight 字段。"
         )
         json_schema = (
             '{\n'
+            '  "cognitive_relation": "CAUSALITY|PROTOTYPE_INVARIANT|TEMPORAL_CHRONO|COGNITIVE_DIALECTIC|MERONYMY|NONE",\n'
+            '  "shadow_lambda": 0.0,\n'
             '  "content_raw": "压缩后的抽象事件主文本",\n'
-            '  "insight": "跨事件提炼出的认知/规律",\n'
-            '  "decoration": "主观装饰（可选；无则省略或写 null）"\n'
+            '  "insight": {"relation": "CAUSALITY", "conclusion": "认知结论"},\n'
+            '  "decoration": null\n'
             '}'
             if insight_enabled
             else '{\n'
+            '  "cognitive_relation": "CAUSALITY|...|NONE",\n'
+            '  "shadow_lambda": 0.0,\n'
             '  "content_raw": "压缩后的抽象事件主文本",\n'
-            '  "decoration": "主观装饰（可选；无则省略或写 null）"\n'
+            '  "decoration": null\n'
             '}'
         )
 
@@ -179,17 +189,35 @@ class InductiveEvolutionSkill:
             ],
         )
 
-        return Event(
+        relation = str(data.get("cognitive_relation", "NONE")).upper()
+        if relation not in COGNITIVE_RELATIONS:
+            relation = "NONE"
+        shadow_lambda = float(data.get("shadow_lambda", 0.5) or 0.5)
+        shadow_lambda = min(max(shadow_lambda, 0.0), 1.0)
+
+        if relation == "NONE":
+            return SynthesisOutcome(None, relation, shadow_lambda, rejected_none=True)
+
+        insight_val = None
+        if insight_enabled:
+            raw_ins = data.get("insight")
+            if isinstance(raw_ins, dict):
+                insight_val = f"[{raw_ins.get('relation', relation)}] {raw_ins.get('conclusion', '')}".strip()
+            elif raw_ins:
+                insight_val = f"[{relation}] {raw_ins}"
+
+        event = Event(
             event_id=generate_event_id(),
             content_raw=data.get("content_raw", ""),
             is_abstract=True,
             status=EventStatus.ACTIVE,
             decoration=data.get("decoration"),
-            insight=data.get("insight") if insight_enabled else None,
+            insight=insight_val,
             abstraction_level=abstraction_level,
             source_events=[e.event_id for e in events],
             role_list=[],
         )
+        return SynthesisOutcome(event, relation, shadow_lambda, rejected_none=False)
 
     # ------------------------------------------------------------------
 

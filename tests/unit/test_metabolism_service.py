@@ -13,16 +13,14 @@ from rems.skills.event_enrichment import EventEnrichmentSkill
 from rems.skills.role_extraction import RoleExtractionSkill
 from rems.storage.database import Database
 from rems.storage.repository import EventRepository, MetabolismRepository
-from rems.storage.vector_store import VectorStore
 
 from ..conftest import FakeLLM
 
 
 @pytest.fixture()
-def metabolism_service(config: REMSConfig, db: Database, fake_llm: FakeLLM, tmp_dir):
+def metabolism_service(config: REMSConfig, db: Database, fake_llm: FakeLLM, vector_store):
     event_repo = EventRepository(db)
     meta_repo = MetabolismRepository(db)
-    vector_store = VectorStore(config)
     role_skill = RoleExtractionSkill(fake_llm, config)
     enrichment_skill = EventEnrichmentSkill(fake_llm, config, role_fallback=role_skill)
     event_service = EventService(config, fake_llm, event_repo, vector_store, enrichment_skill)

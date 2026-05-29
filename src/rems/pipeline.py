@@ -34,7 +34,14 @@ from .storage.repository import (
     RecallLogRepository,
     RoleRepository,
 )
+from .embedding.tri_band import TriBandEncoder
+from .jobs.tier1_refresh import refresh_tier1
+from .services.abstraction_shadowing import AbstractionShadowingService
+from .skills.recall_intent import RecallIntentClassifier
+from .storage.active_pool_cache import ActivePoolCache
+from .storage.tier1_store import Tier1Store
 from .storage.vector_store import VectorStore
+from .strategies.event_weight import EventWeightDeriver
 
 # 顶层编排：ingest 串联回忆（ContextPackage）、代谢封存、角色白描/语义卡片、
 # 记忆再巩固抽象与 NPC 指令；对照《REMS 记忆系统规范解析》4.4、5.1–5.3。
@@ -199,13 +206,24 @@ class REMSPipeline:
             window_size=config.perf_monitor_window_size,
             tolerances_ms=config.perf_phase_tolerance_ms,
             load_factor_max=config.perf_load_factor_max,
+            recall_phases=config.perf_recall_phases,
+            abstract_phases=config.perf_abstract_phases,
             silence_boost_at_max=config.forgetting_overload_silence_boost,
         )
 
-        vector_store = VectorStore(config, perf_monitor=perf_monitor)
+        tier1_store = Tier1Store(db, config)
+        active_pool_cache = ActivePoolCache(tier1_store, config)
+        active_pool_cache.refresh()
 
+        vector_store = VectorStore(config, perf_monitor=perf_monitor)
         event_repo = EventRepository(db)
         role_repo = RoleRepository(db)
+        tri_band = TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo)
+        vector_store.set_tri_band(tri_band)
+        event_weight = EventWeightDeriver(config, event_repo, role_repo)
+        asf_service = AbstractionShadowingService(
+            config, event_repo, role_repo, vector_store, tier1_store,
+        )
         meta_repo = MetabolismRepository(db)
         recall_log_repo = RecallLogRepository(db)
         abstracted_subset_repo = AbstractedSubsetRepository(db)
@@ -233,6 +251,8 @@ class REMSPipeline:
             enrichment_skill,
             role_service=role_service,
             emotion_evolver=emotion_evolver,
+            tier1_store=tier1_store,
+            event_weight=event_weight,
         )
         
         metabolism_service = MetabolismService.with_default_boundary_repair(
@@ -246,6 +266,10 @@ class REMSPipeline:
         recall_service = RecallService(
             config, event_repo, role_repo, vector_store, perf_monitor=perf_monitor,
             recall_quality=recall_quality,
+            active_pool_cache=active_pool_cache,
+            tri_band=tri_band,
+            event_weight=event_weight,
+            intent_classifier=RecallIntentClassifier(config),
         )
         abstraction_service = AbstractionService(
             config,
@@ -258,6 +282,7 @@ class REMSPipeline:
             enrichment_skill=enrichment_skill,
             perf_monitor=perf_monitor,
             recall_quality=recall_quality,
+            asf_service=asf_service,
         )
         belief_revision_service = BeliefRevisionService(config, event_repo, role_repo)
 

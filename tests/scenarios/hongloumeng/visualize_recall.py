@@ -98,7 +98,7 @@ def run_visual_diagnostic():
     config = REMSConfig(
         storage=StorageConfig(
             database_url=f"sqlite:///{base_dir}/rems_sim.db",
-            chromadb_path=str(base_dir / "chroma_sim")
+            qdrant_path=str(base_dir / "qdrant_sim")
         ),
         embedding={"provider": "hash"},
         user_mode=UserMode.MULTI

@@ -1,10 +1,11 @@
-"""Tests for RecallService (search, scoring, assembly)."""
+"""Tests for RecallService (tri-band search, scoring, assembly)."""
 
 from __future__ import annotations
 
 import pytest
 
 from rems.config import REMSConfig
+from rems.embedding.tri_band import TriBandEncoder
 from rems.models.event import Event
 from rems.models.metabolism import Shadow
 from rems.services.recall_service import RecallService
@@ -14,11 +15,16 @@ from rems.storage.vector_store import VectorStore
 
 
 @pytest.fixture()
-def recall_service(config: REMSConfig, db: Database, tmp_dir):
+def recall_service(config: REMSConfig, db: Database):
     event_repo = EventRepository(db)
     role_repo = RoleRepository(db)
     vector_store = VectorStore(config)
-    return RecallService(config, event_repo, role_repo, vector_store), event_repo, vector_store
+    tri_band = TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo)
+    vector_store.set_tri_band(tri_band)
+    svc = RecallService(
+        config, event_repo, role_repo, vector_store, tri_band=tri_band,
+    )
+    return svc, event_repo, vector_store
 
 
 class TestRecallBlock:
@@ -33,7 +39,7 @@ class TestRecallBlock:
 
         event = Event(content_raw="张三去了北京参加会议")
         event_repo.save(event)
-        vector_store.add_event(event.event_id, event.content_raw, {"is_abstract": False})
+        vector_store.upsert_event_vectors(event)
 
         block = svc.build_recall_block("北京的会议")
         assert len(block.items) >= 1
@@ -59,24 +65,13 @@ class TestScoring:
         score = RecallService._time_decay(old, half_life_days=30)
         assert score < 0.3
 
-    def test_rrf_merge_uses_both_streams(self, recall_service):
+    def test_single_stream_score_orders_by_distance(self, recall_service):
         svc, _, _ = recall_service
         a = Event(content_raw="A")
         b = Event(content_raw="B")
-        c = Event(content_raw="C")
-
-        merged = svc._rrf_merge(
-            {
-                a.event_id: (a, 0.9),
-                b.event_id: (b, 0.8),
-            },
-            {
-                b.event_id: (b, 0.7, 10.0),
-                c.event_id: (c, 0.6, 1.0),
-            },
-            [],
-        )
-
-        ids = [event.event_id for event, _ in merged]
-        assert b.event_id == ids[0]
-        assert set(ids) == {a.event_id, b.event_id, c.event_id}
+        stream = {
+            a.event_id: (a, 0.2, 0.5),
+            b.event_id: (b, 0.8, 0.5),
+        }
+        ranked = svc._single_stream_score(stream, [])
+        assert ranked[0][0].event_id == a.event_id

@@ -17,10 +17,12 @@ from rems.services.abstraction_service import AbstractionService, _find_all_freq
 from rems.skills.inductive_evolution import InductiveEvolutionSkill
 from rems.skills.summary_generation import SummaryGenerationSkill
 from rems.storage.database import Database
+from rems.embedding.tri_band import TriBandEncoder
 from rems.storage.repository import (
     AbstractedSubsetRepository,
     EventRepository,
     RecallLogRepository,
+    RoleRepository,
 )
 from rems.storage.vector_store import VectorStore
 
@@ -28,7 +30,7 @@ from ..conftest import FakeLLM
 
 
 @pytest.fixture()
-def env(config: REMSConfig, db: Database, fake_llm: FakeLLM):
+def env(config: REMSConfig, db: Database, fake_llm: FakeLLM, vector_store):
     # 把阈值调到便于小子集触发：
     #   overlap >= 0.6 视为高度重合；novelty 同时满足比例 >= 0.1 与绝对量 >= 2 才算"显著新增"。
     config.narrative_dup_overlap_threshold = 0.6
@@ -40,7 +42,8 @@ def env(config: REMSConfig, db: Database, fake_llm: FakeLLM):
     config.abstract_narrative_coherence_enabled = False
 
     event_repo = EventRepository(db)
-    vector_store = VectorStore(config)
+    role_repo = RoleRepository(db)
+    vector_store.set_tri_band(TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo))
     recall_log_repo = RecallLogRepository(db)
     fired_repo = AbstractedSubsetRepository(db)
     evolution_skill = InductiveEvolutionSkill(fake_llm, config)
@@ -245,7 +248,9 @@ class TestMineWithDedupe:
         events = [_save_basic(event_repo, f"e{i}") for i in range(3)]
         leaf_ids = [e.event_id for e in events]
         for eid in leaf_ids:
-            vector_store.add_event(eid, "x", {"is_abstract": False})
+            ev = event_repo.get(eid)
+            if ev:
+                vector_store.upsert_event_vectors(ev)
 
         # 预先存在一个抽象事件 A1 覆盖这三个叶子
         _save_abstract(event_repo, leaf_ids)
@@ -266,14 +271,21 @@ class TestMineWithDedupe:
         events = [_save_basic(event_repo, f"e{i}") for i in range(3)]
         leaf_ids = [e.event_id for e in events]
         for eid in leaf_ids:
-            vector_store.add_event(eid, "x", {"is_abstract": False})
+            ev = event_repo.get(eid)
+            if ev:
+                vector_store.upsert_event_vectors(ev)
 
         _save_abstract(event_repo, leaf_ids)
 
         for k in range(3):
             recall_log_repo.append(recall_id=f"RCL-{k}", event_ids=leaf_ids)
 
-        fake_llm.push_response({"content_raw": "new abstract", "decoration": None})
+        fake_llm.push_response({
+            "cognitive_relation": "CAUSALITY",
+            "shadow_lambda": 0.5,
+            "content_raw": "new abstract",
+            "decoration": None,
+        })
         fake_llm.push_response({"summary": "s", "char_count": 10})
 
         created = svc.mine_and_synthesize()

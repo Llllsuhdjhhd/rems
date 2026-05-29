@@ -13,20 +13,28 @@ from rems.services.recall_service import RecallService
 from rems.skills.inductive_evolution import InductiveEvolutionSkill
 from rems.skills.summary_generation import SummaryGenerationSkill
 from rems.storage.database import Database
-from rems.storage.repository import AbstractedSubsetRepository, EventRepository, RecallLogRepository
+from rems.embedding.tri_band import TriBandEncoder
+from rems.storage.repository import AbstractedSubsetRepository, EventRepository, RecallLogRepository, RoleRepository
 from rems.storage.vector_store import VectorStore
 
 from ..conftest import FakeLLM
 
 
+def _wire_vector_store(config, db, vector_store: VectorStore) -> VectorStore:
+    event_repo = EventRepository(db)
+    role_repo = RoleRepository(db)
+    vector_store.set_tri_band(TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo))
+    return vector_store
+
+
 @pytest.fixture()
-def abstraction_env(config: REMSConfig, db: Database, fake_llm: FakeLLM):
+def abstraction_env(config: REMSConfig, db: Database, fake_llm: FakeLLM, vector_store):
     config.abstract_subset_min_size = 3
     config.abstract_subset_min_support = 3
     config.abstract_narrative_coherence_enabled = False
 
     event_repo = EventRepository(db)
-    vector_store = VectorStore(config)
+    _wire_vector_store(config, db, vector_store)
     recall_log_repo = RecallLogRepository(db)
     fired_repo = AbstractedSubsetRepository(db)
     evolution_skill = InductiveEvolutionSkill(fake_llm, config)
@@ -81,13 +89,18 @@ def test_synthesis_bumps_member_coverage(abstraction_env):
     ]
     for e in events:
         event_repo.save(e)
-        vector_store.add_event(e.event_id, e.content_raw, {"is_abstract": False})
+        vector_store.upsert_event_vectors(e)
 
     common = [events[0].event_id, events[1].event_id, events[2].event_id]
     for k in range(3):
         recall_log_repo.append(recall_id=f"RCL-{k}", event_ids=common)
 
-    fake_llm.push_response({"content_raw": "抽象", "insight": ""})
+    fake_llm.push_response({
+        "cognitive_relation": "CAUSALITY",
+        "shadow_lambda": 0.5,
+        "content_raw": "抽象",
+        "insight": "",
+    })
     for _ in range(5):
         fake_llm.push_response({"summary": "s", "char_count": 10})
 

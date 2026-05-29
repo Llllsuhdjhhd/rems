@@ -37,8 +37,8 @@ from rems.skills.boundary_split import (
 from rems.skills.event_enrichment import EventEnrichmentSkill
 from rems.skills.role_extraction import RoleExtractionSkill
 from rems.storage.database import Database
+from rems.embedding.tri_band import TriBandEncoder
 from rems.storage.repository import EventRepository, MetabolismRepository, RoleRepository
-from rems.storage.vector_store import VectorStore
 
 from ..conftest import FakeLLM
 
@@ -253,10 +253,9 @@ class TestOverlongUCSplitRemediator:
 # =====================================================================
 
 @pytest.fixture()
-def metabolism_service_with_repair(config: REMSConfig, db: Database, fake_llm: FakeLLM):
+def metabolism_service_with_repair(config: REMSConfig, db: Database, fake_llm: FakeLLM, vector_store):
     event_repo = EventRepository(db)
     meta_repo = MetabolismRepository(db)
-    vector_store = VectorStore(config)
     role_skill = RoleExtractionSkill(fake_llm, config)
     enrichment_skill = EventEnrichmentSkill(fake_llm, config, role_fallback=role_skill)
     event_service = EventService(config, fake_llm, event_repo, vector_store, enrichment_skill)
@@ -414,16 +413,16 @@ class TestMetabolismServiceSplitFlow:
 # =====================================================================
 
 class TestRecallExpandsSplitPrefix:
-    def test_prefix_is_pulled_in_when_tail_event_is_recalled(self, config, db, tmp_dir):
+    def test_prefix_is_pulled_in_when_tail_event_is_recalled(self, config, db, vector_store):
         event_repo = EventRepository(db)
         role_repo = RoleRepository(db)
-        vector_store = VectorStore(config)
-        svc = RecallService(config, event_repo, role_repo, vector_store)
+        tri_band = TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo)
+        svc = RecallService(config, event_repo, role_repo, vector_store, tri_band=tri_band)
 
         # 前缀事件（仅靠 split_prefix_event_ids 拉进，不直接命中检索）
         prefix = Event(content_raw="武松在景阳冈下连喝十八碗酒", summaries={"L1": "喝酒"})
         event_repo.save(prefix)
-        vector_store.add_event(prefix.event_id, prefix.content_raw, {"is_abstract": False})
+        vector_store.upsert_event_vectors(prefix)
 
         # 尾部事件（直接被检索命中），声明前缀链。
         tail = Event(
@@ -432,7 +431,7 @@ class TestRecallExpandsSplitPrefix:
             split_prefix_event_ids=[prefix.event_id],
         )
         event_repo.save(tail)
-        vector_store.add_event(tail.event_id, tail.content_raw, {"is_abstract": False})
+        vector_store.upsert_event_vectors(tail)
 
         block = svc.build_recall_block("景阳冈打虎")
         ids = [it.event_id for it in block.items]
@@ -441,15 +440,15 @@ class TestRecallExpandsSplitPrefix:
         assert tail.event_id in ids
         assert ids.index(prefix.event_id) < ids.index(tail.event_id)
 
-    def test_prefix_not_duplicated_when_already_recalled(self, config, db, tmp_dir):
+    def test_prefix_not_duplicated_when_already_recalled(self, config, db, vector_store):
         event_repo = EventRepository(db)
         role_repo = RoleRepository(db)
-        vector_store = VectorStore(config)
-        svc = RecallService(config, event_repo, role_repo, vector_store)
+        tri_band = TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo)
+        svc = RecallService(config, event_repo, role_repo, vector_store, tri_band=tri_band)
 
         prefix = Event(content_raw="prefix event text", summaries={"L1": "prefix"})
         event_repo.save(prefix)
-        vector_store.add_event(prefix.event_id, prefix.content_raw, {"is_abstract": False})
+        vector_store.upsert_event_vectors(prefix)
 
         tail = Event(
             content_raw="tail event text",
@@ -457,7 +456,7 @@ class TestRecallExpandsSplitPrefix:
             split_prefix_event_ids=[prefix.event_id],
         )
         event_repo.save(tail)
-        vector_store.add_event(tail.event_id, tail.content_raw, {"is_abstract": False})
+        vector_store.upsert_event_vectors(tail)
 
         block = svc.build_recall_block("prefix tail")
         ids = [it.event_id for it in block.items]
