@@ -18,4 +18,4 @@ venv/
 tests/scenarios/*/outputs/
 tests/integration/outputs/
 test_chroma/
-
+memory_samples/

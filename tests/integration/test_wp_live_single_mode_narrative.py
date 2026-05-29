@@ -127,7 +127,7 @@ def test_wp_live_single_mode_narrative(tmp_path, monkeypatch) -> None:
     )
     rep.set_repro_footer(
         pytest_cmd=(
-            "python -m pytest tests/test_wp_live_single_mode_narrative.py -v -s"
+            "python -m pytest tests/integration/test_wp_live_single_mode_narrative.py -v -s"
             + (f"  # REMS_WP_LIVE_NARRATIVE_ROUNDS={rounds_note}" if rounds_note else "")
         ),
     )

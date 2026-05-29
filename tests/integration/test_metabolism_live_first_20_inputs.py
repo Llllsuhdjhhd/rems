@@ -11,11 +11,11 @@ runs with the **base** ``anaconda3\\python.exe``, torch may fail (WinError 1114 
 
     conda activate py3125
     $env:REMS_RUN_LIVE_METABOLISM_TEST = "1"
-    python -m pytest tests/test_metabolism_live_first_20_inputs.py -v -s
+    python -m pytest tests/integration/test_metabolism_live_first_20_inputs.py -v -s
 
 Or without activating::
 
-    conda run -n py3125 --no-capture-output python -m pytest tests/test_metabolism_live_first_20_inputs.py -v -s
+    conda run -n py3125 --no-capture-output python -m pytest tests/integration/test_metabolism_live_first_20_inputs.py -v -s
 
 **Escape hatch** (no PyTorch; fake vectors only — not for semantic recall quality)::
 
@@ -257,7 +257,7 @@ def test_first_20_inputs_metabolism_detailed_report(tmp_path: Path) -> None:
                 "当前解释器无法加载 PyTorch，无法使用真实向量嵌入。\n"
                 f"{torch_msg}\n\n"
                 "请改用已安装可用 torch 的环境（例如）：`conda activate py3125` 后再运行 pytest，\n"
-                "或使用：`conda run -n py3125 python -m pytest tests/test_metabolism_live_first_20_inputs.py -v -s`\n\n"
+                "或使用：`conda run -n py3125 python -m pytest tests/integration/test_metabolism_live_first_20_inputs.py -v -s`\n\n"
                 "若仅需在无 torch 的解释器上试跑管线，可设置 `REMS_LIVE_ALLOW_FAKE_EMBEDDING=1`（假嵌入）。"
             )
         pipeline = REMSPipeline.from_config(cfg)

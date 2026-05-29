@@ -73,7 +73,7 @@ def test_wp_live_abstraction_and_recall(tmp_path) -> None:
     rep.set_config_snapshot(cfg)
     rep.set_llm_env_summary(emb_notes)
     rep.set_repro_footer(
-        pytest_cmd="python -m pytest tests/test_wp_live_abstraction_and_recall.py -v -s",
+        pytest_cmd="python -m pytest tests/integration/test_wp_live_abstraction_and_recall.py -v -s",
     )
 
     cluster: list[Event] = []

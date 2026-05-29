@@ -79,7 +79,7 @@ def test_wp_live_multi_and_modes(tmp_path) -> None:
     )
     rep.set_repro_footer(
         pytest_cmd=(
-            "python -m pytest tests/test_wp_live_multi_and_modes.py -v -s"
+            "python -m pytest tests/integration/test_wp_live_multi_and_modes.py -v -s"
             + (f"  # REMS_WP_LIVE_MULTI_ROUNDS={rounds_note}" if rounds_note else "")
         ),
     )
