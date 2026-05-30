@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from .config import REMSConfig, UserMode
 from .llm.provider import LLMProvider
@@ -12,6 +14,7 @@ from .models.event import Event, EventRoleEntry
 from .models.metabolism import ContextPackage
 from .models.role import Role
 from .observability import PerfMonitor
+from .observability.ingest_trace import IngestTrace, event_preview
 from .services.abstraction_service import AbstractionService
 from .services.belief_revision_service import BeliefRevisionService
 from .services.emotion_service import EMAEvolver
@@ -185,6 +188,25 @@ class REMSPipeline:
         self.recall_quality = recall_quality
         self.recall_block_relevance_skill = recall_block_relevance_skill
         self._ingest_seq = 0
+        self.ingest_trace: IngestTrace | None = None
+        # 单线程后台执行器：把回忆前的人物提取（纯 LLM，不碰 DB）与回忆重叠。
+        # max_workers=1 足够——每轮 ingest 最多并发一次人物提取；DB 登记仍在主线程串行完成。
+        self._role_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rems-role"
+        )
+
+    def _begin_ingest_step(self, step: str) -> float:
+        trace = self.ingest_trace
+        if trace is not None:
+            trace.set_current_step(step)
+        return time.perf_counter()
+
+    def _trace_ingest_step(self, step: str, t0: float, **detail: Any) -> None:
+        trace = self.ingest_trace
+        if trace is None:
+            return
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        trace.record(step, elapsed_ms, **detail)
 
     # ------------------------------------------------------------------
     @classmethod
@@ -269,7 +291,7 @@ class REMSPipeline:
             active_pool_cache=active_pool_cache,
             tri_band=tri_band,
             event_weight=event_weight,
-            intent_classifier=RecallIntentClassifier(config),
+            intent_classifier=RecallIntentClassifier(config, embedder=tri_band),
         )
         abstraction_service = AbstractionService(
             config,
@@ -339,46 +361,85 @@ class REMSPipeline:
             - 新增模式只需在 :class:`ProcessingMode` 追加成员并复写 ``returns_context_package``
               （或扩展专属装配步骤），不需要改动主干流程。
         """
-        shadow = self.meta_repo.get_shadow()
+        t_ingest = time.perf_counter()
 
-        # Step 1: 提前角色抽取（输入 + 残影）。
-        # 这一轮主要目的是为 RecallService 准备焦点角色与已知角色快照（白皮书 §4.4 流 B）；
-        # 抽得的 role_entries 同时会作为 ``known_roles`` 透传给代谢层，让 EventEnrichmentSkill
-        # 走 summary-only 分支，省掉 seal 阶段的二次角色提取（P1-6）。
+        t0 = self._begin_ingest_step("shadow_load")
+        shadow = self.meta_repo.get_shadow()
+        unclosed_before = self.meta_repo.get_unclosed_events()
+        self._trace_ingest_step(
+            "shadow_load",
+            t0,
+            shadow_chars=len(shadow.content or ""),
+            unclosed_count=len(unclosed_before),
+        )
+
+        # Step 1: 提前角色抽取（输入 + 残影）—— 并发化。
+        # 人物提取是纯 LLM 调用（不碰 DB），在后台线程里与回忆重叠；回忆默认**不等待**结果，
+        # 而是用即时启发式 focus（登记名匹配，零 LLM）先跑。抽取结果在进代谢之前于主线程取回，
+        # 完成 DB 登记并作为「全局富信息池」下放给 EventEnrichmentSkill 走 names_only 分支（白皮书 2.1）。
+        t0 = self._begin_ingest_step("pre_recall_role_extract")
         combined_text = (shadow.content + "\n" + raw_input).strip()
         logger.debug(
-            "ingest pre-recall: role_skill=%s, combined_text_len=%d",
-            self.role_skill is not None, len(combined_text),
+            "ingest pre-recall: role_skill=%s, combined_text_len=%d, wait=%s",
+            self.role_skill is not None,
+            len(combined_text),
+            self.config.recall_wait_for_role_extraction,
         )
-        role_entries: list[EventRoleEntry] = []
+        role_future: Future | None = None
         if self.role_skill and combined_text:
-            extraction_result = self.role_skill.extract(combined_text)
-            extracted_roles = list(extraction_result.roles)
-            if extracted_roles:
-                id_mapping = self.role_service.resolve_and_register(extracted_roles, is_suspicious=False)
-                for er in extracted_roles:
-                    lookup_key = er.role_id or er.name
-                    assigned_id = id_mapping.get(lookup_key, lookup_key)
-                    role_entries.append(self.role_skill.to_event_role_entry(er, assigned_id))
+            role_future = self._role_executor.submit(self.role_skill.extract, combined_text)
 
-        # 从当前输入、残影以及刚抽取的角色中提取焦点角色
+        role_entries: list[EventRoleEntry] = []
+        extracted_names: list[str] = []
+        role_extract_waited = False
+        # 仅当显式要求「回忆等待人物提取」时，于回忆前同步取回并登记（focus 更精确，但更慢）。
+        if role_future is not None and self.config.recall_wait_for_role_extraction:
+            role_entries, extracted_names = self._consume_role_future(role_future)
+            role_future = None
+            role_extract_waited = True
+
+        # 焦点角色：已登记的抽取结果（若已等待）+ 单人核心用户 + 即时启发式名匹配。
         focus_role_ids = set(r.role_id for r in role_entries)
         if self.config.user_mode == UserMode.SINGLE and self.config.core_user_role_id:
             focus_role_ids.add(self.config.core_user_role_id)
         focus_role_ids.update(self._extract_focus_roles(raw_input, shadow.content if shadow else ""))
+        self._trace_ingest_step(
+            "pre_recall_role_extract",
+            t0,
+            combined_text_chars=len(combined_text),
+            submitted=role_future is not None or role_extract_waited,
+            waited=role_extract_waited,
+            extracted_roles=len(role_entries),
+            role_ids=sorted({r.role_id for r in role_entries}),
+            role_names=extracted_names[:12],
+            focus_role_ids=sorted(focus_role_ids),
+        )
 
         # 回忆（所有模式必须执行）：
         # 抽象事件的唯一触发路径是 recall_log 的频繁子集挖掘，跳过回忆等于放弃所有归纳演化；
         # "静默倾听"等模式只是不把 ctx 交给外部，内部仍然完整组装、登记与挖掘。
+        t0 = self._begin_ingest_step("recall_build_context")
         ctx: ContextPackage = self.recall_service.build_context_package(
             raw_input, shadow, focus_role_ids=focus_role_ids, focus_role_entries=role_entries
+        )
+        recall_block_ids = [
+            it.event_id for it in (ctx.recall_block.items or []) if getattr(it, "event_id", None)
+        ]
+        self._trace_ingest_step(
+            "recall_build_context",
+            t0,
+            recall_items=len(ctx.recall_block.items or []),
+            event_ids=recall_block_ids[:12],
+            shadow_in_ctx=len(ctx.shadow.content or "") if ctx.shadow else 0,
         )
 
         # 登记本次回忆块 event_id 到 recall_log（白皮书 §3.2 唯一抽象触发路径的输入流）。
         # 只记录真实 basic/abstract 事件；抽象事件 id 同样进入命名空间，
         # 便于后续更高阶抽象在同一空间继续挖掘。
+        t0 = self._begin_ingest_step("recall_log_append")
+        recall_event_ids: list[str] = []
+        recall_id: str | None = None
         if ctx.recall_block.items:
-            recall_event_ids: list[str] = []
             seen_ids: set[str] = set()
             for it in ctx.recall_block.items:
                 eid = it.event_id
@@ -387,13 +448,25 @@ class REMSPipeline:
                 seen_ids.add(eid)
                 recall_event_ids.append(eid)
             if recall_event_ids:
+                recall_id = f"RCL-{uuid.uuid4().hex}"
                 self.recall_log_repo.append(
-                    recall_id=f"RCL-{uuid.uuid4().hex}",
+                    recall_id=recall_id,
                     event_ids=recall_event_ids,
                 )
+        self._trace_ingest_step(
+            "recall_log_append",
+            t0,
+            appended=bool(recall_event_ids),
+            recall_id=recall_id,
+            n_events=len(recall_event_ids),
+            event_ids=recall_event_ids[:12],
+        )
 
         self._ingest_seq += 1
+        t0 = self._begin_ingest_step("recall_relevance_audit")
         rq, rel_skill = self.recall_quality, self.recall_block_relevance_skill
+        audited = False
+        relevance_rate: float | None = None
         if (
             rq is not None
             and rel_skill is not None
@@ -401,10 +474,31 @@ class REMSPipeline:
             and ctx.recall_block.items
         ):
             try:
-                rate_b = rel_skill.evaluate_relevance_ratio(raw_input, ctx.recall_block)
-                rq.record_recall_block_relevance_rate(rate_b)
+                relevance_rate = rel_skill.evaluate_relevance_ratio(raw_input, ctx.recall_block)
+                rq.record_recall_block_relevance_rate(relevance_rate)
+                audited = True
             except Exception as exc:
                 logger.warning("recall block relevance audit failed: %s", exc)
+        self._trace_ingest_step(
+            "recall_relevance_audit",
+            t0,
+            ran=audited,
+            relevance_rate=relevance_rate,
+        )
+
+        # 进代谢前取回并发的人物提取结果（若回忆阶段未等待）。抽取与回忆已重叠，
+        # 此处 await 通常接近零；在主线程完成 resolve_and_register（避免与回忆并发写 DB）。
+        if role_future is not None:
+            t0 = self._begin_ingest_step("role_extract_await")
+            role_entries, extracted_names = self._consume_role_future(role_future)
+            role_future = None
+            self._trace_ingest_step(
+                "role_extract_await",
+                t0,
+                extracted_roles=len(role_entries),
+                role_ids=sorted({r.role_id for r in role_entries}),
+                role_names=extracted_names[:12],
+            )
 
         # 代谢：边界检测、封存基本事件、维护残影与未完成库（第 4.1–4.2）。
         # 把 pre-recall 已提取的角色作为 enrichment 去代词化 hint 透传，避免事件层面重复抽取。
@@ -417,6 +511,7 @@ class REMSPipeline:
                 role_obj = self.role_repo.get(re_entry.role_id)
                 if role_obj is not None:
                     known_roles_hint.append(role_obj)
+        t0 = self._begin_ingest_step("metabolism_seal")
         sealed = self.metabolism_service.process_input(
             raw_input,
             force_save=force_save,
@@ -424,15 +519,38 @@ class REMSPipeline:
             known_roles_hint=known_roles_hint or None,
             pre_role_entries=role_entries or None,
         )
+        unclosed_after = self.meta_repo.get_unclosed_events()
+        self._trace_ingest_step(
+            "metabolism_seal",
+            t0,
+            sealed_count=len(sealed),
+            sealed=[event_preview(e) for e in sealed],
+            unclosed_after=len(unclosed_after),
+            force_save=force_save,
+        )
 
         # 角色：每个新事件更新白描时间线并刷新语义卡片（第 2.2–2.3）。
         # RoleService 对 is_abstract=True 的事件自带早退，抽象事件不会污染白描。
+        t0 = self._begin_ingest_step("role_timeline_update")
         for event in sealed:
             self.role_service.update_from_event(event)
+        self._trace_ingest_step(
+            "role_timeline_update",
+            t0,
+            events_updated=len(sealed),
+            role_ids=sorted({r.role_id for e in sealed for r in e.role_list}),
+        )
 
         # 抽象事件触发 —— 唯一路径：``recall_log`` 中的频繁子集挖掘（白皮书 §3.2）。
         # 所有模式都跑：被动日志场景下仍然需要持续演化出抽象规律供未来检索或审计。
+        t0 = self._begin_ingest_step("abstraction_mine")
         abstract_events: list[Event] = self.abstraction_service.mine_and_synthesize()
+        self._trace_ingest_step(
+            "abstraction_mine",
+            t0,
+            new_abstracts=len(abstract_events),
+            abstracts=[event_preview(e) for e in abstract_events],
+        )
 
         # NPC：由回忆与威胁启发式生成行为指令（第 5.3）。
         npc_directives: list[dict] = []
@@ -441,6 +559,16 @@ class REMSPipeline:
 
         # 输出路由：``returns_context_package`` 控制 ctx 是否对外暴露；内部管线与产物不变。
         exposed_ctx: Optional[ContextPackage] = ctx if mode.returns_context_package else None
+
+        self._begin_ingest_step("ingest_complete")
+        self._trace_ingest_step(
+            "ingest_complete",
+            t_ingest,
+            mode=mode.value,
+            input_chars=len(raw_input),
+            sealed_total=len(sealed),
+            abstract_total=len(abstract_events),
+        )
 
         return ProcessingResult(
             sealed_events=sealed,
@@ -453,6 +581,33 @@ class REMSPipeline:
     # ------------------------------------------------------------------
     # Focus role extraction (for recall tier selection)
     # ------------------------------------------------------------------
+
+    def _consume_role_future(
+        self, role_future: Future
+    ) -> tuple[list[EventRoleEntry], list[str]]:
+        """Resolve the background role-extraction future and register roles on the main thread.
+
+        线程内只做了纯 LLM 抽取；此处在主线程完成 ``resolve_and_register``（DB 读写）与
+        ``EventRoleEntry`` 构造，保证 DB 不被回忆/抽取并发写入。任何异常都降级为空结果，
+        让主流程继续（人物提取失败不应阻断回忆与代谢）。
+        """
+        role_entries: list[EventRoleEntry] = []
+        extracted_names: list[str] = []
+        try:
+            extraction_result = role_future.result()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("background role extraction failed: %s", exc)
+            return role_entries, extracted_names
+
+        extracted_roles = list(extraction_result.roles)
+        extracted_names = [er.name for er in extracted_roles if er.name]
+        if extracted_roles:
+            id_mapping = self.role_service.resolve_and_register(extracted_roles, is_suspicious=False)
+            for er in extracted_roles:
+                lookup_key = er.role_id or er.name
+                assigned_id = id_mapping.get(lookup_key, lookup_key)
+                role_entries.append(self.role_skill.to_event_role_entry(er, assigned_id))
+        return role_entries, extracted_names
 
     def _extract_focus_roles(self, raw_input: str, shadow_content: str = "") -> set[str]:
         """Identify role IDs that should be treated as 'primary' in this cycle.

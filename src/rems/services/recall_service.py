@@ -188,30 +188,39 @@ class RecallService:
         if self._active_pool is not None:
             active_ids = self._active_pool.fetch(pool_limit)
 
-        query_vec = None
+        n_results = self._config.recall_n_results
+        hits: list[dict] = []
         if self._tri_band is not None:
             valence = self._current_query_valence(focus_role_entries or [])
-            query_vec = self._tri_band.encode_query(search_text, valence=valence)
-
-        hits: list[dict] = []
-        if query_vec is not None:
-            hits = self._vector.search_tri_band(
-                query_vec,
-                weights=intent.weights,
-                filter_ids=active_ids,
-                n_results=60,
-            )
-            max_score = max((h.get("score", 0.0) for h in hits), default=0.0)
-            if self._bypass.should_bypass(max_score) and query_vec is not None:
+            if self._config.recall_multi_route_enabled:
+                # 多路召回取并集：当前句 / 上下文（残影截尾）/ 实体锚定，最大化覆盖、避免长残影稀释。
+                hits = self._multi_route_search(
+                    query, shadow, focus_role_ids or set(),
+                    valence=valence, weights=intent.weights,
+                    active_ids=active_ids, n_results=n_results,
+                )
+            else:
+                query_vec = self._tri_band.encode_query(search_text, valence=valence)
                 hits = self._vector.search_tri_band(
                     query_vec,
                     weights=intent.weights,
+                    filter_ids=active_ids,
+                    n_results=n_results,
+                )
+            # 命中过弱时绕过活跃池过滤兜底一次，再与已有命中并集。
+            max_score = max((h.get("score", 0.0) for h in hits), default=0.0)
+            if self._bypass.should_bypass(max_score):
+                query_vec = self._tri_band.encode_query(search_text, valence=valence)
+                bypass_hits = self._vector.search_tri_band(
+                    query_vec,
+                    weights=intent.weights,
                     filter_ids=None,
-                    n_results=60,
+                    n_results=n_results,
                     bypass_filter=True,
                 )
+                hits = self._union_hits([hits, bypass_hits])
         else:
-            hits = self._vector.search(search_text, n_results=60)
+            hits = self._vector.search(search_text, n_results=n_results)
 
         stream: dict[str, tuple[Event, float, float]] = {}
         for hit in hits:
@@ -279,6 +288,94 @@ class RecallService:
                     self._role_repo.update_white_painting_access(role_entry.role_id, event.event_id, new_factor)
 
         return block
+
+    # ------------------------------------------------------------------
+    # Multi-route candidate generation (本轮新增：覆盖最大化)
+    # ------------------------------------------------------------------
+    def _multi_route_search(
+        self,
+        query: str,
+        shadow: Shadow | None,
+        focus_role_ids: set[str],
+        *,
+        valence: float,
+        weights: tuple[float, float, float],
+        active_ids: list[str] | None,
+        n_results: int,
+    ) -> list[dict[str, Any]]:
+        """Union of complementary query routes to raise recall coverage.
+
+        三路（每路独立检索后按 event_id 取最小 distance 并集）：
+            - 路 C（当前句）：仅当前输入，保证当前话题主信号不被残影稀释；
+            - 路 S（上下文）：残影（按 ``recall_query_shadow_cap`` 取尾部）+ 当前输入，保叙事连续；
+            - 路 E（实体锚定）：以焦点角色名/别名作为 ``entity_hint`` 偏置实体带，保底拉取角色相关事件。
+        下游打分 / RRF / 压缩完全不变——并集只增加候选，不改变排序与组装逻辑。
+        """
+        encode = self._tri_band.encode_query
+        hit_lists: list[list[dict[str, Any]]] = []
+
+        # 路 C：当前句
+        hit_lists.append(
+            self._vector.search_tri_band(
+                encode(query, valence=valence),
+                weights=weights, filter_ids=active_ids, n_results=n_results,
+            )
+        )
+
+        # 路 S：上下文（残影截尾 + 当前句）
+        shadow_text = shadow.content if (shadow and shadow.content) else ""
+        if shadow_text:
+            cap = self._config.recall_query_shadow_cap
+            if cap and cap > 0 and len(shadow_text) > cap:
+                shadow_text = shadow_text[-cap:]
+            ctx_text = (shadow_text + "\n" + query).strip()
+            if ctx_text and ctx_text != query:
+                hit_lists.append(
+                    self._vector.search_tri_band(
+                        encode(ctx_text, valence=valence),
+                        weights=weights, filter_ids=active_ids, n_results=n_results,
+                    )
+                )
+
+        # 路 E：实体锚定
+        entity_hint = self._build_entity_hint(focus_role_ids)
+        if entity_hint:
+            hit_lists.append(
+                self._vector.search_tri_band(
+                    encode(query, valence=valence, entity_hint=entity_hint),
+                    weights=weights, filter_ids=active_ids, n_results=n_results,
+                )
+            )
+
+        return self._union_hits(hit_lists)
+
+    def _build_entity_hint(self, focus_role_ids: set[str]) -> str:
+        """Join focus roles' names + aliases as an entity-band hint string."""
+        if not focus_role_ids:
+            return ""
+        names: list[str] = []
+        for rid in focus_role_ids:
+            role = self._role_repo.get(rid)
+            if role is None:
+                continue
+            if role.name:
+                names.append(role.name)
+            names.extend(a for a in (role.aliases or []) if a)
+        return " ".join(dict.fromkeys(names))  # 去重保序
+
+    @staticmethod
+    def _union_hits(hit_lists: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        """Union hits across routes, keeping the closest (min distance) hit per event_id."""
+        best: dict[str, dict[str, Any]] = {}
+        for hits in hit_lists:
+            for h in hits:
+                eid = h.get("event_id")
+                if not eid:
+                    continue
+                prev = best.get(eid)
+                if prev is None or float(h.get("distance", 1.0)) < float(prev.get("distance", 1.0)):
+                    best[eid] = h
+        return list(best.values())
 
     def _single_stream_score(
         self,

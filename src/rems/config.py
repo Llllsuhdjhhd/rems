@@ -141,6 +141,18 @@ class REMSConfig(BaseSettings):
     # 分层比例：最近 N% 的条目对全局可见，剩余部分仅焦点角色关联可见。
     recall_global_ratio: float = 0.7
 
+    # ---- Recall: 并发人物提取与多路检索（本轮新增）----
+    # 回忆是否等待回忆前的人物提取结果。默认 False：人物提取并发跑，回忆用即时启发式 focus，不阻塞。
+    # True 时回忆前 await，使用完整 focus_role_entries（valence / 焦点档位更准，但更慢）。
+    recall_wait_for_role_extraction: bool = False
+    # 向量检索单路候选条数（取代历史硬编码 60）。
+    recall_n_results: int = 60
+    # 是否启用多路召回并集（当前句 / 上下文 / 实体锚定）。关闭时回退到单路「残影+当前输入」。
+    recall_multi_route_enabled: bool = True
+    # 上下文路中残影参与查询编码的最大字符数（取尾部）；≤0 表示不截断。
+    # 防止长残影把当前输入的语义向量稀释。
+    recall_query_shadow_cap: int = 1200
+
     # ---- Abstraction: Frequent Subset Mining (白皮书 §3.2 唯一触发) ----
     # 每次回忆产生的回忆块 event_id 集合被登记到 ``recall_log``；在集合族中找满足：
     #   - 子集大小 >= abstract_subset_min_size（默认 6；可配置）
@@ -277,6 +289,38 @@ class REMSConfig(BaseSettings):
     ema_history_window: int = 10
     # 事件 activation_energy 由角色滚动 energy 聚合后可选放大。
     activation_energy_gain: float = 1.0
+
+    # ---- Recall intent classification: 软混合权重（本轮新增，去正则硬三选一） ----
+    # True（默认）：按词典（可选原型向量）信号算混合系数，对三组 tri_band 权重做凸组合，支持混合意图。
+    # False：回退到旧的正则硬选 dominant，便于 A/B。
+    recall_intent_soft_blend_enabled: bool = True
+    # softmax 温度：越小越「尖」（接近硬选），越大越「平」（更均匀混合）。
+    recall_intent_softmax_temperature: float = 1.0
+    # fact 基线分：保证无任何信号命中时混合结果回退到 weight_fact。
+    recall_intent_fact_baseline: float = 1.0
+    # 三类意图词典（子串命中计数，大小写不敏感）。fact 多为残余类，词典可空。
+    recall_intent_entity_lexicon: list[str] = Field(
+        default_factory=lambda: [
+            "谁", "人物", "角色", "轨迹", "做过什么", "干什么", "和谁", "跟谁",
+            "where", "who", "character", "person",
+        ]
+    )
+    recall_intent_emotion_lexicon: list[str] = Field(
+        default_factory=lambda: [
+            "感觉", "心情", "情绪", "害怕", "开心", "难过", "生气", "喜欢", "讨厌",
+            "feel", "emotion", "mood", "afraid", "happy", "sad", "angry",
+        ]
+    )
+    recall_intent_fact_lexicon: list[str] = Field(
+        default_factory=lambda: [
+            "什么时候", "哪里", "为什么", "怎么", "多少", "是不是", "发生了",
+            "when", "why", "how", "what", "fact",
+        ]
+    )
+    # 原型向量信号（可选）：用现有嵌入器对每类种子短语预编码，取 cosine 作为附加信号。
+    # 默认关闭——哈希嵌入器下原型噪声大；接入真实句向量模型时可开。
+    recall_intent_prototype_enabled: bool = False
+    recall_intent_prototype_weight: float = 2.0
 
     # ---- RRF recall modifiers (白皮书 4.4) ----
     recall_rrf_k: int = 60
