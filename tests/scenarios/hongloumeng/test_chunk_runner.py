@@ -57,7 +57,7 @@ def test_offline_ingest_one_chunk(scenario_workspace: ScenarioWorkspace, monkeyp
     assert len(results) == 1
     assert results[0].chunk_id == 1
     assert results[0].events_total >= 1
-    assert (scenario_workspace.base_dir / f"chunk_{chunk.id}_report.json").is_file()
+    assert (scenario_workspace.chunk_debug_dir(chunk.id) / "report.json").is_file()
 
 
 @pytest.mark.live_llm

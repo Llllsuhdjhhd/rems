@@ -37,7 +37,17 @@ def main() -> int:
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Skip LLM file logging (still uses real LLM unless you mock separately)",
+        help="Hash embedding + no LLM file logs (still uses real LLM unless mocked)",
+    )
+    parser.add_argument(
+        "--no-debug-files",
+        action="store_true",
+        help="Console trace only; skip debug/ JSON artifacts",
+    )
+    parser.add_argument(
+        "--compact-llm-log",
+        action="store_true",
+        help="Write compact LLM logs (no full messages/response); default is full payload",
     )
     args = parser.parse_args()
 
@@ -56,6 +66,8 @@ def main() -> int:
         chunk_id=args.chunk_id,
         reset=args.reset,
         offline=args.offline,
+        write_debug_files=not args.no_debug_files,
+        full_llm_log=not args.compact_llm_log,
     )
 
     print(f"\nDone. last_chunk_idx={ws.load_last_chunk_idx()}, processed={len(results)}", flush=True)

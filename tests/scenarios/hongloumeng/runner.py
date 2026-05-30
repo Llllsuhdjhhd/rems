@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import time
-from dataclasses import asdict
-from pathlib import Path
 from typing import Any
 
+from rems.observability.ingest_trace import IngestTrace
 from rems.pipeline import ProcessingMode, REMSPipeline
 
 from tests.scenarios.common.harness import (
@@ -15,7 +13,7 @@ from tests.scenarios.common.harness import (
     ScenarioWorkspace,
     build_pipeline,
     install_llm_file_logger,
-    write_chunk_report,
+    write_chunk_debug_bundle,
 )
 from tests.scenarios.common.recall_hooks import install_recall_hooks
 from tests.scenarios.hongloumeng.dataset import Chunk, iter_chunks
@@ -36,11 +34,24 @@ def ingest_one_chunk(
     workspace: ScenarioWorkspace,
     enable_llm_log: bool = True,
     enable_recall_trace: bool = True,
+    write_debug_files: bool = True,
+    full_llm_log: bool = True,
+    echo_pipeline: bool = True,
 ) -> tuple[ChunkIngestSnapshot, dict[str, Any] | None]:
     """Ingest a single dataset chunk; return snapshot + optional recall trace."""
+    pipeline_trace = IngestTrace(echo=echo_pipeline)
+    pipeline.ingest_trace = pipeline_trace
+
+    debug_dir = workspace.chunk_debug_dir(chunk.id, create=write_debug_files)
     uninstall_llm = None
     if enable_llm_log:
-        uninstall_llm, _ = install_llm_file_logger(workspace.log_dir, chunk.id)
+        uninstall_llm, _ = install_llm_file_logger(
+            debug_dir / "llm",
+            chunk.id,
+            ingest_trace=pipeline_trace,
+            write_files=write_debug_files,
+            full_payload=full_llm_log,
+        )
 
     recall_trace: dict[str, Any] | None = None
     uninstall_recall = None
@@ -49,12 +60,13 @@ def ingest_one_chunk(
 
     events_before, _, _ = _count_events(pipeline)
     meta_repo = pipeline.metabolism_service._repo  # noqa: SLF001
-    shadow_before = meta_repo.get_shadow()
+    meta_repo.get_shadow()
 
     t0 = time.perf_counter()
     try:
         pipeline.ingest(chunk.content, mode=ProcessingMode.DIALOGUE)
     finally:
+        pipeline.ingest_trace = None
         if uninstall_recall:
             uninstall_recall()
         if uninstall_llm:
@@ -84,10 +96,7 @@ def ingest_one_chunk(
             tri_hits = max(tri_hits, int(row.get("n_hits") or 0))
         bypass = bool(recall_trace.get("bypass"))
 
-    recall_block_n = 0
-    if recall_trace and pipeline.recall_service:
-        # Last ingest already ran recall inside pipeline; trace has search hits.
-        recall_block_n = tri_hits  # proxy; full block in trace file if needed
+    recall_block_n = tri_hits if recall_trace else 0
 
     snap = ChunkIngestSnapshot(
         chunk_id=chunk.id,
@@ -107,11 +116,16 @@ def ingest_one_chunk(
         bypass_triggered=bypass,
         elapsed_ms=elapsed_ms,
     )
-    write_chunk_report(workspace, snap)
 
-    if recall_trace is not None:
-        trace_path = workspace.base_dir / f"chunk_{chunk.id}_recall_trace.json"
-        trace_path.write_text(json.dumps(recall_trace, ensure_ascii=False, indent=2), encoding="utf-8")
+    if write_debug_files:
+        out_dir = write_chunk_debug_bundle(
+            workspace,
+            chunk.id,
+            snapshot=snap,
+            pipeline_steps=pipeline_trace.steps,
+            recall_trace=recall_trace if enable_recall_trace else None,
+        )
+        print(f"  debug -> {out_dir.relative_to(workspace.base_dir)}", flush=True)
 
     return snap, recall_trace
 
@@ -124,6 +138,9 @@ def run_chunks(
     reset: bool = False,
     offline: bool = False,
     config_overrides: dict[str, Any] | None = None,
+    write_debug_files: bool = True,
+    full_llm_log: bool = True,
+    echo_pipeline: bool = True,
 ) -> list[ChunkIngestSnapshot]:
     """Main entry: ingest *count* chunks into *workspace*."""
     if reset:
@@ -158,8 +175,15 @@ def run_chunks(
             workspace=workspace,
             enable_llm_log=not offline,
             enable_recall_trace=True,
+            write_debug_files=write_debug_files,
+            full_llm_log=full_llm_log,
+            echo_pipeline=echo_pipeline,
         )
-        workspace.save_last_chunk_idx(chunk.id, extra={"last_report": f"chunk_{chunk.id}_report.json"})
+        rel_debug = f"debug/chunk_{chunk.id}"
+        workspace.save_last_chunk_idx(
+            chunk.id,
+            extra={"last_debug_dir": rel_debug},
+        )
         results.append(snap)
         print(
             f"  events +{snap.events_created} (total {snap.events_total}), "

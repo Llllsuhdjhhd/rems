@@ -107,6 +107,10 @@ class AbstractionService:
             1. ``is_fired(subset)`` — 字面子集已处理过则跳过。
             2. ``enable_narrative_dedup`` 为真时 ``_is_narrative_duplicate`` — 叙事线近似去重
                （overlap / novelty 双护栏，含叶子展开；比对窗口 K 随 ``PerfMonitor`` 负载收紧）。
+            2.5 叙事整合性前置闸门（``abstract_narrative_coherence_enabled``，默认开）—
+               ``_synthesize_from_subset`` 内先做一次 LLM 划分（相干叙事线 vs 无关项）：
+               相干数 < ``abstract_narrative_coherence_min_count`` 则 ``coherence_rejected`` 跳过；
+               否则只用相干子集合成。rate_a 回灌 ``RecallQualityController`` 的 EMA-a。
             3. 合成成功后 ``replace_subset`` — 把所有**完全包含** S 的 recall_log 行中的 S
                替换为新抽象 id（行级「完全包含」去重，多叙事线共享叶子仍由各自行决定）。
             4. 每次成功合成后立即用最新 ``recall_log`` 重新频繁集挖掘（至多 ``abstract_mining_max_refresh_rounds`` 轮），
@@ -305,7 +309,30 @@ class AbstractionService:
         events.sort(key=lambda e: (e.create_time, e.event_id))
         cfg = self._config
 
+        # 叙事整合性前置闸门（白皮书 §3.2「相关率 a」）：在送入合成前，先用一次 LLM 把挖矿
+        # 子集划分为「相干叙事线」与「无关项」。相干数低于 ``abstract_narrative_coherence_min_count``
+        # 则跳过本次抽象；否则只用相干子集做后续合成（丢弃无关项，避免噪声污染抽象证据）。
+        # rate_a（相干占比）回灌 RecallQualityController 的 EMA-a 通道，参与动态语义距离钳制。
         coherent_events = events
+        if cfg.abstract_narrative_coherence_enabled:
+            coh = self._evolution.evaluate_narrative_coherence(events)
+            if self._recall_quality is not None:
+                self._recall_quality.record_abstraction_coherence_rate(coh.rate_a)
+            if not coh.passed_gate:
+                logger.info(
+                    "coherence gate rejected: subset_size=%d coherent=%d rate_a=%.2f (min=%d)",
+                    len(events),
+                    len(coh.coherent_event_ids),
+                    coh.rate_a,
+                    max(1, cfg.abstract_narrative_coherence_min_count),
+                )
+                return SubsetSynthesisOutcome(None, coherence_rejected=True)
+            coherent_events = [e for e in events if e.event_id in coh.coherent_event_ids]
+            if len(coherent_events) < len(events):
+                logger.info(
+                    "coherence gate pruned subset: %d → %d coherent (rate_a=%.2f)",
+                    len(events), len(coherent_events), coh.rate_a,
+                )
 
         evidence_events = self._evidence_policy.collect(coherent_events, self._event_repo)
         if not evidence_events:

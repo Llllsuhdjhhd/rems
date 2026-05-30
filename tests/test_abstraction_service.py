@@ -132,8 +132,8 @@ class TestMineAndSynthesize:
         second = svc.mine_and_synthesize()
         assert second == []
 
-    def test_coherence_flag_does_not_block_merged_synthesis(self, abstraction_env):
-        """2026.06: narrative coherence is merged into synthesize(); no pre-filter gate."""
+    def test_coherence_gate_passes_and_synthesizes_coherent_subset(self, abstraction_env):
+        """整合性前置闸门：先 LLM 划分相干 / 无关，相干数达标则只用相干子集合成。"""
         svc, event_repo, vector_store, recall_log_repo, fake_llm = abstraction_env
         svc._config.abstract_narrative_coherence_enabled = True
         svc._config.abstract_narrative_coherence_min_count = 2
@@ -152,6 +152,12 @@ class TestMineAndSynthesize:
                 event_ids=sorted(row_ids),
             )
 
+        # 1) 整合性划分：把全部三条判为相干（无剔除）。
+        fake_llm.push_response({
+            "coherent_event_ids": list(miner_core),
+            "excluded_event_ids": [],
+        })
+        # 2) 合成。
         fake_llm.push_response({
             "cognitive_relation": "CAUSALITY",
             "shadow_lambda": 0.5,
@@ -164,3 +170,57 @@ class TestMineAndSynthesize:
         created = svc.mine_and_synthesize()
         assert len(created) == 1
         assert set(created[0].source_events) == set(miner_core)
+
+    def test_coherence_gate_prunes_incoherent_member(self, abstraction_env):
+        """相干划分剔除无关项后，仅以相干子集合成；source_events 不含被剔除项。"""
+        svc, event_repo, vector_store, recall_log_repo, fake_llm = abstraction_env
+        svc._config.abstract_narrative_coherence_enabled = True
+        svc._config.abstract_narrative_coherence_min_count = 2
+
+        events = [
+            _save_event(event_repo, vector_store, f"张三事件{i}") for i in range(3)
+        ]
+        e0, e1, e2 = events
+        miner_core = [e0.event_id, e1.event_id, e2.event_id]
+        for k in range(3):
+            recall_log_repo.append(recall_id=f"RCL-{k}", event_ids=sorted(miner_core))
+
+        # 划分：e2 判为无关，相干 = {e0, e1}（达到 min_count=2）。
+        fake_llm.push_response({
+            "coherent_event_ids": [e0.event_id, e1.event_id],
+            "excluded_event_ids": [e2.event_id],
+        })
+        fake_llm.push_response({
+            "cognitive_relation": "CAUSALITY",
+            "shadow_lambda": 0.5,
+            "content_raw": "两条合并",
+            "insight": "",
+        })
+        for _ in range(5):
+            fake_llm.push_response({"summary": "short", "char_count": 6})
+
+        created = svc.mine_and_synthesize()
+        assert len(created) == 1
+        assert set(created[0].source_events) == {e0.event_id, e1.event_id}
+
+    def test_coherence_gate_rejects_below_min_count(self, abstraction_env):
+        """相干数低于 min_count → coherence_rejected，本次不产出抽象事件。"""
+        svc, event_repo, vector_store, recall_log_repo, fake_llm = abstraction_env
+        svc._config.abstract_narrative_coherence_enabled = True
+        svc._config.abstract_narrative_coherence_min_count = 3
+
+        events = [
+            _save_event(event_repo, vector_store, f"张三事件{i}") for i in range(3)
+        ]
+        miner_core = [e.event_id for e in events]
+        for k in range(3):
+            recall_log_repo.append(recall_id=f"RCL-{k}", event_ids=sorted(miner_core))
+
+        # 仅一条相干，低于 min_count=3 → 整轮闸门拒绝（合成响应不会被消费）。
+        fake_llm.push_response({
+            "coherent_event_ids": [events[0].event_id],
+            "excluded_event_ids": [events[1].event_id, events[2].event_id],
+        })
+
+        created = svc.mine_and_synthesize()
+        assert created == []

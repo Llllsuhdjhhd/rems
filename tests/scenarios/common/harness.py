@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from rems.config import REMSConfig, StorageConfig, UserMode
+from rems.observability.ingest_trace import IngestTrace
 from rems.llm.provider import LLMProvider
 from rems.pipeline import REMSPipeline
 
@@ -33,7 +34,6 @@ class ScenarioWorkspace:
     def create(cls, base_dir: Path, *, run_name: str = "continuous_run") -> ScenarioWorkspace:
         ws = cls(base_dir=base_dir, run_name=run_name)
         ws.base_dir.mkdir(parents=True, exist_ok=True)
-        (ws.base_dir / "llm_calls").mkdir(parents=True, exist_ok=True)
         return ws
 
     @classmethod
@@ -56,8 +56,15 @@ class ScenarioWorkspace:
         return self.base_dir / "qdrant_sim"
 
     @property
-    def log_dir(self) -> Path:
-        return self.base_dir / "llm_calls"
+    def debug_root(self) -> Path:
+        return self.base_dir / "debug"
+
+    def chunk_debug_dir(self, chunk_id: int, *, create: bool = False) -> Path:
+        """Per-chunk debug artifacts: report / traces / llm summaries."""
+        d = self.debug_root / f"chunk_{chunk_id}"
+        if create:
+            d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def load_last_chunk_idx(self) -> int:
         if not self.state_file.exists():
@@ -81,7 +88,6 @@ class ScenarioWorkspace:
         if self.base_dir.exists():
             shutil.rmtree(self.base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
 
     def build_config(self, **overrides: Any) -> REMSConfig:
         cfg = REMSConfig(
@@ -125,11 +131,17 @@ class ChunkIngestSnapshot:
 def install_llm_file_logger(
     log_dir: Path,
     chunk_id: int,
+    *,
+    ingest_trace: IngestTrace | None = None,
+    write_files: bool = True,
+    full_payload: bool = False,
 ) -> tuple[Callable[[], None], list[Path]]:
-    """Patch LLMProvider.complete to write JSON logs; return uninstall + paths."""
+    """Patch LLMProvider.complete; optionally persist compact per-call summaries."""
     orig = LLMProvider.complete
     written: list[Path] = []
     counter = {"n": 0}
+    if write_files:
+        log_dir.mkdir(parents=True, exist_ok=True)
 
     def complete_with_logging(self, task_type, messages, **kwargs):
         counter["n"] += 1
@@ -139,19 +151,36 @@ def install_llm_file_logger(
         content = orig(self, task_type, messages, **kwargs)
         ms = (time.perf_counter() - t0) * 1000.0
         metrics = self._invocations[-1] if self._invocations else None
-        log_path = log_dir / f"chunk_{chunk_id}_{n:03d}_{task_type}.json"
-        payload = {
-            "chunk_id": chunk_id,
-            "task_type": task_type,
-            "model": model,
-            "messages": messages,
-            "response": content,
-            "metrics": asdict(metrics) if metrics else {},
-            "latency_ms": ms,
-        }
-        log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        written.append(log_path)
-        print(f"  [LLM] #{n:03d} {task_type} ({ms:.0f}ms) -> {log_path.name}", flush=True)
+        log_name = f"{n:03d}_{task_type}.json"
+        if write_files:
+            payload: dict[str, Any] = {
+                "chunk_id": chunk_id,
+                "task_type": task_type,
+                "model": model,
+                "latency_ms": ms,
+                "metrics": asdict(metrics) if metrics else {},
+            }
+            if full_payload:
+                payload["messages"] = messages
+                payload["response"] = content
+            else:
+                payload["message_count"] = len(messages or [])
+                payload["response_chars"] = len(content or "")
+            log_path = log_dir / log_name
+            log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            written.append(log_path)
+        if ingest_trace is not None:
+            ingest_trace.record_llm(
+                task_type=task_type,
+                model=model,
+                latency_ms=ms,
+                prompt_tokens=getattr(metrics, "prompt_tokens", None) if metrics else None,
+                completion_tokens=getattr(metrics, "completion_tokens", None) if metrics else None,
+                total_tokens=getattr(metrics, "total_tokens", None) if metrics else None,
+                log_file=log_name if write_files else None,
+            )
+        elif write_files:
+            print(f"  [LLM] #{n:03d} {task_type} ({ms:.0f}ms) -> {log_name}", flush=True)
         return content
 
     LLMProvider.complete = complete_with_logging  # type: ignore[method-assign]
@@ -162,15 +191,40 @@ def install_llm_file_logger(
     return uninstall, written
 
 
+def write_chunk_debug_bundle(
+    workspace: ScenarioWorkspace,
+    chunk_id: int,
+    *,
+    snapshot: ChunkIngestSnapshot,
+    pipeline_steps: list[dict[str, Any]],
+    recall_trace: dict[str, Any] | None = None,
+) -> Path:
+    """Write all per-chunk debug JSON once at ingest end (minimal I/O)."""
+    debug_dir = workspace.chunk_debug_dir(chunk_id, create=True)
+    llm_dir = debug_dir / "llm"
+    rel = debug_dir.relative_to(workspace.base_dir).as_posix()
+
+    snap = asdict(snapshot)
+    snap["extra"] = {**snap.get("extra", {}), "debug_dir": rel}
+
+    (debug_dir / "report.json").write_text(
+        json.dumps(snap, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (debug_dir / "pipeline_trace.json").write_text(
+        json.dumps({"chunk_id": chunk_id, "steps": pipeline_steps}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if recall_trace is not None:
+        (debug_dir / "recall_trace.json").write_text(
+            json.dumps(recall_trace, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    if llm_dir.is_dir() and not any(llm_dir.iterdir()):
+        llm_dir.rmdir()
+    return debug_dir
+
+
 def build_pipeline(workspace: ScenarioWorkspace, **config_overrides: Any) -> REMSPipeline:
     cfg = workspace.build_config(**config_overrides)
     return REMSPipeline.from_config(cfg)
-
-
-def write_chunk_report(workspace: ScenarioWorkspace, snapshot: ChunkIngestSnapshot) -> Path:
-    out = workspace.base_dir / f"chunk_{snapshot.chunk_id}_report.json"
-    out.write_text(
-        json.dumps(asdict(snapshot), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return out
